@@ -1,6 +1,10 @@
+import 'dart:convert';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'engine/tx_backup_commit.dart';
+import 'engine/tx_backup_import.dart';
 import 'engine/tx_engine.dart';
 import 'engine/tx_session.dart';
 
@@ -12,7 +16,7 @@ class TerminalX extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
         debugShowCheckedModeBanner: false,
-        title: 'Terminal X',
+        title: 'Terminal X V0.1c',
         theme: ThemeData.dark(useMaterial3: true).copyWith(
           scaffoldBackgroundColor: const Color(0xFF0E121B),
           colorScheme: ColorScheme.fromSeed(
@@ -38,8 +42,10 @@ class _TradingScreenState extends State<TradingScreen> {
   int _selected = 0;
   bool _limitOrder = false;
   bool _loading = true;
+  bool _importing = false;
+  bool _hasImported = false;
   String? _storageError;
-  String _message = 'V0.1b：真实有限盘口撮合，数据只保存在本机。';
+  String _message = 'V0.1c：独立安装；可安全导入 V0.1b XML 备份。';
   Future<void> _writeChain = Future<void>.value();
 
   @override
@@ -71,7 +77,6 @@ class _TradingScreenState extends State<TradingScreen> {
           session = TxSession.fromLegacyJson(legacy);
           migrated = true;
         }
-        // Commit the new snapshot first; NEVER modify the legacy save key.
         final saved = await prefs.setString(TxSession.saveKey, session.exportJson());
         if (!saved) throw StateError('Initial session snapshot not written');
       }
@@ -79,6 +84,7 @@ class _TradingScreenState extends State<TradingScreen> {
       setState(() {
         _session = session;
         _loading = false;
+        _hasImported = prefs.containsKey(TxBackupCommit.preImportSaveKey);
         _limit.text = (session.referenceCents[0] / 100).toStringAsFixed(2);
         if (migrated) {
           _message = '已迁移旧现金/持仓/报价。旧挂单仅归档，不会自动继续成交；旧存档未修改。';
@@ -88,13 +94,13 @@ class _TradingScreenState extends State<TradingScreen> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _storageError = '无法安全读取旧版或新版存档：$error。已停止交易，未覆盖原存档。';
+        _storageError = '无法安全读取存档：$error。已停止交易，未覆盖原存档。';
       });
     }
   }
 
-  // Serialize the snapshot writes to avoid an earlier async write overwriting
-  // a later snapshot. SQLite/Drift with real transactions remains the next step.
+  // Order writes are serialized. Import waits for this queue and disables new
+  // trades throughout file picking, user confirmation and commit.
   void _persist() {
     final snap = _session!.exportJson();
     _writeChain = _writeChain.then((_) async {
@@ -111,7 +117,110 @@ class _TradingScreenState extends State<TradingScreen> {
   }
 
   String _money(int cents) => (cents / 100).toStringAsFixed(2);
-  bool get _canTrade => !_loading && _session != null && _storageError == null;
+  bool get _canTrade => !_loading && !_importing &&
+      _session != null && _storageError == null;
+
+  // Only the selected file's bytes are read. No ADB, root permission or direct
+  // access to V0.1b's private storage is needed. The source file is unchanged.
+  Future<void> _importXmlBackup() async {
+    if (!_canTrade || _hasImported) return;
+    setState(() => _importing = true);
+    var startedStorageCommit = false;
+    try {
+      await _writeChain;
+      if (_storageError != null) throw StateError('Pending save failed');
+
+      final selection = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['xml'],
+        withData: true,
+      );
+      if (!mounted || selection == null) return;
+      if (selection.files.length != 1) {
+        throw const FormatException('Please select one XML backup');
+      }
+      final file = selection.files.single;
+      if (file.size <= 0 || file.size > TxBackupImport.maxXmlCharacters) {
+        throw const FormatException('Backup file is empty or too large');
+      }
+      final bytes = file.bytes;
+      if (bytes == null || bytes.length != file.size) {
+        throw const FormatException('Could not read complete backup bytes');
+      }
+      final xml = utf8.decode(bytes, allowMalformed: false);
+      final proposed = TxBackupImport.previewXml(xml);
+      final player = proposed.engine.account(TxSession.playerId);
+      if (!mounted) return;
+
+      final confirmed = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('确认导入 V0.1b 存档'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('交易引擎校验通过。请核对：'),
+                const SizedBox(height: 8),
+                Text('模拟时间：第 ${proposed.step} 步'),
+                Text('现金：¥${_money(player.cashCents)}'),
+                Text('冻结现金：¥${_money(player.reservedCashCents)}'),
+                for (final symbol in TxSession.symbols)
+                  Text('$symbol：${player.sharesOf(symbol)} 股；冻结 '
+                      '${player.reservedSharesOf(symbol)} 股'),
+                Text('玩家委托：${proposed.playerOrders.length} 笔'),
+                Text('玩家成交：${proposed.playerFills.length} 笔'),
+                const SizedBox(height: 12),
+                const Text(
+                  '确认后只替换本 V0.1c 的会话；替换前将保存 V0.1c 原会话副本。'
+                  '原 V0.1b 应用及你在下载文件夹中的 XML 不会被修改。'
+                  '为保护数据，本版本仅允许导入一次。',
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('确认导入'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || confirmed != true) return;
+      await _writeChain;
+      if (_storageError != null) throw StateError('Pending save failed');
+      startedStorageCommit = true;
+      final restored = await TxBackupCommit.commitOnce(proposed);
+      if (!mounted) return;
+      setState(() {
+        _session = restored;
+        _hasImported = true;
+        _selected = 0;
+        _limitOrder = false;
+        _limit.text = _money(restored.referenceCents[0]);
+        _message = '导入成功，已校验账务并保存。V0.1b 原应用与备份未修改。';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        if (startedStorageCommit) {
+          _storageError = '导入写入或验证失败，已暂停交易。'
+              'V0.1c 原会话恢复副本仍受保护。不要清除应用数据。';
+        } else {
+          _message = '未导入：文件解析/校验失败，或者读取存档时出错。原数据未修改。';
+        }
+      });
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
 
   int? _parsePrice(String value) {
     final amount = double.tryParse(value.trim());
@@ -212,7 +321,7 @@ class _TradingScreenState extends State<TradingScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('TERMINAL X · V0.1b'),
+        title: const Text('TERMINAL X · V0.1c'),
         actions: [IconButton(
           icon: const Icon(Icons.skip_next),
           tooltip: '推进行情',
@@ -220,6 +329,32 @@ class _TradingScreenState extends State<TradingScreen> {
         )],
       ),
       body: ListView(padding: const EdgeInsets.all(14), children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('V0.1b 存档安全导入',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                const Text('从手机下载文件夹选择备份 XML。先只读校验并预览，'
+                    '你确认后才会写入独立的 V0.1c 数据区。'),
+                const SizedBox(height: 8),
+                if (_hasImported)
+                  const Text('此设备的 V0.1c 已使用过导入功能；'
+                      '为防止覆盖现有数据，不允许再次导入。'),
+                if (_importing) const LinearProgressIndicator(),
+                FilledButton.icon(
+                  onPressed: (_canTrade && !_hasImported) ? _importXmlBackup : null,
+                  icon: const Icon(Icons.folder_open),
+                  label: Text(_hasImported ? '存档已导入' : '选择 XML 并预览'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
         Text('总资产 ¥${_money(session.totalAssetsCents)}',
             style: const TextStyle(fontSize: 25, fontWeight: FontWeight.bold)),
         Text('现金 ¥${_money(player.cashCents)}  ·  可用 ¥${_money(player.availableCashCents)}'),
@@ -232,10 +367,10 @@ class _TradingScreenState extends State<TradingScreen> {
             ButtonSegment(value: 1, label: Text('SIM-A02')),
           ],
           selected: {_selected},
-          onSelectionChanged: (values) => setState(() {
+          onSelectionChanged: _canTrade ? (values) => setState(() {
             _selected = values.first;
             _limit.text = _money(session.referenceCents[_selected]);
-          }),
+          }) : null,
         ),
         const SizedBox(height: 16),
         Text('¥${_money(session.lastPrice(symbol))}',
@@ -336,7 +471,8 @@ class _TradingScreenState extends State<TradingScreen> {
             Text(entry, style: const TextStyle(color: Colors.white54)),
         ],
         const SizedBox(height: 36),
-        const Text('本地合成股票与有限资金/库存做市商。未实现正式交易所规则、手续费、SQLite或生产签名。',
+        const Text('本地合成股票与有限资金/库存做市商。未实现正式交易所规则、手续费、SQLite或生产签名。'
+            'V0.1c 与 V0.1b 分属独立应用。',
             style: TextStyle(color: Colors.white54, fontSize: 12)),
       ]),
     );
