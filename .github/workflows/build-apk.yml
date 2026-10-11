@@ -1,38 +1,37 @@
-
 name: Build Android APK
 
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-
       - name: Create Android project
-        run: flutter create --project-name terminal_x --platforms=android .
-
+        run: flutter create --org com.terminalx.preview --project-name terminal_x --platforms=android .
       - name: Install dependencies
         run: flutter pub get
-
+      - name: Test engine and recovery before building APK
+        run: flutter test test/tx_engine_test.dart test/tx_session_test.dart
       - name: Build APK
         run: flutter build apk --debug
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
