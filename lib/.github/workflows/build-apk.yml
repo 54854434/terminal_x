@@ -1,1 +1,42 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'lib/**'
+      - 'pubspec.yaml'
+      - '.github/workflows/build-apk.yml'
 
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Configure Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Generate Android platform project
+        run: flutter create --project-name terminal_x --platforms=android .
+      - name: Resolve packages
+        run: flutter pub get
+      - name: Static analysis
+        run: flutter analyze lib
+      - name: Compile installable debug APK
+        run: flutter build apk --debug
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-x-android-debug
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
