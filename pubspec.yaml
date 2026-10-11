@@ -1,7 +1,7 @@
 name: terminal_x
 description: Offline Android trading simulator starter.
 publish_to: none
-version: 0.1.0+1
+version: 0.1.1+2
 
 environment:
   sdk: '>=3.5.0 <4.0.0'
@@ -11,6 +11,7 @@ dependencies:
     sdk: flutter
   shared_preferences: ^2.5.3
   xml: ^6.5.0
+  file_picker: ^8.3.7
 
 dev_dependencies:
   flutter_test:
