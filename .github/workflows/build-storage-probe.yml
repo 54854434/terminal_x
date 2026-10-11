@@ -7,6 +7,8 @@ on:
     paths:
       - 'lib/storage_probe_main.dart'
       - 'lib/storage/tx_sqlite_store.dart'
+      - 'lib/storage/tx_migration_bridge.dart'
+      - 'test/tx_migration_bridge_test.dart'
       - '.github/workflows/build-storage-probe.yml'
       - 'pubspec.yaml'
 
@@ -40,8 +42,8 @@ jobs:
           grep -q 'android:label="Terminal X SQLite Probe"' android/app/src/main/AndroidManifest.xml
       - name: Install dependencies
         run: flutter pub get
-      - name: Run existing regressions and SQLite security tests
-        run: flutter test test/tx_engine_test.dart test/tx_session_test.dart test/tx_backup_commit_test.dart test/tx_sqlite_store_test.dart
+      - name: Run engine, backup, SQLite and migration-bridge tests
+        run: flutter test test/tx_engine_test.dart test/tx_session_test.dart test/tx_backup_commit_test.dart test/tx_sqlite_store_test.dart test/tx_migration_bridge_test.dart
       - name: Build separate SQLite test APK
         run: flutter build apk --debug --target lib/storage_probe_main.dart
       - name: Upload SQLite test APK
