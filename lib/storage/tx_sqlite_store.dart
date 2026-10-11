@@ -1,4 +1,6 @@
-/// Experimental V0.1d SQLite/Drift store, deliberately NOT wired into main.dart.
+/// V0.1d SQLite/Drift store. V0.1d uses initializeFresh() for a NEW account;
+/// the legacy migration entry point remains optional and is never used by the
+/// isolated SQLite trading application.
 ///
 /// The caller supplies a full V0.1c JSON snapshot. This module never reads,
 /// rewrites, or deletes SharedPreferences or the V0.1b XML backup.
@@ -272,5 +274,62 @@ class TxSqliteStore extends GeneratedDatabase {
       _testCheckpoint?.call('after_session_insert');
       return (await readCurrent())!;
     });
+  }
+
+  /// Initializes a fresh account ONLY when the SQLite database is empty.
+  /// Unlike legacy migration, no SharedPreferences migration marker is made.
+  /// Existing valid sessions are returned untouched; corruption fails closed.
+  Future<TxStoredSession> initializeFresh(TxSession initialSession) async {
+    final payload = _verifiedJson(initialSession.exportJson());
+    final checksum = _digest(payload);
+    return transaction(() async {
+      final existing = await readCurrent();
+      if (existing != null) return existing;
+
+      final now = _utcNow();
+      final snapshotId = await _insertSnapshot(payload, checksum, 1, now);
+      _testCheckpoint?.call('after_snapshot_insert');
+      await customStatement('''
+        INSERT INTO sessions(session_id, revision, snapshot_id, updated_at_utc)
+        VALUES (?, ?, ?, ?)
+      ''', [primarySessionId, 1, snapshotId, now]);
+      _testCheckpoint?.call('after_session_insert');
+      return (await readCurrent())!;
+    });
+  }
+
+
+  /// Verified recent committed revisions, oldest first. Read-only.
+  /// The chart uses ONLY persisted observations; historical corruption is
+  /// reported and never silently replaced by fabricated OHLC candles.
+  Future<List<TxStoredSession>> readHistory({int limit = 180}) async {
+    if (limit < 1 || limit > 500) {
+      throw ArgumentError.value(limit, 'limit');
+    }
+    final rows = await customSelect('''
+      SELECT revision, payload_json, sha256
+      FROM snapshots
+      WHERE session_id = ?
+      ORDER BY revision DESC LIMIT ?
+    ''', variables: [
+      Variable.withString(primarySessionId),
+      Variable.withInt(limit),
+    ]).get();
+    final verified = <TxStoredSession>[];
+    for (final row in rows.reversed) {
+      final payload = row.read<String>('payload_json');
+      final checksum = row.read<String>('sha256');
+      if (_digest(payload) != checksum) {
+        throw StateError('Corrupted historical SQLite snapshot');
+      }
+      final session = TxSession.importJson(payload);
+      session.engine.checkInvariants();
+      verified.add(TxStoredSession(
+        session: session,
+        revision: row.read<int>('revision'),
+        sha256: checksum,
+      ));
+    }
+    return verified;
   }
 }
