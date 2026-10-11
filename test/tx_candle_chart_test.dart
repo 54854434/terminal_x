@@ -20,7 +20,7 @@ void main() {
       body: SingleChildScrollView(child: TxCandleChart(candles: candles)),
     )));
     expect(find.textContaining('步 38–69'), findsOneWidget);
-    await tester.dragAt(
+    await tester.dragFrom(
       tester.getTopLeft(find.byType(TxCandleChart)) + const Offset(90, 90),
       const Offset(150, 0),
     );
