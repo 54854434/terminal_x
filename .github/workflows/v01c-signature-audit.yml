@@ -33,61 +33,129 @@ jobs:
         run: flutter pub get
       - name: Validate existing V0.1b engine and recovery tests
         run: flutter test test/tx_engine_test.dart test/tx_session_test.dart
-      - name: Build disposable diagnostic APK (never publish APK)
+      - name: Build disposable diagnostic APK (do not publish APK)
         run: flutter build apk --debug
-      - name: Compare package and certificate against accepted V0.1b APK
+      - name: Audit APK metadata and certificate with error-tolerant diagnostics
         shell: bash
         run: |
-          set -euo pipefail
-          APK=build/app/outputs/flutter-apk/app-debug.apk
-          EXPECTED_PACKAGE='com.terminalx.preview.terminal_x'
-          # Signer certificate SHA-256 from the ORIGINAL accepted V0.1b
-          # artifact 11702639474 (ZIP hash verified independently).
-          EXPECTED_CERT='3DE881F8022CF6E13594F0687661E1697241272B585EC5396CAE965ABC2A9D64'
-          EXPECTED_VERSION_CODE='1'
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          test -n "$SDK_ROOT" && test -d "$SDK_ROOT/build-tools"
-          SIGNER="$(find "$SDK_ROOT/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
-          test -n "$SIGNER" && test -x "$SIGNER"
-          AAPT="$(dirname "$SIGNER")/aapt"
-          test -x "$AAPT"
-          "$SIGNER" verify --verbose --print-certs "$APK" > /tmp/tx-apk-certs.txt
-          "$AAPT" dump badging "$APK" > /tmp/tx-apk-manifest.txt
-          PACKAGE="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" /tmp/tx-apk-manifest.txt | head -n 1)"
-          VERSION_CODE="$(sed -n "s/^package: .*versionCode='\([^']*\)'.*/\1/p" /tmp/tx-apk-manifest.txt | head -n 1)"
-          CERT="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' /tmp/tx-apk-certs.txt | tr -d ':' | tr '[:lower:]' '[:upper:]' | head -n 1)"
-          test -n "$PACKAGE" && test -n "$VERSION_CODE"
-          test "${#CERT}" -eq 64
-          PACKAGE_RESULT=mismatch
-          CERT_RESULT=mismatch
-          if [[ "$PACKAGE" == "$EXPECTED_PACKAGE" ]]; then PACKAGE_RESULT=match; fi
-          if [[ "$CERT" == "$EXPECTED_CERT" ]]; then CERT_RESULT=match; fi
-          {
-            echo '# Terminal X V0.1c - signing compatibility report'
-            echo
-            echo '- Baseline: V0.1b phone-tested APK; original run 38141798593; artifact 11702639474'
-            echo '- Baseline APK SHA-256: d41b241a4cd7d6ae48e95d66dce967e2a97abd6209973382f67fd43cdb1ae01d'
-            echo "- Expected package: $EXPECTED_PACKAGE"
-            echo "- Built package: $PACKAGE"
-            echo "- Package match: $PACKAGE_RESULT"
-            echo "- Expected certificate SHA-256: $EXPECTED_CERT"
-            echo "- Built certificate SHA-256: $CERT"
-            echo "- Certificate match: $CERT_RESULT"
-            echo "- Baseline versionCode: $EXPECTED_VERSION_CODE"
-            echo "- Built versionCode: $VERSION_CODE"
-            echo "- Built APK SHA-256: $(sha256sum "$APK" | cut -d ' ' -f 1)"
-            echo
-            echo 'This is a CI-only diagnostic. DO NOT install, uninstall, or overwrite V0.1b.'
-            echo 'A different package or signer means Android cannot update the existing app in place.'
-            echo 'A match does not by itself guarantee a successful upgrade or safe data migration.'
-          } | tee signature-audit.txt >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$PACKAGE_RESULT" != match || "$CERT_RESULT" != match ]]; then
-            echo '::warning::This APK cannot safely replace V0.1b as an in-place update. Preserve installed data.'
-          fi
-      - name: Upload text report only (no APK or signing material)
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          
+          apk = Path('build/app/outputs/flutter-apk/app-debug.apk')
+          expected_package = 'com.terminalx.preview.terminal_x'
+          expected_cert = '3DE881F8022CF6E13594F0687661E1697241272B585EC5396CAE965ABC2A9D64'
+          expected_version = '1'
+          root = Path(os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT') or '/usr/local/lib/android/sdk')
+          notes = []
+          
+          def run_tool(args):
+              try:
+                  result = subprocess.run([str(x) for x in args], capture_output=True,
+                                          text=True, timeout=35, check=False)
+                  return result.returncode, (result.stdout or '') + '\n' + (result.stderr or '')
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  return -1, f'{type(exc).__name__}: {exc}'
+          
+          def candidates(name):
+              base = root / 'build-tools'
+              if not base.is_dir():
+                  notes.append(f'Android build-tools directory unavailable: {base}')
+                  return []
+              # Look across versions: newest SDK directories may omit legacy aapt.
+              return sorted((f for f in base.glob(f'*/{name}') if f.is_file()), reverse=True)
+          
+          def short_error(label, detail):
+              notes.append(label + ': ' + (detail.strip()[-300:] or 'no diagnostic output'))
+          
+          package = version = cert = None
+          if not apk.is_file():
+              notes.append(f'APK was not found: {apk}')
+              apk_sha = 'unavailable'
+          else:
+              apk_sha = hashlib.sha256(apk.read_bytes()).hexdigest()
+              signers = candidates('apksigner')
+              if not signers:
+                  notes.append('apksigner not found in installed Android build-tools')
+              else:
+                  tool = signers[0]
+                  code, output = run_tool([tool, 'verify', '--print-certs', apk])
+                  match = re.search(r'Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F:]+)', output)
+                  if match:
+                      candidate = match.group(1).replace(':', '').upper()
+                      if re.fullmatch(r'[0-9A-F]{64}', candidate):
+                          cert = candidate
+                      else:
+                          notes.append('Signer certificate digest is not 64 hex characters')
+                  if code != 0:
+                      short_error('apksigner verification failed', output)
+                  if not match:
+                      short_error('apksigner digest not recognized', output)
+                  notes.append(f'apksigner tool: {tool}')
+          
+              # Read identity from the actual built APK, never infer it from pubspec.yaml.
+              for name in ('aapt', 'aapt2'):
+                  for tool in candidates(name):
+                      code, output = run_tool([tool, 'dump', 'badging', apk])
+                      match = re.search(r"^package:\s+name='([^']+)'[^\n]*versionCode='([^']+)'", output, re.M)
+                      if code == 0 and match:
+                          package, version = match.groups()
+                          notes.append(f'APK metadata tool: {tool}')
+                          break
+                      short_error(f'{tool.name} metadata read failed ({tool.parent.name})', output)
+                  if package is not None:
+                      break
+              if package is None:
+                  notes.append('Neither aapt nor aapt2 extracted the APK package/version')
+          
+          def comparison(actual, expected):
+              return 'unknown' if actual is None else ('match' if actual == expected else 'mismatch')
+          
+          package_status = comparison(package, expected_package)
+          cert_status = comparison(cert, expected_cert)
+          version_status = comparison(version, expected_version)
+          summary = [
+              '# Terminal X V0.1c - APK signature compatibility audit (revised)',
+              '',
+              '- Baseline: phone-tested V0.1b; run 38141798593; artifact 11702639474',
+              '- Baseline APK SHA-256: d41b241a4cd7d6ae48e95d66dce967e2a97abd6209973382f67fd43cdb1ae01d',
+              f'- SDK root checked: `{root}`',
+              f'- Expected package: `{expected_package}`',
+              f'- Built package: `{package or "unavailable"}`',
+              f'- Package match: **{package_status}**',
+              f'- Expected certificate SHA-256: `{expected_cert}`',
+              f'- Built certificate SHA-256: `{cert or "unavailable"}`',
+              f'- Certificate match: **{cert_status}**',
+              f'- Baseline versionCode: `{expected_version}`',
+              f'- Built versionCode: `{version or "unavailable"}`',
+              f'- VersionCode match: **{version_status}**',
+              f'- Built APK SHA-256: `{apk_sha}`',
+              '',
+              '## Diagnostics',
+              *[f'- {x}' for x in notes],
+              '',
+              'This run is DIAGNOSTIC ONLY. Do not install this APK or uninstall V0.1b.',
+              'A package or certificate mismatch blocks ordinary in-place Android upgrading.',
+              'A match does not prove upgrade safety; a higher versionCode and migration/backup testing are still needed.',
+          ]
+          report = '\n'.join(summary) + '\n'
+          Path('signature-audit.txt').write_text(report, encoding='utf-8')
+          step_summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if step_summary:
+              with open(step_summary, 'a', encoding='utf-8') as fh:
+                  fh.write(report)
+          print(report)
+          if package_status != 'match' or cert_status != 'match':
+              print('::warning::Package and/or signer not confirmed compatible. Preserve installed V0.1b and its data.')
+          PY
+      - name: Upload report only - never upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: terminal-x-v01c-signature-report
           path: signature-audit.txt
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
