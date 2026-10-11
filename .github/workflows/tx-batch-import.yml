@@ -126,6 +126,38 @@ jobs:
                       raise ValueError('Expected file missing in repository: ' + p)
                   staged[p] = blob
 
+              # Optional repository cleanup: explicit, SHA-256-locked files only.
+              # No globbing, no recursive deletion, no application source or test deletion.
+              removed = plan.get('remove', [])
+              if not isinstance(removed, list) or len(removed) > 30:
+                  raise ValueError('remove must be a list of at most 30 entries.')
+              def removable(path):
+                  if not isinstance(path, str) or '\\' in path or '..' in path:
+                      return False
+                  # Only previously committed, disposable archives / build drops.
+                  return (bool(re.fullmatch(
+                      r'terminal_x_[a-zA-Z0-9_-]+\.(?:zip|apk)', path))
+                      or bool(re.fullmatch(
+                          r'(?:dist|artifacts|out)/(?:tmp|obsolete|preview)/'
+                          r'[a-zA-Z0-9_./-]+\.(?:zip|apk)', path)))
+              remove_paths = set()
+              for entry in removed:
+                  if not isinstance(entry, dict) or set(entry) != {'path', 'sha256'}:
+                      raise ValueError('Each remove entry requires path and sha256.')
+                  p = entry['path']
+                  digest = entry['sha256']
+                  if (not removable(p) or p == 'terminal_x_batch.zip'
+                      or p in staged or p in remove_paths
+                      or not isinstance(digest, str)
+                      or not re.fullmatch(r'[a-f0-9]{64}', digest)):
+                      raise ValueError('Unsafe cleanup entry: ' + repr(p))
+                  dest = Path(p)
+                  if not dest.is_file() or dest.is_symlink():
+                      raise ValueError('Cleanup file missing or unsafe: ' + p)
+                  if hashlib.sha256(dest.read_bytes()).hexdigest() != digest:
+                      raise ValueError('Cleanup checksum conflict: ' + p)
+                  remove_paths.add(p)
+
           for p, blob in staged.items():
               dest = Path(p)
               dest.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +250,16 @@ jobs:
           from pathlib import Path
           manifest = json.loads(Path('.tx_batch_plan.json').read_text())
           paths = [f['path'] for f in manifest['files']]
+          # All removal entries were checked before tests/build. Verify again at
+          # commit time to prevent accidentally removing modified files.
+          for entry in manifest.get('remove', []):
+              p = entry['path']
+              file = Path(p)
+              if (not file.is_file() or file.is_symlink()
+                  or __import__('hashlib').sha256(file.read_bytes()).hexdigest()
+                      != entry['sha256']):
+                  raise SystemExit('Cleanup target changed; abort: ' + p)
+              subprocess.run(['git', 'rm', '--', p], check=True)
           Path('terminal_x_batch.zip').unlink()
           subprocess.run(['git', 'add', '--', *paths], check=True)
           subprocess.run(['git', 'add', '-A', '--', 'terminal_x_batch.zip'], check=True)
@@ -232,3 +274,48 @@ jobs:
           fi
           echo '### Terminal X batch import' >> "$GITHUB_STEP_SUMMARY"
           echo 'Regression and APK build passed; source files committed together.' >> "$GITHUB_STEP_SUMMARY"
+
+  prune-obsolete-debug-artifacts:
+    name: Prune old disposable debug APK artifacts
+    needs: verify-build-commit
+    if: needs.verify-build-commit.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Retain recent APKs, remove old disposable artifacts
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {owner, repo, per_page: 100}
+            );
+            const eligible = new Map();
+            for (const a of artifacts) {
+              // Only generated preview APK artifacts from V0.2 onwards.
+              // Protect V0.1*, backups, signed builds and release artifacts.
+              if (!/^terminal-x-v(?:0[2-9]|[1-9][0-9]+)[a-z0-9-]*-apk$/.test(a.name)) continue;
+              if (/backup|signed|release|stable/i.test(a.name)) continue;
+              if (!eligible.has(a.name)) eligible.set(a.name, []);
+              eligible.get(a.name).push(a);
+            }
+            const cutoff = Date.now() - 14 * 86400000;
+            let removed = 0;
+            for (const [name, group] of eligible) {
+              group.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              for (const a of group.slice(3)) {  // Always retain the latest 3 per version.
+                if (new Date(a.created_at).getTime() >= cutoff) continue;
+                if (removed >= 10) break;         // Cap deletions per batch.
+                await github.rest.actions.deleteArtifact({owner, repo, artifact_id: a.id});
+                core.info(`Removed old debug artifact ${name}, id=${a.id}`);
+                removed++;
+              }
+            }
+            await core.summary.addHeading('Preview artifact retention')
+              .addRaw(`Only debug APK artifacts: retained latest 3 per artifact name, removed ${removed} older than 14 days (max 10 per run).`)
+              .write();
