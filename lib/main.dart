@@ -1,7 +1,8 @@
-import 'dart:convert';
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'engine/tx_engine.dart';
+import 'engine/tx_session.dart';
 
 void main() => runApp(const TerminalX());
 
@@ -25,24 +26,21 @@ class TerminalX extends StatelessWidget {
 
 class TradingScreen extends StatefulWidget {
   const TradingScreen({super.key});
+
   @override
   State<TradingScreen> createState() => _TradingScreenState();
 }
 
 class _TradingScreenState extends State<TradingScreen> {
-  final _random = Random();
   final _qty = TextEditingController(text: '100');
   final _limit = TextEditingController(text: '10.00');
-  final symbols = ['SIM-A01', 'SIM-A02'];
-  final prices = [10.00, 25.00];
-  final owned = [0, 0];
-  final pending = <Map<String, dynamic>>[];
-  final trades = <String>[];
-  double cash = 1000000;
-  int selected = 0;
-  int step = 0;
-  bool limitOrder = false;
-  String message = '本地离线演示：点击「推进行情」更新虚拟报价。';
+  TxSession? _session;
+  int _selected = 0;
+  bool _limitOrder = false;
+  bool _loading = true;
+  String? _storageError;
+  String _message = 'V0.1b：真实有限盘口撮合，数据只保存在本机。';
+  Future<void> _writeChain = Future<void>.value();
 
   @override
   void initState() {
@@ -58,190 +56,288 @@ class _TradingScreenState extends State<TradingScreen> {
   }
 
   Future<void> _load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString('terminal_state');
-    if (raw == null) return;
     try {
-      final state = jsonDecode(raw) as Map<String, dynamic>;
+      final prefs = await SharedPreferences.getInstance();
+      final newSnapshot = prefs.getString(TxSession.saveKey);
+      late final TxSession session;
+      var migrated = false;
+      if (newSnapshot != null) {
+        session = TxSession.importJson(newSnapshot);
+      } else {
+        final legacy = prefs.getString(TxSession.oldSaveKey);
+        if (legacy == null) {
+          session = TxSession.fresh();
+        } else {
+          session = TxSession.fromLegacyJson(legacy);
+          migrated = true;
+        }
+        // Commit the new snapshot first; NEVER modify the legacy save key.
+        final saved = await prefs.setString(TxSession.saveKey, session.exportJson());
+        if (!saved) throw StateError('Initial session snapshot not written');
+      }
       if (!mounted) return;
       setState(() {
-        cash = (state['cash'] as num).toDouble();
-        for (var i = 0; i < 2; i++) {
-          prices[i] = (state['prices'][i] as num).toDouble();
-          owned[i] = (state['owned'][i] as num).toInt();
+        _session = session;
+        _loading = false;
+        _limit.text = (session.referenceCents[0] / 100).toStringAsFixed(2);
+        if (migrated) {
+          _message = '已迁移旧现金/持仓/报价。旧挂单仅归档，不会自动继续成交；旧存档未修改。';
         }
-        step = (state['step'] as num).toInt();
-        pending.addAll((state['pending'] as List).map((e) => Map<String, dynamic>.from(e)));
-        trades.addAll((state['trades'] as List).cast<String>());
       });
-    } catch (_) {
-      setState(() => message = '存档格式错误，已使用默认账户。');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _storageError = '无法安全读取旧版或新版存档：$error。已停止交易，未覆盖原存档。';
+      });
     }
   }
 
-  Future<void> _save() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('terminal_state', jsonEncode({
-      'cash': cash, 'prices': prices, 'owned': owned,
-      'pending': pending, 'trades': trades, 'step': step,
-    }));
-  }
-
-  // Five synthetic ask/bid levels; all quantities are executable in this demo.
-  List<Map<String, num>> levels(int symbol, {required bool asks}) {
-    final mid = prices[symbol];
-    return List.generate(5, (i) => {
-      'price': double.parse((mid + (asks ? 1 : -1) * (i + 1) * 0.01).toStringAsFixed(2)),
-      'qty': 100 + (i * 150),
+  // Serialize the snapshot writes to avoid an earlier async write overwriting
+  // a later snapshot. SQLite/Drift with real transactions remains the next step.
+  void _persist() {
+    final snap = _session!.exportJson();
+    _writeChain = _writeChain.then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = await prefs.setString(TxSession.saveKey, snap);
+      if (!saved) throw StateError('shared_preferences refused the write');
+    }).catchError((Object error) {
+      if (mounted) {
+        setState(() {
+          _storageError = '保存失败：$error。为保护数据，已暂停进一步下单。';
+        });
+      }
     });
   }
 
-  String _money(num n) => n.toStringAsFixed(2);
+  String _money(int cents) => (cents / 100).toStringAsFixed(2);
+  bool get _canTrade => !_loading && _session != null && _storageError == null;
 
-  void _trade({required int symbol, required bool buy, required int quantity,
-      required bool market, double? priceLimit}) {
-    if (quantity <= 0) {setState(() => message = '数量必须大于0'); return;}
-    var remaining = quantity;
-    var executed = 0;
-    var total = 0.0;
-    final book = levels(symbol, asks: buy);
-    for (final entry in book) {
-      final price = (entry['price'] as num).toDouble();
-      if (!market && ((buy && price > priceLimit!) || (!buy && price < priceLimit!))) break;
-      final available = (entry['qty'] as num).toInt();
-      final q = min(remaining, available);
-      if (buy && cash + 1e-8 < price * q) {
-        final affordable = (cash / price).floor();
-        if (affordable <= 0) break;
-        final actual = min(q, affordable);
-        cash -= actual * price;
-        owned[symbol] += actual;
-        total += actual * price;
-        executed += actual;
-        remaining -= actual;
-        break;
-      }
-      if (!buy && owned[symbol] < q) {
-        final actual = min(q, owned[symbol]);
-        if (actual <= 0) break;
-        cash += actual * price;
-        owned[symbol] -= actual;
-        total += actual * price;
-        executed += actual;
-        remaining -= actual;
-        break;
-      }
-      if (buy) {cash -= price * q; owned[symbol] += q;}
-      else {cash += price * q; owned[symbol] -= q;}
-      total += price * q;
-      executed += q;
-      remaining -= q;
-      if (remaining == 0) break;
-    }
-    setState(() {
-      if (executed > 0) {
-        trades.insert(0, '${buy ? '买入' : '卖出'} ${symbols[symbol]} $executed 股 均价 ${_money(total / executed)}');
-        if (trades.length > 20) trades.removeLast();
-      }
-      if (!market && remaining > 0) {
-        pending.add({'symbol': symbol, 'buy': buy, 'qty': remaining, 'limit': priceLimit});
-      }
-      message = '成交 $executed 股；${market ? '未成交数量取消' : '剩余已挂单'} $remaining 股。';
-    });
-    _save();
+  int? _parsePrice(String value) {
+    final amount = double.tryParse(value.trim());
+    if (amount == null || !amount.isFinite || amount <= 0 ||
+        amount * 100 > TxEngine.maxPriceCents) return null;
+    final cents = (amount * 100).round();
+    return cents >= 1 ? cents : null;
   }
 
-  void _submit(bool buy) {
+  void _submit(TxSide side) {
+    if (!_canTrade) return;
     final quantity = int.tryParse(_qty.text.trim());
-    final requestedPrice = double.tryParse(_limit.text.trim());
-    if (quantity == null || quantity <= 0 || (limitOrder && (requestedPrice == null || requestedPrice <= 0))) {
-      setState(() => message = '请输入有效的数量和价格。');
+    final price = _limitOrder ? _parsePrice(_limit.text) : null;
+    if (quantity == null || quantity <= 0 ||
+        (_limitOrder && price == null)) {
+      setState(() => _message = '请输入有效数量和限价。');
       return;
     }
-    _trade(symbol: selected, buy: buy, quantity: quantity, market: !limitOrder,
-      priceLimit: requestedPrice);
+    try {
+      final order = _session!.placePlayer(
+        symbol: TxSession.symbols[_selected],
+        side: side,
+        kind: _limitOrder ? TxKind.limit : TxKind.market,
+        quantity: quantity,
+        limitPriceCents: price,
+      );
+      setState(() {
+        _message = order.status == TxStatus.rejected
+            ? '拒单：${order.rejectReason}'
+            : '委托 ${order.id}：成交 ${order.filled} 股，剩余 ${order.remaining} 股；${_status(order.status)}';
+      });
+      _persist();
+    } catch (error) {
+      setState(() => _message = '下单失败：$error');
+    }
+  }
+
+  void _cancel(TxOrder order) {
+    if (!_canTrade) return;
+    try {
+      _session!.cancelPlayer(order.id);
+      setState(() => _message = '已撤销 ${order.id}，剩余冻结金额/持仓已释放。');
+      _persist();
+    } catch (error) {
+      setState(() => _message = '撤单失败：$error');
+    }
   }
 
   void _nextTick() {
-    setState(() {
-      for (var i = 0; i < 2; i++) {
-        final move = (_random.nextInt(7) - 3) * 0.01;
-        prices[i] = max(0.10, double.parse((prices[i] + move).toStringAsFixed(2)));
-      }
-      step++;
-      message = '行情推进到第 $step 步（演示随机报价）。';
-    });
-    // Process eligible pending limit orders on each tick.
-    final due = List<Map<String, dynamic>>.from(pending);
-    pending.clear();
-    for (final order in due) {
-      _trade(symbol: order['symbol'] as int, buy: order['buy'] as bool,
-        quantity: order['qty'] as int, market: false,
-        priceLimit: (order['limit'] as num).toDouble());
+    if (!_canTrade) return;
+    try {
+      _session!.nextTick();
+      setState(() => _message = '模拟时间：第 ${_session!.step} 步；有限流动性重新报价。');
+      _persist();
+    } catch (error) {
+      setState(() => _message = '推进行情失败：$error');
     }
-    _save();
+  }
+
+  String _status(TxStatus status) {
+    switch (status) {
+      case TxStatus.open:
+        return '挂单中';
+      case TxStatus.partiallyFilled:
+        return '部分成交';
+      case TxStatus.filled:
+        return '全部成交';
+      case TxStatus.cancelled:
+        return '已取消/未成交余量取消';
+      case TxStatus.rejected:
+        return '拒绝';
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final market = prices[selected];
-    final assets = cash + List.generate(2, (i) => owned[i] * prices[i]).reduce((a, b) => a + b);
-    final asks = levels(selected, asks: true).reversed.toList();
-    final bids = levels(selected, asks: false);
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_session == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('TERMINAL X · 存档保护')),
+        body: Padding(
+          padding: const EdgeInsets.all(20),
+          child: SelectableText(_storageError ?? '无法读取存档'),
+        ),
+      );
+    }
+    final session = _session!;
+    final player = session.engine.account(TxSession.playerId);
+    final symbol = TxSession.symbols[_selected];
+    final asks = session.engine.depth(symbol, TxSide.sell).reversed.toList();
+    final bids = session.engine.depth(symbol, TxSide.buy);
+    final orders = session.playerOrders;
+    final active = orders.where((o) =>
+        o.status == TxStatus.open || o.status == TxStatus.partiallyFilled).toList();
+    final recent = session.playerFills.take(8).toList();
+
     return Scaffold(
-      appBar: AppBar(title: const Text('TERMINAL X · 本地模拟'),
-        actions: [IconButton(icon: const Icon(Icons.skip_next), tooltip: '推进行情', onPressed: _nextTick)]),
+      appBar: AppBar(
+        title: const Text('TERMINAL X · V0.1b'),
+        actions: [IconButton(
+          icon: const Icon(Icons.skip_next),
+          tooltip: '推进行情',
+          onPressed: _canTrade ? _nextTick : null,
+        )],
+      ),
       body: ListView(padding: const EdgeInsets.all(14), children: [
-        Text('总资产 ¥${_money(assets)}', style: const TextStyle(fontSize: 25, fontWeight: FontWeight.bold)),
-        Text('现金 ¥${_money(cash)}  ·  第 $step 步', style: const TextStyle(color: Colors.white70)),
+        Text('总资产 ¥${_money(session.totalAssetsCents)}',
+            style: const TextStyle(fontSize: 25, fontWeight: FontWeight.bold)),
+        Text('现金 ¥${_money(player.cashCents)}  ·  可用 ¥${_money(player.availableCashCents)}'),
+        Text('冻结资金 ¥${_money(player.reservedCashCents)}  ·  第 ${session.step} 步',
+            style: const TextStyle(color: Colors.white70)),
         const SizedBox(height: 14),
-        SegmentedButton<int>(segments: const [
-          ButtonSegment(value: 0, label: Text('SIM-A01')),
-          ButtonSegment(value: 1, label: Text('SIM-A02')),
-        ], selected: {selected}, onSelectionChanged: (s) => setState(() {
-          selected = s.first;
-          _limit.text = prices[selected].toStringAsFixed(2);
-        })),
+        SegmentedButton<int>(
+          segments: const [
+            ButtonSegment(value: 0, label: Text('SIM-A01')),
+            ButtonSegment(value: 1, label: Text('SIM-A02')),
+          ],
+          selected: {_selected},
+          onSelectionChanged: (values) => setState(() {
+            _selected = values.first;
+            _limit.text = _money(session.referenceCents[_selected]);
+          }),
+        ),
         const SizedBox(height: 16),
-        Text('¥${_money(market)}', style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold)),
-        Text('持仓：${owned[selected]} 股', style: const TextStyle(color: Colors.white70)),
+        Text('¥${_money(session.lastPrice(symbol))}',
+            style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold)),
+        Text('持仓 ${player.sharesOf(symbol)} 股  ·  可卖 ${player.availableSharesOf(symbol)} 股',
+            style: const TextStyle(color: Colors.white70)),
         const SizedBox(height: 12),
-        const Text('五档合成盘口（演示）', style: TextStyle(fontWeight: FontWeight.bold)),
-        for (final l in asks) Text('卖盘   ¥${_money(l['price']!)}            ${l['qty']} 股',
-          style: const TextStyle(color: Color(0xFFFA7676))),
+        const Text('真实有限五档盘口（已冻结的委托数量）',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        if (asks.isEmpty) const Text('卖盘暂无有效挂单'),
+        for (final level in asks)
+          Text('卖盘  ¥${_money(level.priceCents)}       ${level.quantity} 股',
+              style: const TextStyle(color: Color(0xFFFA7676))),
         const Divider(),
-        for (final l in bids) Text('买盘   ¥${_money(l['price']!)}            ${l['qty']} 股',
-          style: const TextStyle(color: Color(0xFF54D49B))),
+        if (bids.isEmpty) const Text('买盘暂无有效挂单'),
+        for (final level in bids)
+          Text('买盘  ¥${_money(level.priceCents)}       ${level.quantity} 股',
+              style: const TextStyle(color: Color(0xFF54D49B))),
         const SizedBox(height: 12),
         Row(children: [
           const Text('限价单'),
-          Switch(value: limitOrder, onChanged: (v) => setState(() => limitOrder = v)),
-          Expanded(child: TextField(controller: _qty, keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: '数量（股）'))),
+          Switch(value: _limitOrder, onChanged: _canTrade
+              ? (v) => setState(() => _limitOrder = v) : null),
+          Expanded(child: TextField(
+            controller: _qty,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: '数量（股）'),
+          )),
         ]),
-        if (limitOrder) TextField(controller: _limit, keyboardType: const TextInputType.numberWithOptions(decimal: true),
-          decoration: const InputDecoration(labelText: '限价')),
+        if (_limitOrder) TextField(
+          controller: _limit,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(labelText: '限价'),
+        ),
         const SizedBox(height: 10),
         Row(children: [
-          Expanded(child: FilledButton(onPressed: () => _submit(true), child: const Text('买入'))),
+          Expanded(child: FilledButton(
+            onPressed: _canTrade ? () => _submit(TxSide.buy) : null,
+            child: const Text('买入'),
+          )),
           const SizedBox(width: 8),
-          Expanded(child: OutlinedButton(onPressed: () => _submit(false), child: const Text('卖出'))),
+          Expanded(child: OutlinedButton(
+            onPressed: _canTrade ? () => _submit(TxSide.sell) : null,
+            child: const Text('卖出'),
+          )),
         ]),
-        OutlinedButton.icon(onPressed: _nextTick, icon: const Icon(Icons.fast_forward), label: const Text('推进行情一步')),
-        Text(message, style: const TextStyle(color: Colors.amberAccent)),
+        OutlinedButton.icon(
+          onPressed: _canTrade ? _nextTick : null,
+          icon: const Icon(Icons.fast_forward),
+          label: const Text('推进行情一步'),
+        ),
+        Text(_storageError ?? _message,
+            style: TextStyle(color: _storageError == null
+                ? Colors.amberAccent : Colors.redAccent)),
+        if (session.isLegacyUpgrade)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('旧版资产已迁移；旧挂单不会自动执行，原存档保留。',
+                style: TextStyle(color: Colors.orangeAccent)),
+          ),
         const SizedBox(height: 14),
-        Text('挂单（${pending.length}）', style: const TextStyle(fontWeight: FontWeight.bold)),
-        for (var i = 0; i < pending.length; i++)
-          ListTile(dense: true, title: Text('${pending[i]['buy'] ? '买' : '卖'} ${symbols[pending[i]['symbol'] as int]} ${pending[i]['qty']}股 @ ${pending[i]['limit']}'),
-            trailing: IconButton(icon: const Icon(Icons.close), onPressed: () {
-              setState(() => pending.removeAt(i)); _save();
-            })),
+        Text('当前挂单（${active.length}）',
+            style: const TextStyle(fontWeight: FontWeight.bold)),
+        if (active.isEmpty) const Text('暂无玩家挂单'),
+        for (final order in active)
+          ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            title: Text('${order.side == TxSide.buy ? '买' : '卖'} ${order.symbol} '
+                '${order.remaining}/${order.quantity}股 @ ¥${_money(order.limitPriceCents!)}'),
+            subtitle: Text('${order.id} · ${_status(order.status)}'),
+            trailing: IconButton(
+              tooltip: '撤单',
+              icon: const Icon(Icons.close),
+              onPressed: _canTrade ? () => _cancel(order) : null,
+            ),
+          ),
         const SizedBox(height: 12),
-        const Text('最近成交', style: TextStyle(fontWeight: FontWeight.bold)),
-        for (final trade in trades.take(8)) Text(trade),
-        const SizedBox(height: 40),
-        const Text('仅供本地功能验证。尚未实现K线、完整订单簿、资金冻结、市场规则或AI策略。',
-          style: TextStyle(color: Colors.white54, fontSize: 12)),
+        const Text('最近成交（真实撮合）', style: TextStyle(fontWeight: FontWeight.bold)),
+        if (recent.isEmpty) const Text('暂无玩家成交'),
+        for (final fill in recent)
+          Text('${session.engine.order(fill.buyOrderId).ownerId == TxSession.playerId ? '买入' : '卖出'} '
+              '${fill.symbol} ${fill.quantity}股 @ ¥${_money(fill.priceCents)}'),
+        const SizedBox(height: 12),
+        const Text('最近委托状态', style: TextStyle(fontWeight: FontWeight.bold)),
+        for (final order in orders.take(8))
+          Text('${order.id} · ${_status(order.status)} · 已成交 ${order.filled}/${order.quantity}'),
+        if (session.archivedLegacyOrders.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text('旧版待处理挂单归档（${session.archivedLegacyOrders.length}，未激活）'),
+          for (final order in session.archivedLegacyOrders.take(10))
+            Text(order.toString(), style: const TextStyle(color: Colors.white54)),
+        ],
+        if (session.archivedLegacyTrades.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          const Text('旧版历史成交记录（仅供查看）'),
+          for (final entry in session.archivedLegacyTrades.take(8))
+            Text(entry, style: const TextStyle(color: Colors.white54)),
+        ],
+        const SizedBox(height: 36),
+        const Text('本地合成股票与有限资金/库存做市商。未实现正式交易所规则、手续费、SQLite或生产签名。',
+            style: TextStyle(color: Colors.white54, fontSize: 12)),
       ]),
     );
   }
