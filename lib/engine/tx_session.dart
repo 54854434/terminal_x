@@ -1,7 +1,5 @@
-/// Terminal X V0.1b single-device session: deterministic finite makers,
-/// account/book state and a versioned snapshot. No Flutter dependency.
-///
-/// The v0.1 demo save remains untouched under the old `terminal_state` key.
+/// Single-device, deterministic simulated trading session.
+/// Existing JSON snapshots remain schema-compatible and are never reset.
 import 'dart:convert';
 import 'tx_engine.dart';
 
@@ -41,9 +39,8 @@ class TxSession {
     return result;
   }
 
-  /// Migrates only settled legacy assets. Old demo pending orders are archived,
-  /// not executed or silently dropped: they had no reserved cash/shares and
-  /// cannot be safely resumed as live orders without user re-confirmation.
+  /// Read-only legacy import is retained for tests and old flows, but the
+  /// isolated V0.2.1 app always creates or opens its own fresh SQLite account.
   static TxSession fromLegacyJson(String oldJson) {
     final data = Map<String, dynamic>.from(jsonDecode(oldJson) as Map);
     final oldCash = _validLegacyMoney(data['cash'], 'cash');
@@ -71,7 +68,6 @@ class TxSession {
     final archive = pendingRaw.map((o) =>
         Map<String, dynamic>.from(o as Map)).toList();
     final tradeArchive = tradeRaw.map((o) => o as String).toList();
-
     final e = TxEngine();
     e.registerAccount(playerId, cashCents: oldCash, shares: shares);
     e.registerAccount('LP_A', cashCents: 300000000, shares: {symbols[0]: 25000});
@@ -83,9 +79,25 @@ class TxSession {
     return session;
   }
 
-  /// The reference quote is deterministic by symbol and simulated step.
-  /// Requote does not restore consumed inventory or cash: makers must remain
-  /// funded and fully comply with the same engine reservation constraints.
+  /// The upgraded market model is deterministic from the saved simulation step;
+  /// no wall clock, mutable PRNG state or external market data is involved.
+  /// Trend regimes rotate every 120 simulated minutes. No false fills are made.
+  static int referenceMove(int minute, int symbolIndex) {
+    if (minute < 1 || symbolIndex < 0 || symbolIndex >= symbols.length) {
+      throw ArgumentError('Invalid simulation minute or symbol');
+    }
+    final regime = ((minute - 1) ~/ 120 + symbolIndex * 2) % 4;
+    final mix = ((minute * 1103515245 + symbolIndex * 12345 + 1013904223)
+        ^ (minute * 2654435761)) & 0x7fffffff;
+    final noise = ((mix ^ (mix >> 7) ^ (mix >> 13)) % 13) - 6;
+    switch (regime) {
+      case 0: return 2 + noise * 2;  // upward regime
+      case 1: return noise;          // quiet range
+      case 2: return -2 + noise * 2; // downward regime
+      default: return noise * 4;    // wide and volatile
+    }
+  }
+
   void nextTick() {
     final restingMakerOrders = engine.orders.values.where((o) =>
         o.ownerId.startsWith('LP_') &&
@@ -98,8 +110,8 @@ class TxSession {
     step++;
     _quoteFillStart = engine.fills.length;
     for (var i = 0; i < symbols.length; i++) {
-      final adjustment = ((step * 17 + i * 11 + 3) % 7) - 3;
-      referenceCents[i] = (referenceCents[i] + adjustment).clamp(10, 1000000).toInt();
+      referenceCents[i] = (referenceCents[i] + referenceMove(step, i))
+          .clamp(10, 1000000).toInt();
     }
     _quoteMakers();
     engine.checkInvariants();
@@ -204,7 +216,6 @@ class TxSession {
     if (quoteFillStart < 0 || quoteFillStart > engine.fills.length) {
       throw const FormatException('Invalid fill cursor');
     }
-    // In addition to ledger checks, ensure the player and makers exist.
     for (final id in [playerId, 'LP_A', 'LP_B']) {
       engine.account(id);
     }
