@@ -1,0 +1,58 @@
+name: Build Terminal X V0.2 Batch Terminal (isolated)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'lib/main_terminal_v02.dart'
+      - 'lib/market/**'
+      - 'lib/widgets/**'
+      - 'lib/storage/tx_trading_service.dart'
+      - 'lib/storage/tx_sqlite_store.dart'
+      - 'test/tx_trading_service_test.dart'
+      - 'test/tx_candle_history_test.dart'
+      - 'test/tx_candle_chart_test.dart'
+      - '.github/workflows/build-v02-terminal.yml'
+      - 'pubspec.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create DIFFERENT V0.2 Android application
+        run: |
+          flutter create --org com.terminalx.v02 --project-name terminal_x --platforms=android .
+          grep -Rq 'applicationId = "com.terminalx.v02.terminal_x"' android/app/build.gradle.kts
+          grep -Rq 'namespace = "com.terminalx.v02.terminal_x"' android/app/build.gradle.kts
+          ! grep -Rq 'com.terminalx.preview.terminal_x' android/app/build.gradle.kts
+          ! grep -Rq 'com.terminalx.v01c.terminal_x' android/app/build.gradle.kts
+          sed -i 's/android:label="terminal_x"/android:label="Terminal X V0.2"/' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:label="Terminal X V0.2"' android/app/src/main/AndroidManifest.xml
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Run legacy, SQLite and V0.2 batch regressions
+        run: |
+          flutter test test/tx_engine_test.dart test/tx_session_test.dart test/tx_backup_commit_test.dart test/tx_sqlite_store_test.dart test/tx_trading_service_test.dart test/tx_candle_history_test.dart test/tx_candle_chart_test.dart
+      - name: Build isolated professional trading APK
+        run: flutter build apk --debug --target lib/main_terminal_v02.dart
+      - name: Upload V0.2 batch APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-x-v02-batch-terminal-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
