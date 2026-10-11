@@ -1,0 +1,51 @@
+name: Build Terminal X V0.1d SQLite Probe (isolated)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'lib/storage_probe_main.dart'
+      - 'lib/storage/tx_sqlite_store.dart'
+      - '.github/workflows/build-storage-probe.yml'
+      - 'pubspec.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Generate DIFFERENT Android application ID
+        run: |
+          flutter create --org com.terminalx.storageprobe --project-name terminal_x --platforms=android .
+          grep -Rq 'applicationId = "com.terminalx.storageprobe.terminal_x"' android/app/build.gradle.kts
+          grep -Rq 'namespace = "com.terminalx.storageprobe.terminal_x"' android/app/build.gradle.kts
+          ! grep -Rq 'com.terminalx.preview.terminal_x' android/app/build.gradle.kts
+          ! grep -Rq 'com.terminalx.v01c.terminal_x' android/app/build.gradle.kts
+          sed -i 's/android:label="terminal_x"/android:label="Terminal X SQLite Probe"/' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:label="Terminal X SQLite Probe"' android/app/src/main/AndroidManifest.xml
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Run existing regressions and SQLite security tests
+        run: flutter test test/tx_engine_test.dart test/tx_session_test.dart test/tx_backup_commit_test.dart test/tx_sqlite_store_test.dart
+      - name: Build separate SQLite test APK
+        run: flutter build apk --debug --target lib/storage_probe_main.dart
+      - name: Upload SQLite test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-x-v01d-sqlite-probe-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
