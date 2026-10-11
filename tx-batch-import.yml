@@ -1,0 +1,234 @@
+name: Terminal X - One ZIP Batch Import and APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terminal_x_batch.zip'
+  workflow_dispatch:
+
+# This installer is only activated by a direct commit of a single ZIP to main.
+# Never use pull_request_target and never run untrusted fork contents with write access.
+permissions:
+  contents: write
+
+concurrency:
+  group: terminal-x-import-main
+  cancel-in-progress: false
+
+jobs:
+  verify-build-commit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the ZIP commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Verify ZIP manifest and stage source changes
+        id: batch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import stat
+          import zipfile
+
+          archive = Path('terminal_x_batch.zip')
+          if not archive.is_file():
+              raise SystemExit('Upload terminal_x_batch.zip to repository root first.')
+          if archive.stat().st_size > 20 * 1024 * 1024:
+              raise SystemExit('Batch ZIP must be no more than 20 MiB.')
+
+          def allowed(path):
+              parts = PurePosixPath(path).parts
+              return (bool(parts) and len(parts) >= 2 and
+                      parts[0] in ('lib', 'test', 'assets', 'scripts') or
+                      path in ('docs/TERMINAL_X_HANDOFF.md', 'pubspec.yaml',
+                               'analysis_options.yaml'))
+
+          def check_path(path):
+              if (not isinstance(path, str) or len(path) > 220 or not path or
+                  path.startswith('/') or '\\' in path or ':' in path or
+                  any(x in ('', '.', '..') for x in path.split('/')) or
+                  any(x.startswith('.') for x in path.split('/')) or
+                  not allowed(path)):
+                  raise ValueError('Disallowed batch file path: ' + repr(path))
+              return path
+
+          with zipfile.ZipFile(archive, 'r') as z:
+              entries = z.infolist()
+              if len(entries) < 2 or len(entries) > 101:
+                  raise ValueError('Unexpected ZIP entry count.')
+              names = [info.filename for info in entries]
+              if len(set(names)) != len(names) or 'manifest.json' not in names:
+                  raise ValueError('ZIP contains duplicate names or no manifest.')
+              if any(i.is_dir() or stat.S_ISLNK(i.external_attr >> 16)
+                     or i.flag_bits & 1 for i in entries):
+                  raise ValueError('Directories, symlinks and encrypted ZIP entries are forbidden.')
+              if sum(i.file_size for i in entries) > 30 * 1024 * 1024:
+                  raise ValueError('Uncompressed ZIP contents exceed 30 MiB.')
+              if z.getinfo('manifest.json').file_size > 64 * 1024:
+                  raise ValueError('Manifest is too large.')
+              plan = json.loads(z.read('manifest.json').decode('utf-8'))
+              if plan.get('schema') != 1 or not isinstance(plan.get('files'), list):
+                  raise ValueError('Unsupported manifest schema.')
+              files = plan['files']
+              if not files or len(files) > 100:
+                  raise ValueError('Manifest must declare 1–100 files.')
+              paths = [check_path(entry['path']) for entry in files]
+              if len(set(paths)) != len(paths) or set(names) != set(paths) | {'manifest.json'}:
+                  raise ValueError('ZIP entries differ from the manifest file list.')
+
+              build = plan['build']
+              org = build['org']
+              target = check_path(build['target'])
+              app_id = build['application_id']
+              label = build['display_name']
+              artifact = build['artifact']
+              tests = build['tests']
+              if (not re.fullmatch(r'[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+', org)
+                  or app_id != org + '.terminal_x'
+                  or not target.startswith('lib/') or not target.endswith('.dart')
+                  or not re.fullmatch(r'[A-Za-z0-9 ._-]{1,32}', label)
+                  or not re.fullmatch(r'[A-Za-z0-9_-]{1,70}', artifact)
+                  or not isinstance(tests, list) or not 1 <= len(tests) <= 40
+                  or len(set(tests)) != len(tests)
+                  or any(not isinstance(t, str) or not t.startswith('test/') or
+                         not t.endswith('_test.dart') or '\\' in t or '..' in t
+                         for t in tests)):
+                  raise ValueError('Invalid build configuration or test paths.')
+
+              # Verify every new file AND its expected old content before replacing anything.
+              staged = {}
+              for entry in files:
+                  p = entry['path']
+                  blob = z.read(p)
+                  digest = hashlib.sha256(blob).hexdigest()
+                  if digest != entry['sha256']:
+                      raise ValueError('SHA-256 mismatch: ' + p)
+                  dest = Path(p)
+                  if dest.is_symlink():
+                      raise ValueError('Refusing symlink destination: ' + p)
+                  expected_old = entry.get('previous_sha256')
+                  if dest.is_file():
+                      actual_old = hashlib.sha256(dest.read_bytes()).hexdigest()
+                      if expected_old != actual_old:
+                          raise ValueError('Repository version conflict: ' + p)
+                  elif expected_old is not None:
+                      raise ValueError('Expected file missing in repository: ' + p)
+                  staged[p] = blob
+
+          for p, blob in staged.items():
+              dest = Path(p)
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              dest.write_bytes(blob)
+          if not Path(target).is_file() or any(not Path(t).is_file() for t in tests):
+              raise ValueError('Build target or one or more tests not present after import.')
+          Path('.tx_batch_plan.json').write_text(json.dumps(plan), encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('artifact=' + artifact + '\n')
+          print(f'Validated {len(staged)} files, batch={plan.get("batch")!r}.')
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Prepare isolated Android application
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          plan = json.loads(Path('.tx_batch_plan.json').read_text())['build']
+          subprocess.run(['flutter', 'create', '--org', plan['org'],
+                          '--project-name', 'terminal_x', '--platforms=android', '.'],
+                         check=True)
+          gradle = Path('android/app/build.gradle.kts').read_text()
+          if ('applicationId = "' + plan['application_id'] + '"' not in gradle or
+              'namespace = "' + plan['application_id'] + '"' not in gradle):
+              raise SystemExit('The generated Android application ID does not match the manifest.')
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          text = manifest.read_text()
+          if 'android:label="terminal_x"' not in text:
+              raise SystemExit('Unexpected Android label template; stop, do not overwrite.')
+          manifest.write_text(text.replace('android:label="terminal_x"',
+                                           'android:label="' + plan['display_name'] + '"'))
+          PY
+
+      - name: Install Flutter packages
+        run: flutter pub get
+
+      - name: Run batch regression suite once
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          tests = json.loads(Path('.tx_batch_plan.json').read_text())['build']['tests']
+          subprocess.run(['flutter', 'test', *tests], check=True)
+          PY
+
+      - name: Build separate Android debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          target = json.loads(Path('.tx_batch_plan.json').read_text())['build']['target']
+          subprocess.run(['flutter', 'build', 'apk', '--debug', '--target', target], check=True)
+          PY
+
+      - name: Upload the APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.batch.outputs.artifact }}
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit all verified files as one change and remove uploaded ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          manifest = json.loads(Path('.tx_batch_plan.json').read_text())
+          paths = [f['path'] for f in manifest['files']]
+          Path('terminal_x_batch.zip').unlink()
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          subprocess.run(['git', 'add', '-A', '--', 'terminal_x_batch.zip'], check=True)
+          PY
+          if git diff --cached --quiet; then
+            echo 'No source changes staged; batch was already present.'
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m 'Batch import verified Terminal X sources and handoff'
+            git push origin HEAD:main
+          fi
+          echo '### Terminal X batch import' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Regression and APK build passed; source files committed together.' >> "$GITHUB_STEP_SUMMARY"
