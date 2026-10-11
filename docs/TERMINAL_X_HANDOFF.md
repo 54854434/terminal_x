@@ -3,8 +3,11 @@
 > **用途**：将本文件上传到新的 ChatGPT 对话，便于直接继续项目，而不必重新讲述全部背景。
 >
 > **更新日期**：2026-10-11  
-> **文档版本**：1.9  
-> **当前阶段**：V0.1b 阶段A已在GitHub Actions通过 **17/17** 测试并入库（`49836dacb90819e653fadc3bbed47d43c2c2fb83`）。阶段B用户已上传并运行，run `38140701786` 测试及 **Android APK编译均成功**；但 `git push` 因GitHub App缺少 `workflows` 权限被拒绝，未将新版界面/构建工作流/交接文档提交到 `main`，且本次APK Artifact步骤被跳过。正在准备**手机端两份YAML一次上传**的恢复方式；旧APK保留、阶段B实机尚未验证。完整V0.1尚未完成。
+> **文档版本**：2.4  
+> **GitHub 工程唯一地址**：**https://github.com/54854434/terminal_x** （Public；默认分支 `main`）  
+> **规范交接路径**：`docs/TERMINAL_X_HANDOFF.md`（主文件）；历史文件 `docs/TERMINAL_X_HANDOFF_LATEST.md` 仅供核对  
+> **当前阶段**：**V0.1b 代码入库、17/17 自动测试通过、APK 云端构建成功，用户已反馈安卓手机实测 10/10 通过，无异常报告。** 旧原型历史实测 8/8 通过；完整 V0.1 尚未完成。
+> **本轮验证（2026-10-11）**：用户已确认 V0.1b 手机验收 10/10 通过。GitHub `main` 最新核实为 `dc1cb4e65c4bba88350e78618abf19878437fed0`，v2.3 已作为 `docs/TERMINAL_X_HANDOFF(20261011-133044).md` 上传成功，但**规范主文件 `docs/TERMINAL_X_HANDOFF.md` 仍为 v1.9**。本地 v2.4 为纠偏与清理预检版本，尚未提交。没有新增代码/构建/实测或删除。详见第 12 节。
 
 ## 0. 新对话给 AI 的指令（优先阅读）
 
@@ -15,7 +18,7 @@
 2. 每一步给出适合手机操作的具体指令、文件路径、完整可复制的内容和验收方法。
 3. 优先交付真正能安装、能交易、能保存的最小功能闭环；不要一次堆满五大市场。
 4. 新增功能不能破坏资金/订单一致性。先确保测试通过，再构建 APK。
-5. 仓库已由用户于2026-10-11设为 Public：`https://github.com/54854434/terminal_x`。允许公开读取真实源码；当前连接仅具有读取权限，**不具备推送权限**，故所有改动必须经手机GitHub手动上传。
+5. GitHub 仓库于2026-10-11设为 Public：`https://github.com/54854434/terminal_x`。可直接公开读取仓库源码；当前连接对仓库仅有**读取权限**。修改需由用户手机网页提交，或由用户运行经过限制的 GitHub Actions 完成；不要要求安装插件或使用电脑。
 6. 每次里程碑结束，**更新本交接文档的“当前状态、下一步、已知问题、文件版本”**，供下一段对话使用。
 
 ---
@@ -82,258 +85,238 @@
 
 **阶段性通过标准**：手机能够下单→正确成交→更新余额与持仓→大单影响成交价→退出重启恢复→重新构建安装。不要用静态演示数据冒充真实的虚拟交易结果。
 
-## 4. 已完成的首个手机原型与验收（2026-10-11 用户确认）
+## 4. 用户确认的旧原型手机验收（历史基线）
 
-用户已经明确确认：
-- **用户曾将交接 `.md` 上传GitHub**；已核实 `docs/TERMINAL_X_HANDOFF.md` 后来在提交 `d9b219d` 被删除，主分支目前缺失该路径。用户于2026-10-11已把仓库设为 Public。
-- **用户报告安卓APK已生成、安装并可打开**；已确认真实 `main` 的 `lib/main.dart` 为早期简化原型，构建工作流为 debug APK；但旧版APK的具体运行编号、签名证书与对应提交SHA尚未独立核实。
-- **8项实机功能测试均报告通过**：
-  1. App正常打开，不闪退；
-  2. 显示默认100万元虚拟资金；
-  3. 两只虚拟股票可以切换；
-  4. 买入100股后现金减少、持仓增加；
-  5. 卖出50股后资金、持仓相应变化；
-  6. 五档盘口及最近成交可查看；
-  7. 可以提交、撤销限价挂单；
-  8. 退出重进后资产数据保留。
+2026-10-11 用户已经确认**第一代 APK 已安装，并通过以下 8 项手机实测**：启动不闪退、显示默认 100 万元模拟资金、两只模拟股票切换、买入100股现金减少持仓增加、卖出50股资金持仓相应变化、查看五档盘口与最近成交、提交并撤销限价挂单、退出重启后资产保留。此结果仅针对**旧原型**，不等于新版 V0.1b 的手机实测，也不证明旧原型具有真实连续订单簿。
 
-**验收界限**：以上证明基础操作流程正常，**不代表**已实现真实连续订单簿、正确资金冻结、价格-时间优先撮合、可靠多价位价格冲击、手续费、AI持仓约束、完整SQLite账务或专业K线。它仍是可运行的早期原型，不应记为完整 V0.1 验收通过。
+旧原型曾使用 `lib/main.dart` 中模拟五档和随机推进逻辑，`shared_preferences` 持久化使用 `terminal_state` 键，委托/现金没有完善冻结。旧 APK 对应的精确安装包SHA及其签名证书仍未核实。**不要卸载旧 APK，不要删除旧 App 数据。**
 
-此前提供入门包 `terminal_x_mobile_starter.zip`，含：
+## 5. 已核实的最新开发状态（2026-10-11）
 
-```text
-terminal_x_mobile_starter/
-├── pubspec.yaml
-├── lib/main.dart
-├── .github/workflows/build-apk.yml
-└── README.md
-```
+### 5.1 GitHub 与提交记录
 
-2026-10-11 已实际读取 `main` 的 `lib/main.dart`：代码仍为 Flutter/Dart + `shared_preferences` 原型，两资产、合成五档盘口、简化市/限价委托、随机推进行情。**已证实旧代码无挂单冻结与连续价格—时间优先撮合**，且随机数无固定种子；不能把新交付未上传的源码说成线上已实现。
+- 唯一工程地址：**https://github.com/54854434/terminal_x**；`Public`、主分支 `main`。
+- **最新核实的远端 `main` 提交：`dc1cb4e65c4bba88350e78618abf19878437fed0`**，`Add files via upload`，仅新增了误命名的交接副本。V0.1b 代码里程碑提交仍是 `290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`。[最新提交](https://github.com/54854434/terminal_x/commit/dc1cb4e65c4bba88350e78618abf19878437fed0)。
+- 远端**规范主文件** `docs/TERMINAL_X_HANDOFF.md` **仍是 v1.9**（Git blob SHA `913dd0eb959152770fe0680678d7530b745de90c`）；手机上传的完整 v2.3 存在于**错误路径** `docs/TERMINAL_X_HANDOFF(20261011-133044).md`（blob `98f4c6fc97e0d7daf024d8e8122ac9ccd956a8af`，内容验证为 v2.3），尚未替换规范主文件。本地 v2.4 待上传，禁止误报远端主文件已同步。
+- 旧重复交接文件 `docs/TERMINAL_X_HANDOFF_LATEST.md` 仍存在，作为历史版本暂留；规范路径仅 `docs/TERMINAL_X_HANDOFF.md`。
+- 本轮 `get_repo` 再次确认：GitHub 连接 `pull: true`、`push: false`，仓库 `public`、默认分支 `main`；不需要用户重复提供仓库地址或安装 GitHub 插件。
+- 本轮 `search_commits` 最新记录为 `dc1cb4...`；`fetch_commit` 证明仅新增上述误命名文档副本。尚未穷尽更晚的 Actions 运行。
 
-### 下一开发目标：V0.1b
+### 5.2 阶段 A：引擎及测试已经真实完成
 
-1. 引入有状态的买卖订单簿，撮合按价格优先、同价时间优先；成交、盘口深度和挂单数量一致。
-2. 提交买单冻结足够资金，卖单冻结可卖持仓；部分成交后按比例释放/占用，撤单释放剩余冻结量；处理无效订单、重复提交及余额不足。
-3. 单一事务或等价的一致性机制保存订单、逐笔成交、现金/持仓流水；迁移SQLite/Drift之前规划清楚旧存档升级/导出和签名安全。
-4. 最低限度实现模拟做市商的有限流动性；大额单跨多个价位成交时价格与滑点可追溯。谨慎控制手机算力。
-5. 添加纯Dart自动化测试，并让 GitHub Actions 在生成APK前执行 `flutter test`。
-6. 尽可能保持已经通过测试的8项功能不回退。
+- 2026-10-11 运行 [Actions #38139622283](https://github.com/54854434/terminal_x/actions/runs/38139622283)：日志明确显示 **`🎉 17 tests passed.`**，通过后自动 push 至 `main`。
+- 真实入库提交 `49836dacb90819e653fadc3bbed47d43c2c2fb83`，新增核心源码及测试：
+  - `lib/engine/tx_engine.dart`：整数分的账务状态、有限双侧订单簿、价优先同价FIFO、跨档成交、部分成交、限价/市价约束、买入现金/卖出股票冻结、撤单释放、成交和账户流水、订单ID去重与权限检查、快照和校验等；具体实现以当前 GitHub 文件为准。
+  - `lib/engine/tx_session.dart`：`SIM-A01`、`SIM-A02`；有资金与库存约束的有限合成流动性提供者及固定规则报价，步进时钟、存档与旧版资产迁移。
+  - `test/tx_engine_test.dart`、`test/tx_session_test.dart`：共 17 项单元测试，已由 GitHub Actions 实际运行通过。
+  - `pubspec.yaml`：`flutter_test` 开发依赖已入库。
+- `flutter_test` 证明测试案例中的业务规则，不代表已有完整市场机制、SQLite 事务、独立 AI 智能体或手机 UI 端到端通过。
 
-**下一项具体任务（2026-10-11 最新）**：阶段A已通过，下一步阶段B：从已交付的 `terminal_x_v01b_stage_B_preview_app.zip` 中仅提取并上传 `lib/main.dart` 和 `.github/workflows/build-apk.yml`（依次在 GitHub 目标目录替换）；`docs/TERMINAL_X_HANDOFF.md` 使用本次最新v1.7，不要使用阶段B ZIP中的旧交接版本。构建动作必须先跑自动化测试再生成独立预览 APK。旧应用保留，避免签名/存档破坏。已核实旧 build #6 成功，详见§13。
+### 5.3 阶段 B：真实集成与 APK 已云端成功
 
+- 首次批量导入 [Actions #38140701786](https://github.com/54854434/terminal_x/actions/runs/38140701786)：**17项测试与 APK 编译成功**，但 GitHub 内置令牌没有 `workflows` 文件修改权限，push `.github/workflows/build-apk.yml` 被拒绝。该次运行整体失败、APK Artifact 被跳过；临时 runner 提交 `c5478f9` **并非远端提交**。
+- 用户随后**手动更新** `.github/workflows/build-apk.yml`，新版工作流 SHA `28c5be6c60663b742531bcfbde026d8682cf5c79`；工作流内 `flutter test` 先于 `flutter build apk --debug`。
+- 恢复运行 [**Actions #38141798593**](https://github.com/54854434/terminal_x/actions/runs/38141798593)，job `114476989497`：**最终 success**；ZIP/基线校验、Flutter 环境、依赖、**17/17项测试**、Android debug APK 构建、push 界面/交接文件、Artifact 上传全部成功。
+- 阶段 B 真实入库提交：**`290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`**。`lib/main.dart` 已改为使用 `TxSession`/`TxEngine`（已读源码，Git blob SHA `3ef34844a6f935ff3d402013dd6e83c31ef30714`），与旧原型 UI 逻辑不同；仓库规范交接文档入库的是 **v1.9**。
+- **可下载的实际 APK Artifact**：`terminal-x-v01b-stage-b-preview-debug`，ID `11702639474`，ZIP Artifact 大小 72,049,098 字节；本轮 GitHub 接口确认 `expired=false`，`expires_at=2027-01-09T13:05:32Z`；Artifact ZIP SHA-256 `6115d744cd32527897f678b11ee1011a7ecf2cc1b99f54203c2e8e8d314e24f6`（**这是 Artifact ZIP 的摘要，不是解压后 APK 的 SHA**）；[直接打开 Artifact 页面](https://github.com/54854434/terminal_x/actions/runs/38141798593/artifacts/11702639474)。这不是本对话沙盒中的 APK，需用安卓浏览器在 GitHub 下载解压后安装。
+- 当前预览 App 用 `flutter create --org com.terminalx.preview --project-name terminal_x --platforms=android .` 编译，**预期 Android 应用 ID 为 `com.terminalx.preview.terminal_x`**，设计上可与旧版并存；实际手机安装/签名指纹/升级兼容性**待用户验证**。`--debug` 不等于固定可更新的正式签名。
+- **2026-10-11 用户已明确报告 V0.1b 安卓实测 10/10 项全部通过、备注无；详细分项见第11节。** 测试由用户执行，AI未直接接触设备。
+- 本轮复查 job `114476989497` 的原始日志：`🎉 17 tests passed.`、`✓ Built build/app/outputs/flutter-apk/app-debug.apk`、Artifact ID `11702639474` 上传完成；`flutter create --org com.terminalx.preview --project-name terminal_x --platforms=android .` 确实执行。该次 Artifact 对应工作流原始 `head_sha=f39671e25c9e208b19466547a25b68f1a003ce49`，因为恢复工作流是在 runner 构建后才向 main push 代码，最终入库提交为 `290fbf...`；不要把两者错误混写成同一个 Git SHA。
+- APK 证书指纹、APK 文件 SHA-256、手机安装与未来覆盖升级是否兼容：**待核实**。
 
-### 2026-10-11 私人仓库身份与权限核查（交接版本 1.4）
+### 5.4 新版当前代码的具体行为（源码已读，10 项手机反馈已通过）
 
-**当时用户提供仓库地址：** `https://github.com/54854434/terminal_x`。以下404仅为**公开前的历史记录**；本轮已成功读取公开仓库。
+- `lib/main.dart` 中有两股票切换、真实订单簿五档、现金/可用/冻结金额、持仓/可卖数、买入/卖出、市/限价、撤单、委托状态、最近成交、手动推进行情。
+- `TxSession.saveKey = 'terminal_x_v01b_state'`，旧键为 `terminal_state`；新版本从旧保存数据导入已结算现金、持仓、报价和步数时，**旧挂单仅归档、不重新激活**，不覆盖原 `terminal_state`。坏存档进入保护模式，拒绝交易而不是静默重置；这是已读代码和单测覆盖的意图，尚非手机端验证。
+- 现阶段仍采用 `shared_preferences` 快照和顺序写盘；**尚非 SQLite/Drift 的真正原子数据库事务**，应用意外终止和跨版本迁移仍需专项验证。
+- 深色专业 UI 仅为基本版；完整 K 线、行情事件、复杂 AI、交易所时间与规则、正式生产签名等均**未完成**。
 
-**实际执行的 GitHub 连接检查：**
+## 6. V0.1b 手机安装与验收记录（现已通过）
 
-- `get_repo(repository_full_name="54854434/terminal_x")`：GitHub API 返回 `404 Not Found`。
-- `fetch_file` 尝试读取 `pubspec.yaml`、`docs/TERMINAL_X_HANDOFF.md`：均返回 `404 Not Found`。
-- `list_installations`：`installations: []`；`list_installed_accounts`：`accounts: []`。
-- `get_user_login`：连接识别的 GitHub 用户为 **`idx7`**（与用户给出的仓库拥有者 `54854434` 不同）；是否该账户被添加为仓库协作者也未核实。
-- `search_installed_repositories_streaming(query="terminal_x")`：结果为空。
+**以下为历史手机验收操作步骤；2026-10-11 用户已反馈 10/10 通过，请勿重复要求重做。下一优先事项见第 11 节。**
 
-**诊断结论：** 当前 GitHub 连接无法读取 `54854434/terminal_x`。这**可能**是连接了不同账号或缺少私仓授权；不能据此断定仓库不存在。未获取默认分支、提交 SHA、实际代码、仓库交接 MD、Actions、构建编号/签名信息；**未修改任何 GitHub 文件、分支或 Actions 设置**。
+1. 手机浏览器打开 [已成功的 GitHub Actions 运行](https://github.com/54854434/terminal_x/actions/runs/38141798593)，在 `Artifacts` 选择 `terminal-x-v01b-stage-b-preview-debug` 下载ZIP；解压后找到 `app-debug.apk`。如果手机页面不显示下载，开启浏览器「桌面版网站」。不要下载失败的 `38140701786`，它没有Artifact。
+2. 在安卓手机上安装新预览 APK。因为不同应用 ID，设计上不覆盖旧 APK；**不要卸载原 App**、不要清除旧数据。记录能否安装、启动、旧 App 是否仍存在、默认资金和两股票的显示。
+3. **推荐手机测试清单（具体输入与核对值见第10节）**：①安装启动，②两股切换与初始资产，③SIM-A01市价买100/卖50后的现金与持仓，④超额限价买单拒单，⑤空仓卖单拒单，⑥限价买单冻结现金，⑦限价卖单冻结可卖股与撤单释放，⑧SIM-A02市价大单跨五档与余量撤销，⑨模拟时间推进，⑩退出/重开后资产、挂单、步数恢复。先做正常重开，再单独验证强制结束程序恢复；不能把未测试记成通过。
+4. 如出现安装冲突、启动异常、异常资产或账务不守恒：记录手机提示、哪一步、预期/实际结果、对应 Actions 链接；下段对话以真实问题优先修复。**现已获得手机实测 10/10 通过，但实际清理仍须另行明确授权。**
+5. 手机验收后再处理仓库清理及下一里程碑。若继续新开发，必须先验证测试/构建再交付，保持旧版可回退。
 
-**历史建议已过期：** 当时仓库仍为Private，曾建议通过插件授权。用户后来主动选择公开仓库，已能读取。不要再要求安装插件或重复核对仓库地址。
+## 7. GitHub 清理计划（用户明确要求后续顺带清理）
 
-**历史检查现状：** 已成功读取前三份真实源码与默认分支、最新提交 SHA；交接文件在最新提交中删除。旧APK Actions运行号与签名证书未能核实。本轮V0.1b源码基于实际原型设计，仍需Actions测试和手机验证。
+**本轮通过 GitHub 文件接口再次核实：两份 ZIP 和三个一次性工作流仍在 `main`；尚未执行清理，也未上传清理工作流。**
 
-**本次文件改动：** 只更新会话内 `TERMINAL_X_HANDOFF.md`（v1.3 → v1.4），未更改 `terminal_x_v01b_additive.zip` 中的 Dart/测试/YAML；它们继续保持“已生成未编译、未验证”。本地文件不等于 GitHub 已同步。
+- 临时根目录 ZIP：`terminal_x_v01b_stage_A_engine_tests.zip`（历史大小 16,145 B；本轮 blob SHA `c4754a3ec96426a1d0382088e0e5b553267a750e`）与 `terminal_x_v01b_stage_B_bulk_v18.zip`（历史大小 21,906 B；本轮 blob SHA `b4b530b05bd5c846c264cc91022f1681dee024a2`）。手机关键回归现已确认；仍须先预览并经用户逐项明确授权才可清理。
+- 上一对话曾计划/生成清理工作流 `terminal_x_cleanup_uploaded_packages.yml`，但**本轮上传的附件不包含该 YAML，GitHub 目标路径 `.github/workflows/terminal_x_cleanup_uploaded_packages.yml` 返回 404**；切勿声称本轮已有可用文件。用户手机回归已通过；下一步可重新审查并提供严格白名单版本：`workflow_dispatch` 默认 `mode=preview` 只列目标；只有 `mode=delete` 且校验确认口令 `DELETE_TWO_V01B_ZIPS` 才允许删除两份 ZIP，操作前还要验证 `main` 的当前提交、目标 blob SHA 和无并行改动；不得开放任意路径或通配符删除。
+- 旧一次性工作流：`.github/workflows/terminal_x_import_stage_a.yml`（blob `fbb422a7...`）、`.github/workflows/terminal_x_import_stage_b.yml`（blob `91e5532b...`）、`.github/workflows/terminal_x_import_stage_b_recovery.yml`（blob `515ce093...`）本轮均核实仍存在。经用户确认不再需要时才考虑**手机 GitHub 网页手动逐个删除**；GitHub 内置令牌不应被假定有修改 workflow 文件的权限。
+- **必须保留**：`.github/workflows/build-apk.yml`、`.github/workflows/v01b-engine-validation.yml`、`lib/`、`test/`、`pubspec.yaml`、`docs/TERMINAL_X_HANDOFF.md`。历史 `docs/TERMINAL_X_HANDOFF_LATEST.md` 在新版主文件已确认同步且无内容丢失后才能考虑手动删除。
+- 删除 GitHub 当前分支文件**不会清除历史 Git commits** 中的文件内容。公有仓库不应上传 token、密码、私有 APK 签名密钥或手机私人存档。不要因为清理而删除用户唯一可回退的代码或测试产物。
+- 任何清理都必须**在用户显式确认后实际执行**；目前仅计划，不应说已清理。
 
-### 2026-10-11 本轮增量开发记录（交接版本 1.3）
+## 8. 开发路线与未解决事项
 
-**审查动作与范围：**已阅读全文上传的交接版本1.2，并尝试通过可用 GitHub 连接查询 `terminal_x` 仓库、可访问仓库清单、GitHub App 安装授权；均无可用目标（安装授权列表为空）。**因此没有检查真实 `main` 源代码，也没有检查任何 Actions 成功记录或构建产物；仓库 URL、分支最新 SHA 和实际工程目录全部待核实。**不应推断 GitHub 上已经接收本次改动。
-
-**本轮只新增旁路文件，绝不覆盖 `lib/main.dart`、`pubspec.yaml`、旧构建工作流或存档：**
-
-- `lib/engine/tx_engine.dart`：零 Flutter 依赖的内存撮合核心：两侧有限订单簿、同价FIFO、按价优先、多档成交价、限价/市价IOC、现金及股票锁定与撤单释放、账户和成交流水、幂等订单ID、自成交防护、JSON快照导出/导入、运行时一致性检查。**状态：代码已写但未编译、未与App连接。**
-- `test/tx_engine_test.dart`：11个 `flutter_test` 单测，覆盖价格/时间优先、跨档冲击、有限库存、买卖冻结、撤单、余额不足、ID重复及权限、非法单、自成交、快照恢复/篡改保护。**状态：已写，测试未运行。**
-- `.github/workflows/v01b-engine-validation.yml`：新的、与原APK构建解耦的云端测试工作流。**状态：本地文件已生成，未推送，未触发。**
-- `docs/V01B_MOBILE_INTEGRATION.md`：手机 GitHub 页面可执行的复制/集成/验收步骤，明确先测试后合并老 APK 工作流，不能未核实就整体覆盖既有YAML。**状态：说明已写。**
-- `docs/TERMINAL_X_HANDOFF.md`：本交接文件 v1.3。**状态：会话内生成，可供下载；未推送GitHub。**
-
-**严格的验收边界：**新增引擎不等于用户当前APK启用了该逻辑；`exportJson` 只是序列化，不代表原子写盘/旧存档迁移；在这个执行环境找不到 Dart 和 Flutter 命令，无法运行 `flutter test` 或编译 APK。此前报告通过的8项手机测试**不是针对本次源码的回归测试**。
-
-**下一件唯一优先事项：**找回真实 GitHub 项目路径与构建配置（手机浏览器提供仓库地址/授权或上传 `pubspec.yaml`、`lib/main.dart`、`.github/workflows/build-apk.yml` 和最近一次 Actions 日志），确认它们与现有8项正常App匹配后，先合并三个新增旁路文件并在 Actions 跑11个测试；**测试为绿前不将新引擎接进交易按钮，也不替换旧存档**。随后按 `docs/V01B_MOBILE_INTEGRATION.md` 在原APK工作流的 build 步骤前增加测试门禁，云编译通过后再作接入与手机回归。
-
-**已知问题/风险：**无法校验编译与具体 Flutter API/依赖兼容性；旧存档字段、原订单实现及其用户数据迁移策略未知；动作还没有账务事务化存盘；没有固定 APK 私有签名记录；没有真实有限做市策略，只允许手工预置有资金/库存的对手账户。切勿卸载原 APK 或覆盖原有持久化键。
-
-## 5. 仅用安卓手机构建APK的操作流程
-
-### 首次准备
-
-1. 在安卓手机浏览器登录/注册 [GitHub](https://github.com/)。
-2. **现已有仓库，无需新建**：直接进入 [terminal_x](https://github.com/54854434/terminal_x)，默认分支 `main`。
-3. 把工程的 `pubspec.yaml`、`lib/main.dart`、`.github/workflows/build-apk.yml` 上传/创建到相应路径。手机浏览器若隐藏菜单，可开启“桌面版网站”。**文件路径必须保持层级**。
-4. 点击仓库的 **Actions**，打开 `Build Android APK`。提交到 `main` 可以自动触发，或在 `workflow_dispatch` 下手动 Run workflow。
-5. 如果运行成功，到对应 workflow run 页面 **Artifacts** 下载 `terminal-x-apk`，解压后获取 `app-debug.apk`；先核实此运行确实使用本轮新工作流。
-6. 在安卓手机打开 APK，按系统提示允许该来源安装应用，并做首次交易与数据恢复测试。
-7. 如果失败，查看 Actions 里**第一处失败步骤**，复制完整关键日志，在新对话提供，用日志定位问题而非重新猜测。
-
-### 稳定升级必须补的环节
-
-- 初期 `--debug` 构建仅用于验证安装；后期需要**固定的私有签名密钥**构建可持续升级的APK。不同云端机器的调试签名可能不一致，无法保证覆盖安装。
-- 未做数据导出前**不要随意卸载旧版**，卸载通常会删除App内部数据。
-- 添加存档导出/导入，然后迁移到 SQLite+Drift、正式版本签名。
-- 不把签名私钥、密钥口令或其他秘密写进仓库源代码；通过 GitHub Actions Secrets 管理。
-- GitHub Actions 免费额度、构建平台及第三方Action版本可能变化，以当前后台和错误日志为准。
-
-## 6. 后续开发优先顺序
-
-| 里程碑 | 工作内容 | 阶段状态 |
+| 阶段 | 状态 | 后续验收 |
 |---|---|---|
-| 0 | 手机上创建仓库，上传工程，GitHub Actions生成并安装调试APK | **已由用户确认完成：首个APK生成并通过8项手机基础测试** |
-| 1 | **V0.1b（进行中）**：独立Dart撮合、会话与持久化兼容、Flutter UI接入代码、云测/云编译工作流 | **基于真实源码已生成完整待上传改造包、17项待运行测试；无提交、无新APK、无新实测** |
-| 2 | 使用 SQLite + Drift 完整保存账户、委托、成交、持仓、事件 | 未开始 |
-| 3 | 专业竖屏UI、交互K线、完整盘口、交易详情 | 未开始 |
-| 4 | 持久化订单簿和本地AI做市商、大单真实市场冲击 | 未开始 |
-| 5 | 操盘台：算法拆单、资金规模/流动性测量、退出成本 | 未开始 |
-| 6 | A股/美股/期货/外汇/加密各自独立市场规则 | 未开始 |
-| 7 | 跨市场联动、经济事件、历史回放、压力测试和长时间优化 | 未开始 |
+| 初始原型 | **用户实测通过 8/8**，保留旧 APK | 不与新 APK 混淆 |
+| V0.1b 阶段 A | **源码入库，GitHub 单测 17/17 通过** | 已完成 |
+| V0.1b 阶段 B | **新 UI 入库，17/17单测通过，debug APK 已构建并上传** | **用户实测 10/10 通过** |
+| 仓库规范交接 | 规范主文件仍 v1.9；v2.3 误传为时间戳副本；本地 v2.4 | 手机**准确同名覆盖** `docs/TERMINAL_X_HANDOFF.md`，核对 SHA/版本 |
+| 临时包/工作流清理 | **计划，未执行** | 用户关键回归已通过；待预览、确认后才可删除 |
+| 数据库事务与迁移 | **未完成**：SQLite + Drift；可备份导出/导入 | 事务一致性与异常恢复测试 |
+| 稳定 APK 签名 | **未完成**：debug 签名不保证未来覆盖升级 | 固定安全签名与升级兼容测试 |
+| 交互K线、专业盘口、风控指标 | 未完成/待增强 | 手机竖屏体验与长时性能 |
+| 更丰富有限 AI 做市与大单执行 | 后续计划；初版有限规则LP已写 | 对手库存、现金及冲击/滑点 |
+| 完整市场规则与五大市场 | 后续计划 | 按品种配置交易时间、T+1/T+0、费用/结算/保证金与风险约束 |
+| 多倍速、暂停、无限模拟、分支存档及历史回放 | 后续计划；当前只有简化手动步进 | 可复现、无限期与安全存档 |
 
-**当前最重要的一步**：阶段A **17/17项Actions测试通过并提交到 `main`**；阶段B需经手机更新UI和带测试门禁的APK构建工作流，等待云端新APK构建与手机实测。保留旧APK与旧应用数据。不要从头初始化仓库，不要跳到五大市场。
+**开发守则（永久）**：撮合与资金/库存/流水必须一致且可追溯；订单状态完整；多价位冲击取决于真实可用深度；做市商资金和库存有限；不凭玩家金额强行操控价格；价格与时间优先；历史回放不被玩家篡改真实历史价；规则按市场/品种/日期配置；优先从两只股票做可安装、可交易、可保存、可回退的最小功能闭环。严格区分已有代码、已云端测试、已构建、已手机实测。
 
-## 7. 必须长期坚持的核心技术约束
+## 9. 新对话开场口令（以第12节 v2.4 纠偏后的事实为准）
 
-- 所有成交发生在同一套模拟撮合规则中；**不能用界面点击直接增减资产而不写成交与账务流水**。
-- 交易请求与资金/库存校验、执行和账务更新需要原子性，避免重复成交、重复扣款。
-- 必须清楚区分订单创建、有效挂单、部分成交、成交完毕、取消、拒绝、过期。
-- 买卖盘口、成交记录和实际执行所用流动性需一致；无无限虚拟对手盘。
-- 行情/账户可用固定随机种子与事件序列重现，方便测试和分支存档。
-- 资金越大越可能出现冲击成本，但并**不能随意强制推高价格**；主要由订单簿深度和AI行为决定。
-- 不把模拟股票规则硬编码为所有A股均10%涨跌幅，或所有期货均无限制；市场规则应按品种和日期配置。
-- 历史回放模式不能让玩家改变真实已发生的历史价位；若没有历史逐笔/盘口数据，要把衍生盘口明确标注为合成。
-- 不接入真实资金/真实交易账户，也不将系统作为真实市场操纵工具。
-
-## 8. 新对话建议直接发这段话
-
-> 请完整阅读我上传的 `TERMINAL_X_HANDOFF.md`，这是我们正在推进的 Terminal X 安卓离线交易/操盘模拟器项目。我只有安卓手机。请不要从头重新策划产品，而是按文档的当前阶段继续落地。我已确认项目交接文件上传GitHub、首个APK生成并在安卓手机上通过8项基础测试。请首先检查当前仓库的工程源码、构建配置与最近成功运行记录，接着按V0.1b计划修复订单簿、资金冻结、部分成交、撤单及账务一致性，添加自动化测试；不要重新创建项目或再要求验证那8项已报告通过的功能。交付的每项修改都要附完整文件、路径、测试及复现办法；最后同步更新这份交接文档。
-
-**仓库已核实**：`https://github.com/54854434/terminal_x`（Public），默认分支 `main`。当前可以直接读取公开源码但连接不具写权限；用户只能安卓手机操作网页+Actions，勿再要求插件或电脑。
-
-## 9. 每次新对话结束要更新的“活跃状态栏”
-
-- **最后更新/交接版本**：2026-10-11 / **1.9**。
-- **GitHub仓库**：`https://github.com/54854434/terminal_x`，**Public**，`main`，公开源码可读、当前AI连接无写入权限；用户仅安卓手机操作GitHub网页和云端Actions。
-- **最后已核实的 `main` 提交 SHA**：`2faa9db26d38a35a1d5335d606950500a8f9ebad`，由用户网页上传阶段B导入workflow；**并非阶段B源码提交**。阶段A已入库SHA `49836dacb90819e653fadc3bbed47d43c2c2fb83`。
-- **阶段A自动化验证**：run `38139622283`、job `114470600752`，成功，日志 `17 tests passed.`，已提交6份文件包括两份Dart引擎/两份测试/依赖与技术文档。
-- **阶段B批量构建实测（服务器侧）**：用户已上传 `terminal_x_v01b_stage_B_bulk_v18.zip`（根目录，21,906字节）以及 `.github/workflows/terminal_x_import_stage_b.yml`；run `38140701786`、job `114473807015`，ZIP校验、Flutter设置、17/17测试、`flutter build apk --debug` **全部成功**。随后尝试提交三个文件时GitHub拒绝工作流修改：`refusing to allow a GitHub App to create or update workflow .github/workflows/build-apk.yml without workflows permission`。该run总结果 **failure**，未成功push，Artifact上传步骤 **skipped**；不能声称APK已有可下载产物。
-- **GitHub当前代码**：`lib/main.dart`仍是早期原型（blob SHA `5170999c27c1c28098935525ee9e408dc9a8c62e`）；`.github/workflows/build-apk.yml`仍是旧版（blob SHA `ef2ba7e10a0010649f15910abc35198af34447df`）。已通过阶段A的`lib/engine/`、`test/`、`pubspec.yaml`没有被破坏。
-- **用户旧APK实测通过**：8/8（启动、100万初始资金、切换双股票、买100/卖50、盘口与成交、限价挂撤、退出恢复）。**阶段B新APK手机安装及实测仍未发生**。
-- **APK构建记录/签名**：旧版run `38134148983`、`38139388744`、`38139500807` success（旧UI）；阶段B `38140701786` 编译成功但Artifact未上传。预览包使用调试构建、独立包名`com.terminalx.preview.terminal_x`，具体证书指纹和固定升级签名均待核实；勿卸载旧包，旧存档不可跨应用沙箱直接读取。
-- **交接文档状态**：GitHub仓库仍有历史 `docs/TERMINAL_X_HANDOFF_LATEST.md`；规范主路径 `docs/TERMINAL_X_HANDOFF.md` **尚未提交**。本地生成v1.9文件，恢复工作流拟在成功后与`lib/main.dart`一起提交；当前只能把它列为**准备交付，尚未远端验收**。
-- **下一件唯一优先事项**：通过手机浏览器把新版`.github/workflows/build-apk.yml`和新`.github/workflows/terminal_x_import_stage_b_recovery.yml`一起上传到`.github/workflows/`，然后手动运行`Terminal X - Recover Stage B and Publish APK`；核对17测试、APK构建、源码/文档推送、Artifact均全绿，记录新的main提交SHA，再下载安装进行回归。
-- **未解决问题**：阶段B尚未推送/可下载安装；缺少新版手机实测；新版`shared_preferences`尚非SQLite/Drift事务；真实存档迁移未手机实测、签名持续升级、复杂市场规则、做市策略与性能仍待完成。**完整V0.1尚未完成**。
+> 请按上传的 `TERMINAL_X_HANDOFF.md` **v2.3** 继续开发 Terminal X。仓库 `https://github.com/54854434/terminal_x`，Public，`main`。最后核实 commit `290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`；17/17 测试通过，成功 APK run `38141798593` / Artifact `11702639474`；**2026-10-11 用户已确认新版安卓手机验收 10/10 通过，无异常反馈**，旧原型历史 8/8。请先确认远端主交接是否已同步 v2.3，再准备白名单清理预览；任何删除须用户另行明确确认。清理后才推进 SQLite/Drift 的事务化保存。用户仅有安卓手机，无电脑；本次结束必须更新最新交接 MD。
 
 ---
 
-## 10. V0.1b本轮交付文件清单与校验
+### 前次交接活跃状态（历史记录，v2.3；已由第12节取代）
 
-本轮独立增量包：`terminal_x_v01b_additive.zip`（手动将文件合并至**现有项目**，不是可直接安装的APK或完整Flutter工程）。其中正式交接位置为 `docs/TERMINAL_X_HANDOFF.md`。文件版本标签均为 **V0.1b draft / 2026-10-11**，不得记为用户实测通过。为了验证手机上传内容一致，各文件 SHA-256 如下（以本次生成文件为准）：
+- GitHub 最新复核 `main`：`290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`；没有新提交。
+- APK run `38141798593` 成功，Artifact `11702639474` 有效；17/17 GitHub 测试通过。
+- **手机验收：旧原型历史 8/8；新版 V0.1b 用户实测 10/10 全通过、无异常反馈。**
+- 本轮没有确认的故障；无代码/工作流改动、无新测试执行/构建、无 GitHub 删除。
+- 远端交接 v1.9；本地最新 v2.3 尚未提交。**当前唯一优先事项：先同步 v2.3 交接并在不执行删除的情况下准备安全清理预览；删除前取得单独明确许可。**
+- 清理后推进 SQLite/Drift 原子事务、迁移、备份与签名规划，先测试再构建。
+- 未穷尽所有 Actions 运行搜索；SQLite/Drift、固定签名、强制杀进程/断电一致性仍待后续专项验收。
 
-- `lib/engine/tx_engine.dart`：`5f62785ac70908633a6a320304d602ffa860d39d7614dfcf3ba4d327b63b7620`
-- `test/tx_engine_test.dart`：`8128b3efcdb12dae72095ca73fa4cf6816dd8ed9884eb057fba52265cd073635`
-- `.github/workflows/v01b-engine-validation.yml`：`1a42cf84d66c077a7eb42694d83b0e2ba6c5abe8231585b4bb9bb30724d9c12c`
-- `docs/V01B_MOBILE_INTEGRATION.md`：`f57c68bef104af64222bde64f09d1a701dbaacc3a917091339d3a284546cc26d`
+## 10. 2026-10-11 v2.2 历史验收方案（已被第11节结果更新）
 
-**MD文件自身不提供静态SHA**（避免把自校验值写入自身引起循环改写）。交接文档中的代码和构建状态以本次可下载包为准；GitHub 提交完成后应记录实际 commit SHA 和 Actions 结果。
+### 10.1 本轮实际完成（不冒充手机验收）
 
-## 11. 公开仓库核对与 V0.1b UI/测试门禁集成（交接 v1.5，2026-10-11）
+- **GitHub 读取验证**：`54854434/terminal_x` 为公开、默认 `main`、本连接只读；`main` 最新提交 `290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`。
+- **构建/测试验证**：成功的恢复 job `114476989497` 原始日志有 `17 tests passed.` 和 `Built build/app/outputs/flutter-apk/app-debug.apk`，Artifact `11702639474` 可用；ZIP SHA-256 及有效期见 5.3 节。
+- **已检查文件路径**：`lib/main.dart` (blob `3ef34844a6f935ff3d402013dd6e83c31ef30714`)、`lib/engine/tx_session.dart` (blob `214d36201cd640626c7dadedf7b0efdb5247c65a`)、`test/tx_session_test.dart` (blob `ccbabe540fdd0dbe891ea96bf2879de0ba36c4e2`)、`.github/workflows/build-apk.yml` (blob `28c5be6c60663b742531bcfbde026d8682cf5c79`)、`.github/workflows/v01b-engine-validation.yml` (blob `5886e04db98a08b01e87f98793cce617eaed3aed`)、`docs/TERMINAL_X_HANDOFF.md` (blob `913dd0eb959152770fe0680678d7530b745de90c`)；后者内容仍 v1.9。两个 ZIP、三个一次性导入工作流和旧 `docs/TERMINAL_X_HANDOFF_LATEST.md` 也已核实存在。
+- **本轮实际 GitHub 提交**：无。**本轮新 Dart/UI 功能**：无；先进行已有 APK 的手机端关键回归，符合“优先唯一下一件可验证工作”的协议。
+- **实测状态**：旧 APK 8/8（历史用户确认）；V0.1b 当时 **0 项收到反馈/全部待测**；**此为历史状态，2026-10-11 后续已获 10/10 通过反馈，见第11节**。没有远程控制用户安卓手机的能力；不得擅自标注通过。
 
-**本节取代先前v1.3/v1.4“私仓无法读取”的历史状态，不删除旧里程碑背景。** GitHub仓库已经公开，读取权限成功。`main` 实际 Flutter `lib/main.dart` 与旧交接猜测相符。`pubspec.yaml` 当前 `version: 0.1.0+1`、`sdk: >=3.5.0 <4.0.0`，运行依赖 `shared_preferences: ^2.5.3`；原仓库缺少测试开发依赖，本轮在`pubspec.yaml`新增`flutter_test` SDK dev_dependency。GitHub `build-apk.yml` 目前没有 `flutter test` 步骤，构建产物`terminal-x-apk`。最新已读HEAD `d9b219d1122f3b83eb08292e5b8f440a88337ecb` 删除了`docs/TERMINAL_X_HANDOFF.md`。历史Actions成功记录、调试签名SHA、用户实际运行时对应HEAD均未独立查到。
+### 10.2 手机下载/安装
 
-**本轮新代码的设计变化（不是已上线功能）：**
+1. 手机浏览器登录 GitHub，打开 <https://github.com/54854434/terminal_x/actions/runs/38141798593/artifacts/11702639474>，下载 Artifact ZIP。若无法定位下载项，打开运行页的 `Artifacts` 区域，必要时开启浏览器“桌面版网站”。
+2. 解压 ZIP 并安装 `app-debug.apk`；若 Android 拒绝安装，请记录报错内容。**严禁卸载旧版、清除旧版数据、上传手机存档到公有仓库。**
+3. 打开新 App，确认标题 `TERMINAL X · V0.1b`、初始两只股票和账号。若已有迁移存档或不是新安装，现金数值可能与下述“新存档”参考不同，先记录，避免直接断言错误。
 
-1. 在既有`tx_engine.dart`上加入会话`tx_session.dart`，单一钱包/流水账本，2只虚拟股，做市账户现金/可卖股均有限；模拟时间推进重挂报价，但库存/资金不会无条件补充。报价变化为步数驱动的确定性序列。
-2. 替换候选`lib/main.dart`：原按钮直改资金的逻辑已迁移至`engine.place()`；盘口展示订单簿中真实未成交量；显示可用/冻结余额、可卖数量、最近逐笔成交和挂撤单。
-3. 候选会话快照记录订单、成交、冻结、账本、时间/行情状态、旧订单归档。启动时若新版单键存档缺失，则只读解析旧键 `terminal_state` 的现金/持仓/参考价格/时钟、保留旧字符串成交历史；**旧挂单只归档，避免无预约资金/股票的旧单自动成交**。旧键不覆盖；新版无效存档时停止交易避免回退为默认百万账户。
-4. 新增6个会话/旧版迁移单测，连同上一轮11个引擎测试共17个；提供独立云端测试workflow及“APK构建前必须17项测试通过”的新build workflow。
-5. 新debug预览包将使用与旧APK不同的安卓applicationId `com.terminalx.preview.terminal_x`，以避免覆写旧APK或陷入不稳定debug签名升级。**因此此预览包无法访问旧APK沙箱存档，迁移只通过测试数据自动化验证，旧版原地迁移尚未实机验证。**
+### 10.3 精确场景（仅限新的、未进行其他订单和 tick 的第 0 步存档）
 
-**执行顺序**：A上传引擎、会话、2份测试、测试工作流以及`pubspec.yaml`→Actions绿色；B替换界面和APK流程并恢复交接MD→Actions先test后build→安装独立预览包→用户进行回归。详见本轮`docs/V01B_MOBILE_UPGRADE.md`。实际GitHub同步/Actions/手机验证结果留待下次核实，绝不能提前标绿。
+| 编号 | 操作 | 源码推导的期望 | 结果（待用户填） |
+|---|---|---|---|
+| 1 | 启动与切换 SIM-A01/SIM-A02 | 不闪退；现金 ¥1,000,000.00、无玩家持仓、模拟步数 0 | 待测 |
+| 2 | SIM-A01 关闭“限价单”，市价买 100 股 | 最优卖盘 ¥10.01 × 100；持仓 100 股，现金 ¥998,999.00 | 待测 |
+| 3 | SIM-A01 市价卖 50 股 | 最优买盘 ¥9.99 × 50；剩 50 股，现金 ¥999,498.50 | 待测 |
+| 4 | SIM-A01 限价 ¥8.00 买 200000 股 | 超过可用资金，订单应拒绝，不应成交或冻结 | 待测 |
+| 5 | SIM-A02 空仓市价卖 1 股 | 应拒绝：可卖数量不足 | 待测 |
+| 6 | SIM-A01 限价 ¥8.00 买 50 股 | 挂单，冻结现金 ¥400.00（现金总额不应直接减少）；撤销后冻结释放 | 待测 |
+| 7 | SIM-A01 限价 ¥12.00 卖 30 股 | 挂单，持仓仍为 50 股，可卖从 50 减为 20；撤销后可卖回到 50 | 待测 |
+| 8 | SIM-A02 未推进行情、未提前成交时市价买 300 股 | 初始卖盘总量 245 股，跨 5 档成交 245，剩余 55 被取消；成交价格应涵盖 ¥25.01 至 ¥25.05 | 待测 |
+| 9 | 点击“推进行情一步” | 步数+1，有限流动性重新报价；无异常账务变化 | 待测 |
+| 10 | 新建不交叉的限价单，等待持久化，正常关闭/重开，随后另测强制终止 | 持仓、现金、可用/冻结、活动挂单、步数恢复；记录任何异常 | 待测 |
 
+测试数据若因前序成交、模拟 tick 或旧存档迁移发生改变，应按当前实际盘口价格和量核对，不要机械套用上面的第 0 步数字。任何失败要记录“操作—预期—实际—界面截图/报错—设备/Android版本（可选）”，不得将未测或未知标为通过。尤其要核对下单后账户余额、冻结金额、成交价和剩余量是否一致。
 
-## 12. v1.6 安卓手机批量导入阶段A（2026-10-11）
+### 10.4 下一轮唯一优先动作与验收门槛
 
-**本节新增的是上传便利工具，不是已验证的交易功能里程碑。**
-
-用户当前只能安卓手机操作，逐目录手动上传7份阶段A源码容易错放路径。本轮从上轮文件 `terminal_x_v01b_stage_A_engine_tests.zip` 派生**只需两次网页上传操作**的辅助方案：
-
-1. 在公开仓库 `https://github.com/54854434/terminal_x` 的**根目录**通过 `Add file → Upload files` 上传原始 `terminal_x_v01b_stage_A_engine_tests.zip`。文件必须保持原始名称与字节，不要在手机端重新打包。
-2. 进入 `.github/workflows/` 目录，上传新生成的 `terminal_x_import_stage_a.yml`，并建议同时上传新单列出的 `v01b-engine-validation.yml`（在文件选择器里一次选两份；如果移动浏览器不能多选，则分别上传）。这两份工作流需用户亲自在浏览器提交，不能指望默认 `GITHUB_TOKEN` 在 workflow 里创建工作流文件。
-3. 打开 `Actions → Terminal X - Import Stage A from ZIP → Run workflow`（选择`main`）。工作流先校验输入 ZIP 的 SHA-256、精确路径清单、现有 `pubspec.yaml` 的已知版本以及其他目标文件未被异版改写；**仅**解压根目录 `pubspec.yaml`、`lib/engine/tx_engine.dart`、`lib/engine/tx_session.dart`、`test/tx_engine_test.dart`、`test/tx_session_test.dart`、`docs/V01B_MOBILE_UPGRADE.md`；然后 `flutter pub get` 与 `flutter test test/tx_engine_test.dart test/tx_session_test.dart`。只有测试全绿才通过 `GITHUB_TOKEN` 的 `contents: write` 提交并推送这6份非workflow文件到 `main`。旧 `lib/main.dart`、原 `build-apk.yml` 与旧App存档**不会触碰**。
-4. GitHub Actions 使用内建仓库令牌进行的 push 通常**不会自动再触发其他普通 push 工作流**，如单独上传了 `v01b-engine-validation.yml`，请再手动运行 `V0.1b Engine Validation`，检查绿色。测试失败的日志即本轮下一次修复输入；失败时未提交交易源码，保留旧APK。
-5. 阶段A成功后，**不得直接声称新版APK已生成**。阶段B的 `lib/main.dart`、`.github/workflows/build-apk.yml` 及完整交接文档仍须按阶段B指导集成、构建与验收。
-
-文件校验：
-
-- `terminal_x_v01b_stage_A_engine_tests.zip`：SHA-256 `122203f2af5dba3cc54cbc8c9b4caaa42ed7e9866885dda977574848202aa7cf`（原阶段A ZIP，包含7份文件）。
-- `terminal_x_import_stage_a.yml`：SHA-256 `12760a63583ddc822772d2b49861418b175e97ebfa55b5fc98f9aa1da2b265ce`，建议仓库路径 `.github/workflows/terminal_x_import_stage_a.yml`。
-- `v01b-engine-validation.yml`：SHA-256 `846b49782a92916499c38096a40842b2ca2384bfa8832fefaa0a853c87376f7f`，建议仓库路径 `.github/workflows/v01b-engine-validation.yml`。
-
-已知限制：
-
-- 本轮**只在会话内生成了辅助 workflow 和最新版交接文件**；未使用 GitHub 写入，亦未在真实 Actions 运行它。`main` 的最新实时提交需在用户上传前核实；截至上轮成功读取为 `d9b219d1122f3b83eb08292e5b8f440a88337ecb`。
-- 新工作流仅支持上述固定阶段A ZIP（SHA 验证写死）；源码后续修改或重新打包必须重新生成并更新校验，不应关闭安全检查。
-- GitHub 若因分支保护或仓库安全策略拒绝 `contents: write` 推送，会在 `git push` 出错；不得要求用户将个人访问令牌公开。若需要，可用手机浏览器手动上传对应源码文件作为回退方案。
-- 导入 workflow 使用 `workflow_dispatch` 手动触发，避免任意提交或外部PR自动使用写入令牌。ZIP 自身及辅助工作流一旦上传至公开仓库也可被任何人查看；不要添加密码、私有存档、签名私钥。
-
-**状态归类**：用户已实测通过：旧版APK 8/8；代码已写但未编译：V0.1b引擎/UI与本轮导入工作流；构建成功但未实测：无（本轮）；计划中：阶段A云端测试、阶段B安装包验收、SQLite/Drift等。
-
-## 13. 真实 GitHub 阶段A上传、云端测试与提交（交接 v1.7，2026-10-11）
-
-用户在安卓手机通过GitHub网页实际上传下列文件：
-
-- 仓库根目录：`terminal_x_v01b_stage_A_engine_tests.zip`，仓库Blob SHA `c4754a3ec96426a1d0382088e0e5b553267a750e`，16,145字节；与本轮本地下载文件git blob哈希一致，原ZIP的SHA-256见§12。
-- `.github/workflows/terminal_x_import_stage_a.yml`：GitHub Blob SHA `fbb422a7c7b19dd7f8c985f13ed823aa7f5c29c1`。
-- `.github/workflows/v01b-engine-validation.yml`：GitHub Blob SHA `5886e04db98a08b01e87f98793cce617eaed3aed`。
-
-**测试真实完成**：GitHub Actions 手动导入任务 `https://github.com/54854434/terminal_x/actions/runs/38139622283` 于2026-10-11 12:32:02 UTC启动，最终`success`。Job `114470600752` 的ZIP校验、Flutter安装、依赖解析、17个引擎与会话用例、提交源码全部成功。日志明确含`🎉 17 tests passed.`；`git commit`结果`49836dacb90819e653fadc3bbed47d43c2c2fb83`，已进一步独立读取`main`发现新增引擎/测试及`pubspec.yaml`变更。**这不是仅生成本地ZIP；此次阶段A确实已进入远端仓库。**
-
-**需要区别的失败任务**：阶段A源码提交前，GitHub因YAML上传自动执行独立验证 run `38139500710`，失败原因为`pubspec.yaml`当时缺少`flutter_test`开发依赖；失败记录发生在阶段A成功之前，并非17测试失败。Actions机器人push新commit后普通`push`验证工作流可能不会自动再次触发，可手机手动运行`V0.1b Engine Validation`再复核一次。
-
-**APK历史记录已验证**：旧`Build Android APK` run `38134148983`（#6）全步骤success（包括上传APK Artifact）；此记录只证明旧工作流成功，**并非V0.1b集成APK**。旧APK push运行 #7 (`38139388744`) 与 #8 (`38139500807`) 同样查询到 **completed/success**，但仍是旧UI工作流产物；它们不代表V0.1b阶段B APK已经生成。签名证书指纹未知。
-
-**阶段B下一步**：从已交付的`terminal_x_v01b_stage_B_preview_app.zip`中取出`lib/main.dart`（原仓库目标同路径）与`.github/workflows/build-apk.yml`（原路径），手机GitHub分别替换后运行带先测后构建的APK工作流。阶段BZIP中含旧版本交接文件，**必须改用此次v1.7**并手动上传至`docs/TERMINAL_X_HANDOFF.md`。不要删除/卸载旧APK，保留旧存档；新debug预览包需实测。新代码属于**阶段A单测已绿、阶段B未编译未实测**，不能将17项自动化测试直接表述为安卓功能8项回归完成。
+- **用户操作**：先下载安装 `11702639474` 对应的预览 APK，然后按 10.3 表逐项验收，回复通过/失败/未测和实际值；无需重新执行阶段 A/B。
+- **AI 操作**：接到反馈后优先复现并修复确证的账务、安装、状态恢复问题；改代码必须先跑自动测试，再重新通过 GitHub Actions 构建 APK，再进行手机回归。
+- **清理门槛**：新 APK 通过安装、买卖、冻结/撤单、跨档成交、正常重开存档等关键回归，且用户明确同意后，才做 `preview -> 白名单核验 -> 明确确认 -> 删除`。绝不运行广泛路径匹配、`git clean`、无差别删除文件；避免通过删历史抹掉回退能力。
+- **文档门槛**：本地文件更新为 v2.3 不代表远端已更新；需在用户手机 GitHub 网页将它同步到 `docs/TERMINAL_X_HANDOFF.md`，提交后核对新 SHA 和文件正文版本。如仓库在同步前已有新提交/更高版本交接，应先合并，不覆盖。
+- **未决问题**：新版手机实际安装和各验收结果、稳定 Android 签名及升级兼容、APK 单文件 SHA、SQLite/Drift 事务与数据迁移、完整交互图表/交易所规则、是否存在未列举的更晚 Actions 构建，均待后续核实。
 
 
-## 14. v1.8 阶段B批量安装包（2026-10-11，待实际运行）
+---
 
-**只准备了发布包和导入工作流，尚未在GitHub上传/运行，不能视为阶段B已完成。** 当前基线为已验证的`main` SHA `49836dacb90819e653fadc3bbed47d43c2c2fb83`，阶段A导入任务 `38139622283` 成功且日志确认17项测试通过。
+## 11. 2026-10-11 v2.3 最新正式验收与后续执行准则（覆盖历史“待测”表述）
 
-为减少安卓网页手动替换文件的步骤，本次另生成：
+### 11.1 新版手机实测由用户确认 10/10 通过
 
-- `terminal_x_v01b_stage_B_bulk_v18.zip`：含新版 `lib/main.dart`、新 `.github/workflows/build-apk.yml` 和最新 `docs/TERMINAL_X_HANDOFF.md`（v1.8）。避免使用老阶段B ZIP附带的v1.5 MD。此ZIP不是可安装APK。
-- `terminal_x_import_stage_b.yml`：建议人工上传至 `.github/workflows/terminal_x_import_stage_b.yml`。必须由仓库所有者在网页上发起 `workflow_dispatch`，限定`main`，工作流先核对ZIP的SHA256及路径白名单，再核实基础源码的已知SHA，解压三份文件。
-- 运行时使用Flutter安装/依赖解析、17个引擎及会话测试、调试版预览APK云端构建；**只有测试和APK构建成功才尝试把三份文件一次推送至main**，并在成功后上传APK Artifact。新APK与旧原型采取不同Android应用ID，继续保留旧APK和存档。
-- 若`GITHUB_TOKEN`缺少修改GitHub Actions工作流文件的权限，自动push可能失败。**失败时不要表示阶段B已入库**：按日志检查后可通过手机网页手动编辑三个目标文件并提交，再运行新`Build Android APK`验证；不得公开PAT，也不要关闭测试门禁。
+2026-10-11 用户直接提供如下安卓端 V0.1b 实测反馈，**全部已勾选通过，备注：无**。本表只记录用户报告，不表示 AI 远程操控过手机或自行核验实际界面数值。
 
-**手机操作顺序**：先将`terminal_x_v01b_stage_B_bulk_v18.zip`上传仓库根目录；再将`terminal_x_import_stage_b.yml`上传`.github/workflows/`；最后进入Actions手动运行`Terminal X - Import Stage B + APK`，检查解包、测试、APK构建、Commit/Push与上传Artifacts五步全部绿。工作流若未确认commit SHA，不得宣称已同步。GitHub Actions机器人push可能不会自动触发其他workflow，应使用本导入任务的APK Artifact下载安装，并独立执行手机验收。
+| 编号 | 手机验收项目 | 用户反馈 |
+|---|---|---|
+| 1 | 安装启动 | 通过 |
+| 2 | 初始账户及两股切换 | 通过 |
+| 3 | 市价买入 | 通过 |
+| 4 | 市价卖出 | 通过 |
+| 5 | 资金不足拒单 | 通过 |
+| 6 | 无股卖出拒单 | 通过 |
+| 7 | 买单资金冻结与撤销 | 通过 |
+| 8 | 卖单持仓冻结 | 通过 |
+| 9 | 跨档部分成交 | 通过 |
+| 10 | 推进行情与重启恢复 | 通过 |
 
-**可验证的下一步**：真实运行批量导入，拿到成功/失败日志、实际main SHA、APK构建结果；然后用户在安卓手机安装隔离预览包，检查撮合/冻结/撤单/持久化，记录实测并更新交接文档为下一版本。正式签名、SQLite/Drift及旧应用原地升级仍是未完成项。
+**里程碑判定**：V0.1b 的本次手机关键场景验收完成。此前第 6、10 节保留为历史操作和期望值记录，其中任何“尚未实测/待测”均以本节最新实测为准。用户没有报告故障，故没有基于反馈确认的缺陷可供修复。不要编造新的 bug，也不要为了“修复”而改动已通过验收的引擎。验收并不涵盖强制杀进程中断写入、SQLite 事务、长期压力、正式签名、完整五大市场或生产可用性。
+
+### 11.2 本轮 GitHub 再次核对与实际改动
+
+- 仓库：`https://github.com/54854434/terminal_x`，Public，默认 `main`；连接具有读取但无 push 权限。
+- 最新可查提交：`290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`；当前未见新提交。
+- 远端主交接 `docs/TERMINAL_X_HANDOFF.md`：**v1.9**，Git blob SHA `913dd0eb959152770fe0680678d7530b745de90c`。本地 v2.3 文件未提交，用户须通过手机 GitHub 网页覆盖同一路径，提交前重新检查远端版本。
+- 最后已确认成功构建：Actions run `38141798593`、job `114476989497`、Artifact `11702639474`，Artifact ZIP SHA-256 `6115d744cd32527897f678b11ee1011a7ecf2cc1b99f54203c2e8e8d314e24f6`，APK 内部单文件 SHA/安装证书仍待核实。未穷尽更晚 Actions 运行。
+- 代码改动：**无**。新测试/新构建：**无**（仍引用历史 17/17 成功日志）。仓库文件清理：**无**。本轮交付：更新完整交接 MD 从 v2.2 至 v2.3。
+
+### 11.3 下一步唯一优先事项：交接同步与只读清理预览
+
+1. 用户手机浏览器进入 `https://github.com/54854434/terminal_x/blob/main/docs/TERMINAL_X_HANDOFF.md`，先确保远端未有高于 v2.3 的更新；再以本对话下载的完整 Markdown 替换该同路径文件，提交建议说明：`docs: record V0.1b Android acceptance 10 of 10 (handoff v2.3)`。提交后核对正文版本和新的 commit SHA；**下载文件不等于已同步**。
+2. 仅评估候选：`terminal_x_v01b_stage_A_engine_tests.zip`、`terminal_x_v01b_stage_B_bulk_v18.zip`、三个 `terminal_x_import_stage_*.yml` 工作流及历史 `docs/TERMINAL_X_HANDOFF_LATEST.md`。使用只读白名单核查路径/Blob/当前分支；先出明细及依赖/回退影响，不进行删除。
+3. 若希望实际清理，另行获得用户对**准确路径清单**的明确确认后，方可执行。两个 ZIP 可考虑带 `preview` 默认、`delete` 密令、SHA 校验和限制仓库/分支的工作流；工作流文件本身也须先经过用户审核。一次性 Actions YAML 及历史交接文件宜由用户手机 GitHub 网页逐个删除。绝不清理 `build-apk.yml`、引擎验证 workflow、`lib/`、`test/`、`pubspec.yaml` 或规范主交接。
+4. 清理完成后，下一开发里程碑为 **SQLite + Drift 事务化持久化方案与小范围迁移实现**。需先设计旧 `terminal_x_v01b_state` 的无损导入、异常保护、原子事务、备份与恢复测试；测试通过才构建新 APK。稳定 Android 签名与数据备份策略必须先纳入升级兼容风险分析，绝不要求卸载已验收的 V0.1b。
+
+### 11.4 已知问题与约束
+
+- 本次手机反馈**没有已确认缺陷**；不要将未实现功能误判为新的缺陷。
+- 现有 `shared_preferences` 顺序快照写入不等于数据库 ACID 事务；断电/系统终止期间一致性尚未专门证明。
+- debug APK 签名不是稳定生产签名；未来覆盖升级可能失败，必须在数据保护方案确认后变更。
+- K线/高级委托/独立 AI 做市、交易所规则、多市场、分支存档、数据导入导出均为后续规划，尚未交付。
+- 仓库清理尚未授权或执行；完整 V0.1 仍未验收完成。
 
 
-## 15. v1.9 阶段B真实Actions验证、受限推送与免Token恢复（2026-10-11）
+---
 
-### 实际已发生
+## 12. 2026-10-11 v2.4 最新状态：上传路径纠偏 + 安全清理只读预检（**本节优先于旧状态字段**）
 
-1. 用户将 `terminal_x_v01b_stage_B_bulk_v18.zip`（仓库根目录）及 `.github/workflows/terminal_x_import_stage_b.yml`（工作流目录）上传到公开仓库，并手动运行 `Terminal X - Import Stage B + APK`。
-2. GitHub Actions run [38140701786](https://github.com/54854434/terminal_x/actions/runs/38140701786)、job `114473807015`。已独立读取实际日志：ZIP SHA校验、已知源码基线检查、Flutter依赖、**17 tests passed.**、`flutter build apk --debug` 均**success**。
-3. 提交阶段运行 `git commit` 时形成本地临时提交 `c5478f9`（只有runner本机的临时提交，不是远端GitHub的`main`！）。`git push` 因 `refusing to allow a GitHub App to create or update workflow .github/workflows/build-apk.yml without workflows permission` 被GitHub拒绝。本次run整体 **failure**；APK Artifact上传被跳过。
-4. 已复查远端 `main` 仍为 `2faa9db26d38a35a1d5335d606950500a8f9ebad`，未发生阶段B实际代码入库。不要把“APK编译成功”误报为“APK文件已可下载”或“已手机安装”。
+### 12.1 实际 GitHub 状态：v2.3 已上传，但上传到错误文件名
 
-### 修复方案（本轮新交付、尚待用户网页操作验证）
+- 仓库仍是 `https://github.com/54854434/terminal_x`，Public，默认 `main`；当前 GitHub 连接权限 `pull=true`、`push=false`。
+- 最新核实 `main` SHA：**`dc1cb4e65c4bba88350e78618abf19878437fed0`**（2026-10-11，`Add files via upload`）。[提交详情](https://github.com/54854434/terminal_x/commit/dc1cb4e65c4bba88350e78618abf19878437fed0) 的 changed files 只有：
+  - **误命名的新文件** `docs/TERMINAL_X_HANDOFF(20261011-133044).md`，已核对正文是完整 **v2.3**，blob SHA `98f4c6fc97e0d7daf024d8e8122ac9ccd956a8af`；它不是规范主文件。
+- **仍未覆盖的规范主文件** `docs/TERMINAL_X_HANDOFF.md` 为 **v1.9**，blob SHA `913dd0eb959152770fe0680678d7530b745de90c`。
+- 当前本地生成的完整文档为 **v2.4**，仍需用户用手机上传并**精确命名为 `TERMINAL_X_HANDOFF.md`**，放在 `docs/` 目录。手机浏览器下载文件有时自动添加时间戳或 `(1)`；先在文件管理器单独文件夹里改回精确名称，核对扩展名只有一次 `.md`，再上传。GitHub 提交变动必须显示 **modified: `docs/TERMINAL_X_HANDOFF.md`**，而不是 `added: ...(` 或其他新文件。若出现冲突或仓库已有更高版本，停止覆盖并核对。
+- v2.3 错误路径副本目前**不要立即删除**；待规范主文件 v2.4 同步、内容完整核实后纳入清理候选。
 
-- **不使用私人Token，亦不修改仓库为Private/Public之外的安全设置**。由仓库所有者使用安卓手机网页，打开 `https://github.com/54854434/terminal_x/tree/main/.github/workflows`，通过网页同一批上传/替换这两份YAML：
-  - `build-apk.yml`：从此前成功编译的阶段B ZIP中提取的经17测试门禁版本，目标路径 `.github/workflows/build-apk.yml`。新版Git blob SHA 预计为`28c5be6c60663b742531bcfbde026d8682cf5c79`。**此文件必须人工提交**；GitHub内置bot没有工作流修改权限。
-  - `terminal_x_import_stage_b_recovery.yml`：新增恢复工作流（本轮生成），校验原始ZIP、现有两个引擎与测试、更新后的`build-apk.yml`与`pubspec.yaml` SHA；使用原始ZIP中`lib/main.dart`，并内嵌此完整v1.9交接文档（gzip+base64精确编码，避免额外上传文件）；在内存目录进行测试和构建，通过后**只把`lib/main.dart`和`docs/TERMINAL_X_HANDOFF.md`推送到main**，不会由bot碰`.github/workflows`；接着上传APK Artifact。
-- 完成网页上传后，打开 GitHub `Actions → Terminal X - Recover Stage B and Publish APK → Run workflow (main)`。**预期**测试和构建通过，机器人push两份普通文件、`Upload APK`全绿；运行状态以GitHub真实结果为准。本工作流有安全基线保护和hash校验，不会任意覆盖已有变化，也不主动清理旧存档。
-- 预览APK为新的Android应用ID，与旧App独立共存。确认Actions有 `terminal-x-v01b-stage-b-preview-debug` Artifact 后才安装，不能使用失败run中未上传的APK。安装后用户实测交易、冻结可用资金与股票、限价部分成交和撤单、重启恢复、两资产切换，检查旧App仍可使用。**未实测前不得写成手机验收通过。**
-- 如果恢复工作流失败，读取真实失败步骤及日志，不要反复盲目上传，也不要申请用户公开密码、令牌或签名密钥。
+### 12.2 清理只读预检：路径固定白名单与依赖
 
-### 连续性和技术约束
+当前仅通过 GitHub 读取、核对名称和 blob SHA；**没有上传/运行任何删除工作流，也没有删除任何仓库文件**。
 
-保留 §0.1 长期交接规则、只安卓手机开发、离线单机金融仿真、最终SQLite/Drift持久化、固定签名、价格时间优先和账务一致性、有限做市商、V0.1两只股票初期范围；后续继续以`docs/TERMINAL_X_HANDOFF.md`为唯一最新版标准路径，旧的`docs/TERMINAL_X_HANDOFF_LATEST.md`仅保留历史参考。本节记录的恢复工作流还未在远端执行，其成功状态、未来提交SHA与手机实测需在下次复查后更新v2.0。
+| 顺序 | 路径（完整相对仓库根路径） | Git blob SHA | 只读预检结论 |
+|---|---|---|---|
+| 1 | `terminal_x_v01b_stage_A_engine_tests.zip` | `c4754a3ec96426a1d0382088e0e5b553267a750e` | 临时导入压缩包；一次性 Stage A 工作流引用；暂保留直到工作流也退役 |
+| 2 | `terminal_x_v01b_stage_B_bulk_v18.zip` | `b4b530b05bd5c846c264cc91022f1681dee024a2` | 临时导入压缩包；两份 Stage B 工作流引用；暂保留直到工作流退役 |
+| 3 | `.github/workflows/terminal_x_import_stage_a.yml` | `fbb422a7c7b19dd7f8c985f13ed823aa7f5c29c1` | 仅 `workflow_dispatch`；写权限，旧一次性导入；待确认退役后手动删除 |
+| 4 | `.github/workflows/terminal_x_import_stage_b.yml` | `91e5532b7ca2a16c73a07f6196cad92707fd66d6` | 仅 `workflow_dispatch`；写权限，旧批量导入；已被成功恢复路径取代 |
+| 5 | `.github/workflows/terminal_x_import_stage_b_recovery.yml` | `515ce093845e6b2307ab8511b6991017e47ff16f` | 仅 `workflow_dispatch`；成功完成过，内嵌旧 v1.9 文档，重新运行不合时宜 |
+| 6 | `docs/TERMINAL_X_HANDOFF_LATEST.md` | `c193e16462e8416a805de74fc1e10b09edf8914b` | 历史 v1.2，需确保规范主文件完整后才删除 |
+| 7 | `docs/TERMINAL_X_HANDOFF(20261011-133044).md` | `98f4c6fc97e0d7daf024d8e8122ac9ccd956a8af` | v2.3 误命名副本；在规范 v2.4 成功后才考虑删除 |
+
+**依赖核对**：三个导入工作流内分别有读取 ZIP、校验摘要以及对仓库修改/推送的步骤。两份临时 ZIP 一旦删除，这些旧工作流就无法再次按原流程工作；因此应先**确认三个旧导入工作流不再需要且无正在进行的运行**，再退役旧工作流，最后删除两份 ZIP。正式 `.github/workflows/build-apk.yml` 与 `.github/workflows/v01b-engine-validation.yml` 仅使用源码和测试，**不依赖这两份临时 ZIP**。旧工作流删除后，Git 提交历史仍能用于追溯，但无法自动保证历史 Artifact 永不过期。
+
+**绝对保留**：`lib/`、`test/`、`pubspec.yaml`、`.github/workflows/build-apk.yml`、`.github/workflows/v01b-engine-validation.yml`、`docs/TERMINAL_X_HANDOFF.md`，以及已安装的旧原型和 V0.1b 安卓应用本地存档。禁止广泛通配符和 `git clean`，禁止上传私人存档、PAT/Token 或签名私钥。
+
+### 12.3 唯一下一步和验收门槛
+
+1. **先修正规范交接路径**：用户下载本地 v2.4 文件，在安卓文件管理器核实完整文件名为 `TERMINAL_X_HANDOFF.md`，打开 `https://github.com/54854434/terminal_x/tree/main/docs`，选择上传该文件并在提交变动页确认只显示 **修改 `docs/TERMINAL_X_HANDOFF.md`**；提交 `docs: sync authoritative Terminal X handoff v2.4`。若显示新增带时间戳副本，立即取消，重新命名。
+2. 提交后 AI 用 GitHub 再核对新 `main`、主文件版本 **2.4**、blob SHA 和提交 files；未经此核对**不删除**重复副本或历史交接文件。
+3. 在用户对**具体七条候选路径**明确确认、检查工作流无运行中任务且规范交接同步成功后，才进入实际清理：优先手动删除三个旧导入 workflow，再删两份 ZIP，最后核对并删两个历史/误命名交接副本。每步记录实际新 commit SHA 和文件名单；不执行自动广泛删除。只读预检不等于获得删除授权。
+4. 安全清理完成后推进 V0.1c：SQLite + Drift 的无损存档迁移、事务化账务保存、失败保护、签名/更新路径及备份策略；必须先通过自动化测试、再云端构建、再手机回归。现有手机验收 V0.1b 10/10，无确认 bug，不应无故重写引擎。
+
+### 12.4 版本/构建/实测/已知问题记录
+
+- 文档版本 **v2.4**，更新日 **2026-10-11**；本次新变动仅**本地交接文档内容**，仓库中最新提交是用户上传的 v2.3 错误命名副本；本轮 AI **无 GitHub 写入**。
+- 最新确认代码里程碑 `290fbf66605f6e0b9df5d72b3aab51d2b72c44d5`；新 `main` `dc1cb4e65c4bba88350e78618abf19878437fed0` 只新增文档副本；未改动 Dart、测试或 APK 构建流程。
+- 已确认构建：Actions `38141798593` / job `114476989497` / Artifact `11702639474`；`17/17` 测试、debug APK 构建及上传通过；APK 单文件 SHA、安装证书与可靠覆盖升级方案仍**待核实**；此轮未触发新构建。
+- 安卓实测：**旧原型 8/8 通过（历史）**；**V0.1b 10/10 通过（用户 2026-10-11 报告，无异常）**。不等于 App 经过长期压力、断电恢复或强制杀进程写入原子性测试。
+- 未解决：主交接路径误命名未纠正、清理尚未授权/执行；共享偏好快照不是 SQLite 事务，固定签名、备份/无损迁移、完整 V0.1 目标与五大市场均未完成。未知的 GitHub 后续变化应每次重新读取，禁止凭历史状态推断。
