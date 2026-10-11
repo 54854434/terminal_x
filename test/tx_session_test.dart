@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import '../lib/engine/tx_engine.dart';
 import '../lib/engine/tx_session.dart';
+import '../lib/engine/tx_backup_import.dart';
 
 void main() {
   test('new session: price-time book, 100-share buy and 50-share sell', () {
@@ -87,5 +88,94 @@ void main() {
       'step': 0, 'pending': [], 'trades': [],
     });
     expect(() => TxSession.fromLegacyJson(legacy), throwsFormatException);
+  });
+
+  group('V0.1c read-only Android XML backup preview', () {
+    String xmlWith(String snapshot,
+        {String key = 'flutter.terminal_x_v01b_state'}) {
+      // Escape text exactly as Android SharedPreferences XML does.
+      final escaped = snapshot
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;');
+      return '<?xml version="1.0" encoding="utf-8"?>'
+          '<map><string name="$key">$escaped</string></map>';
+    }
+
+    test('valid prefixed key reads a fresh session without touching storage', () {
+      final original = TxSession.fresh();
+      original.placePlayer(
+          symbol: TxSession.symbols[0],
+          side: TxSide.buy,
+          kind: TxKind.market,
+          quantity: 100);
+      final restored = TxBackupImport.previewXml(xmlWith(original.exportJson()));
+      expect(restored.exportJson(), original.exportJson());
+      restored.engine.checkInvariants();
+    });
+
+    test('old unprefixed key and XML escaped content are accepted', () {
+      final s = TxSession.fresh();
+      final xml = xmlWith(s.exportJson(),
+          key: TxSession.saveKey)
+          .replaceFirst('</map>', '<string name="other">A&amp;B</string></map>');
+      expect(TxBackupImport.previewXml(xml).exportJson(), s.exportJson());
+    });
+
+    test('valid open limit order preserves frozen cash', () {
+      final s = TxSession.fresh();
+      s.placePlayer(
+          symbol: TxSession.symbols[0],
+          side: TxSide.buy,
+          kind: TxKind.limit,
+          quantity: 50,
+          limitPriceCents: 800);
+      final restored = TxBackupImport.previewXml(xmlWith(s.exportJson()));
+      expect(
+          restored.engine.account(TxSession.playerId).reservedCashCents,
+          40000);
+    });
+
+    test('missing V0.1b key fails closed', () {
+      final xml = '<map><string name="flutter.terminal_state">'
+          'not a V0.1b snapshot</string></map>';
+      expect(() => TxBackupImport.previewXml(xml), throwsFormatException);
+    });
+
+    test('duplicate V0.1b keys fail closed', () {
+      final s = TxSession.fresh().exportJson();
+      final first = xmlWith(s);
+      final duplicate = first.replaceFirst(
+          '</map>',
+          '<string name="${TxSession.saveKey}">$s</string></map>');
+      expect(() => TxBackupImport.previewXml(duplicate), throwsFormatException);
+    });
+
+    test('corrupted session JSON fails without reset', () {
+      expect(() => TxBackupImport.previewXml(xmlWith('{"schema":1')),
+          throwsFormatException);
+    });
+
+    test('tampered account cash fails the engine ledger invariant', () {
+      final data = jsonDecode(TxSession.fresh().exportJson())
+          as Map<String, dynamic>;
+      final engine = jsonDecode(data['engine'] as String)
+          as Map<String, dynamic>;
+      final accounts = engine['accounts'] as List;
+      final player = (accounts.cast<Map<String, dynamic>>()
+          .singleWhere((e) => e['id'] == TxSession.playerId));
+      player['cashCents'] = (player['cashCents'] as int) + 1;
+      data['engine'] = jsonEncode(engine);
+      expect(() => TxBackupImport.previewXml(xmlWith(jsonEncode(data))),
+          throwsFormatException);
+    });
+
+    test('DTD or malformed XML fails closed', () {
+      final s = TxSession.fresh().exportJson();
+      expect(() => TxBackupImport.previewXml(
+          '<!DOCTYPE map [<!ENTITY x "bad">]>' + xmlWith(s)),
+          throwsFormatException);
+      expect(() => TxBackupImport.previewXml('<map><string>'),
+          throwsFormatException);
+    });
   });
 }
