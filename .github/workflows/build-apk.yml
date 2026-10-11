@@ -34,8 +34,8 @@ jobs:
           grep -q 'android:label="Terminal X V0.1c"' android/app/src/main/AndroidManifest.xml
       - name: Install dependencies
         run: flutter pub get
-      - name: Test engine, import and backup safety
-        run: flutter test test/tx_engine_test.dart test/tx_session_test.dart test/tx_backup_commit_test.dart
+      - name: Test engine, import, backup safety and SQLite isolation
+        run: flutter test test/tx_engine_test.dart test/tx_session_test.dart test/tx_backup_commit_test.dart test/tx_sqlite_store_test.dart
       - name: Build isolated V0.1c test APK
         run: flutter build apk --debug
       - name: Upload isolated test APK
