@@ -1,4 +1,4 @@
-name: Terminal X - One ZIP Batch Import and APK
+name: Terminal X - One ZIP Verified ARM64 Release
 
 on:
   push:
@@ -105,6 +105,23 @@ jobs:
                          not t.endswith('_test.dart') or '\\' in t or '..' in t
                          for t in tests)):
                   raise ValueError('Invalid build configuration or test paths.')
+              # The package ID, label and architecture are stable across releases.
+              if (org != 'com.terminalx.game'
+                  or app_id != 'com.terminalx.game.terminal_x'
+                  or label != 'Terminal X'
+                  or build.get('mode') != 'signed-release-arm64'
+                  or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', build.get('version_name', ''))
+                  or not isinstance(build.get('version_code'), int)
+                  or not 23 <= build['version_code'] < 2000000000):
+                  raise ValueError('Unsigned, wrong-identity or unversioned app build refused.')
+              # Refuse any downgrade or same-code rebuild of the stable app line.
+              previous_pubspec = Path('pubspec.yaml')
+              if previous_pubspec.is_file():
+                  prev_match = re.search(r'^version:\s*\d+\.\d+\.\d+\+(\d+)\s*$',
+                      previous_pubspec.read_text(encoding='utf-8'), re.M)
+                  if prev_match is not None and int(prev_match.group(1)) >= 23:
+                      if build['version_code'] <= int(prev_match.group(1)):
+                          raise ValueError('versionCode must increase after each signed release.')
 
               # Verify every new file AND its expected old content before replacing anything.
               staged = {}
@@ -126,8 +143,9 @@ jobs:
                       raise ValueError('Expected file missing in repository: ' + p)
                   staged[p] = blob
 
-              # Optional repository cleanup: explicit, SHA-256-locked files only.
-              # No globbing, no recursive deletion, no application source or test deletion.
+              # Optional repository cleanup. Protect active tests and storage.
+              # Exact legacy entrypoints / placeholder paths require SHA-256,
+              # AND only disappear after tests and the new APK build pass.
               removed = plan.get('remove', [])
               if not isinstance(removed, list) or len(removed) > 30:
                   raise ValueError('remove must be a list of at most 30 entries.')
@@ -135,8 +153,17 @@ jobs:
                   if not isinstance(path, str) or '\\' in path or '..' in path:
                       return False
                   # Only previously committed, disposable archives / build drops.
-                  return (bool(re.fullmatch(
-                      r'terminal_x_[a-zA-Z0-9_-]+\.(?:zip|apk)', path))
+                  safe_legacy = {
+                      'lib/main_terminal_v02.dart',
+                      'lib/main_terminal_v021.dart',
+                      'lib/storage_probe_main.dart',
+                      'lib/market/test',
+                      'lib/widgets/test',
+                      'docs/V01B_MOBILE_UPGRADE.md',
+                  }
+                  return (path in safe_legacy
+                      or bool(re.fullmatch(
+                          r'terminal_x_[a-zA-Z0-9_-]+\.(?:zip|apk)', path))
                       or bool(re.fullmatch(
                           r'(?:dist|artifacts|out)/(?:tmp|obsolete|preview)/'
                           r'[a-zA-Z0-9_./-]+\.(?:zip|apk)', path)))
@@ -164,6 +191,10 @@ jobs:
               dest.write_bytes(blob)
           if not Path(target).is_file() or any(not Path(t).is_file() for t in tests):
               raise ValueError('Build target or one or more tests not present after import.')
+          version_text = Path('pubspec.yaml').read_text(encoding='utf-8')
+          expected_version = f"version: {build['version_name']}+{build['version_code']}"
+          if expected_version not in version_text.splitlines():
+              raise ValueError('pubspec version must match release manifest.')
           Path('.tx_batch_plan.json').write_text(json.dumps(plan), encoding='utf-8')
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
               out.write('artifact=' + artifact + '\n')
@@ -193,10 +224,29 @@ jobs:
           subprocess.run(['flutter', 'create', '--org', plan['org'],
                           '--project-name', 'terminal_x', '--platforms=android', '.'],
                          check=True)
-          gradle = Path('android/app/build.gradle.kts').read_text()
+          gradle_file = Path('android/app/build.gradle.kts')
+          gradle = gradle_file.read_text()
           if ('applicationId = "' + plan['application_id'] + '"' not in gradle or
               'namespace = "' + plan['application_id'] + '"' not in gradle):
               raise SystemExit('The generated Android application ID does not match the manifest.')
+          if ('    buildTypes {' not in gradle or
+              'signingConfig = signingConfigs.getByName("debug")' not in gradle):
+              raise SystemExit('Unexpected Flutter Android signing template; refusing unsafe fallback.')
+          # Gradle reads the private key ONLY from ephemeral runner env/files.
+          # No key material is ever committed to the public repository.
+          key_config = '''    signingConfigs {
+                  create("terminalRelease") {
+                      storeFile = file(System.getenv("TX_KEYSTORE_FILE"))
+                      storePassword = System.getenv("TX_STORE_PASSWORD")
+                      keyAlias = System.getenv("TX_KEY_ALIAS")
+                      keyPassword = System.getenv("TX_KEY_PASSWORD")
+                  }
+              }
+          '''
+          gradle = gradle.replace('    buildTypes {', key_config + '    buildTypes {', 1)
+          gradle = gradle.replace('signingConfig = signingConfigs.getByName("debug")',
+                                  'signingConfig = signingConfigs.getByName("terminalRelease")', 1)
+          gradle_file.write_text(gradle)
           manifest = Path('android/app/src/main/AndroidManifest.xml')
           text = manifest.read_text()
           if 'android:label="terminal_x"' not in text:
@@ -204,6 +254,35 @@ jobs:
           manifest.write_text(text.replace('android:label="terminal_x"',
                                            'android:label="' + plan['display_name'] + '"'))
           PY
+
+      - name: Prepare stable private release signing key
+        shell: bash
+        env:
+          TX_RELEASE_KEYSTORE_B64: ${{ secrets.TX_RELEASE_KEYSTORE_B64 }}
+          TX_STORE_PASSWORD: ${{ secrets.TX_STORE_PASSWORD }}
+          TX_KEY_PASSWORD: ${{ secrets.TX_KEY_PASSWORD }}
+          TX_KEY_ALIAS: ${{ secrets.TX_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          names = ['TX_RELEASE_KEYSTORE_B64', 'TX_STORE_PASSWORD',
+                   'TX_KEY_PASSWORD', 'TX_KEY_ALIAS']
+          if any(not os.environ.get(n) for n in names):
+              raise SystemExit('Stable signing secrets missing: configure 4 Actions secrets first.')
+          data = base64.b64decode(os.environ['TX_RELEASE_KEYSTORE_B64'], validate=True)
+          if not 100 <= len(data) < 48_000:
+              raise SystemExit('Invalid release keystore size.')
+          path = Path('/tmp/terminal_x_release.jks')
+          path.write_bytes(data)
+          path.chmod(0o600)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as out:
+              out.write('TX_KEYSTORE_FILE=' + str(path) + '\n')
+          print('Signing key loaded privately (no contents printed).')
+          PY
+          keytool -list -keystore /tmp/terminal_x_release.jks \
+            -storepass "$TX_STORE_PASSWORD" -alias "$TX_KEY_ALIAS" >/dev/null
 
       - name: Install Flutter packages
         run: flutter pub get
@@ -220,23 +299,43 @@ jobs:
           subprocess.run(['flutter', 'test', *tests], check=True)
           PY
 
-      - name: Build separate Android debug APK
+      - name: Build signed, optimized ARM64 Release APK
         shell: bash
+        env:
+          TX_STORE_PASSWORD: ${{ secrets.TX_STORE_PASSWORD }}
+          TX_KEY_PASSWORD: ${{ secrets.TX_KEY_PASSWORD }}
+          TX_KEY_ALIAS: ${{ secrets.TX_KEY_ALIAS }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json
+          import os
           import subprocess
           from pathlib import Path
-          target = json.loads(Path('.tx_batch_plan.json').read_text())['build']['target']
-          subprocess.run(['flutter', 'build', 'apk', '--debug', '--target', target], check=True)
+          config = json.loads(Path('.tx_batch_plan.json').read_text())['build']
+          subprocess.run(['flutter', 'build', 'apk', '--release', '--split-per-abi',
+              '--target-platform', 'android-arm64', '--target', config['target'],
+              '--build-name', config['version_name'],
+              '--build-number', str(config['version_code']),
+              '--dart-define', 'TX_APP_VERSION=' + config['version_name']],
+              check=True)
+          apk = Path('build/app/outputs/flutter-apk/app-arm64-v8a-release.apk')
+          if not apk.is_file():
+              raise SystemExit('ARM64 release APK missing; do not commit source changes.')
+          print('Verified output exists; ARM64 APK bytes:', apk.stat().st_size)
           PY
+          # Verify the output's v2/v3 Android signature before publishing.
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          SIGNER="$(find "$SDK/build-tools" -type f -name apksigner | sort -V | tail -1)"
+          test -x "$SIGNER"
+          "$SIGNER" verify --verbose --print-certs \
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 
-      - name: Upload the APK artifact
+      - name: Upload the signed ARM64 APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.batch.outputs.artifact }}
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -269,7 +368,7 @@ jobs:
           else
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'Batch import verified Terminal X sources and handoff'
+            git commit -m 'Verified Terminal X signed release batch and safe cleanup'
             git push origin HEAD:main
           fi
           echo '### Terminal X batch import' >> "$GITHUB_STEP_SUMMARY"
@@ -319,3 +418,34 @@ jobs:
             await core.summary.addHeading('Preview artifact retention')
               .addRaw(`Only debug APK artifacts: retained latest 3 per artifact name, removed ${removed} older than 14 days (max 10 per run).`)
               .write();
+
+  retire-legacy-workflows:
+    name: Disable obsolete automatic CI (retain source history)
+    needs: verify-build-commit
+    if: needs.verify-build-commit.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Disable only known old build workflows (reversible)
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const oldWorkflows = [
+              'build-apk.yml', 'build-storage-probe.yml',
+              'build-v02-terminal.yml', 'v01b-engine-validation.yml',
+              'v01c-signature-audit.yml',
+            ];
+            for (const workflow_id of oldWorkflows) {
+              try {
+                await github.rest.actions.disableWorkflow({owner, repo, workflow_id});
+                core.info(`Disabled obsolete ${workflow_id} (not deleted)`);
+              } catch (e) {
+                core.warning(`Could not disable ${workflow_id}: ${e.message}`);
+              }
+            }
+            await core.summary.addRaw('Historical workflows disabled where permitted; their files and past runs remain in Git for audit.').write();
