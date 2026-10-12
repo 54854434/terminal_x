@@ -45,7 +45,21 @@ class TxLiveCandles {
     if (step != oldStep && step != oldStep + 1) {
       throw StateError('Game clock skipped minutes');
     }
+    final previousFillCount = before.session.engine.fills.length;
+    final nextFillCount = after.session.engine.fills.length;
+    if (nextFillCount < previousFillCount) {
+      throw StateError('Verified trade history shrank');
+    }
     for (final symbol in TxSession.symbols) {
+      // A same-minute unmatched place/cancel may create a SQLite revision
+      // but no new print and no changed market mark. Keep the exact existing
+      // candle object; avoid reconstructing the cumulative series, scanning
+      // fills or forcing a chart rebuild for this account-only transaction.
+      // New game minutes NEVER take this shortcut, even with zero volume.
+      if (step == oldStep && previousFillCount == nextFillCount &&
+          before.session.lastPrice(symbol) == after.session.lastPrice(symbol)) {
+        continue;
+      }
       final candles = _values[symbol]!;
       final pair = TxCandleHistory.fromSnapshots([before, after], symbol);
       final incoming = pair.last;
