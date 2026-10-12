@@ -1,0 +1,115 @@
+name: Terminal X - Direct APK Release
+
+# One-time manual install of this workflow to .github/workflows/ is required.
+# Ordinary source updates continue to use ONE terminal_x_batch.zip at repo root.
+on:
+  workflow_run:
+    workflows:
+      - Terminal X - One ZIP Verified ARM64 Release
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Successful Terminal X importer run ID (e.g. 38193523265)'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: terminal-x-direct-apk-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout latest successful source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Verify the successful importer and find the one signed APK artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_RUN_ID: ${{ inputs.run_id }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == 'workflow_dispatch' ]]; then
+            RUN_ID="$MANUAL_RUN_ID"
+          else
+            RUN_ID="$UPSTREAM_RUN_ID"
+          fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo 'Bad run ID'; exit 1; }
+          RUN_DATA="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID")"
+          echo "$RUN_DATA" | jq -e --arg repo "$GH_REPO" '
+            .status == "completed" and
+            .conclusion == "success" and
+            .head_branch == "main" and
+            .head_repository.full_name == $repo and
+            .name == "Terminal X - One ZIP Verified ARM64 Release"
+          ' >/dev/null
+          ARTIFACTS="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts?per_page=100")"
+          ARTIFACT="$(echo "$ARTIFACTS" | jq -r '
+             [.artifacts[] | select(.expired == false) |
+              select(.name | test("^terminal-x-v[0-9]+-signed-arm64-apk$"))] |
+              if length == 1 then .[0].name else empty end
+          ')"
+          [[ -n "$ARTIFACT" ]] || { echo 'Expected exactly one non-expired signed APK artifact'; exit 1; }
+          VERSION="$(sed -nE 's/^version: ([0-9]+\.[0-9]+\.[0-9]+)\+[0-9]+$/\1/p' pubspec.yaml)"
+          [[ -n "$VERSION" ]] || { echo 'Version missing'; exit 1; }
+          EXPECTED="terminal-x-v${VERSION//./}-signed-arm64-apk"
+          [[ "$ARTIFACT" == "$EXPECTED" ]] || {
+            echo "Artifact $ARTIFACT does not match main version $VERSION; refusing to mistag"; exit 1;
+          }
+          {
+            echo "RUN_ID=$RUN_ID"
+            echo "ARTIFACT=$ARTIFACT"
+            echo "VERSION=$VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Download the already-built verified APK
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: direct-apk
+
+      - name: Publish APK file directly to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find direct-apk -type f -name '*.apk' -print)
+          [[ "${#apks[@]}" -eq 1 ]] || { echo 'Expected one actual APK'; exit 1; }
+          TAG="v$VERSION"
+          APK_FILE="Terminal-X-v$VERSION-arm64.apk"
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Not overwriting published APK."
+            exit 0
+          fi
+          # The prior importer committed tested files before its run completed.
+          # Target main rather than the earlier temporary ZIP-upload commit.
+          TARGET_SHA="$(git rev-parse HEAD)"
+          gh release create "$TAG" "${apks[0]}#$APK_FILE" \
+            --repo "$GH_REPO" \
+            --target "$TARGET_SHA" \
+            --title "Terminal X $TAG · signed ARM64 APK" \
+            --notes "Offline Android release from successful Terminal X importer run #$RUN_ID. Download the .apk asset to install over the same signed app. Do not uninstall or erase existing data."
+          echo "APK direct download: https://github.com/$GH_REPO/releases/download/$TAG/$APK_FILE" >> "$GITHUB_STEP_SUMMARY"
