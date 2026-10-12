@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:collection';
 
 import '../engine/tx_session.dart';
 import '../storage/tx_sqlite_store.dart';
@@ -8,10 +9,15 @@ import 'tx_candle_history.dart';
 /// cache is reconstructed once from checksummed committed snapshots.
 /// No readHistory() call per tick, avoiding repeated O(history * save-size).
 class TxLiveCandles {
-  TxLiveCandles._(this._values);
+  TxLiveCandles._(this._values) {
+    for (final entry in _values.entries) {
+      _views[entry.key] = UnmodifiableListView<TxCandle>(entry.value);
+    }
+  }
 
   static const maxCandles = 160;
   final Map<String, List<TxCandle>> _values;
+  final Map<String, List<TxCandle>> _views = {}; 
 
   factory TxLiveCandles.fromVerifiedHistory(List<TxStoredSession> history) {
     final bySymbol = <String, List<TxCandle>>{};
@@ -23,8 +29,9 @@ class TxLiveCandles {
     return TxLiveCandles._(bySymbol);
   }
 
+  /// Stable read-only views avoid allocating new copies on every UI second.
   List<TxCandle> forSymbol(String symbol) =>
-      List.unmodifiable(_values[symbol] ?? (throw ArgumentError.value(symbol)));
+      _views[symbol] ?? (throw ArgumentError.value(symbol));
 
   /// A single successful SQLite commit; never infer or fabricate fills.
   void addCommit(TxStoredSession before, TxStoredSession after) {
