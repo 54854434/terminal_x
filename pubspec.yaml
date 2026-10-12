@@ -1,7 +1,7 @@
 name: terminal_x
-description: Offline Android trading simulator starter.
+description: Offline Android market simulation and trading terminal.
 publish_to: none
-version: 0.1.1+2
+version: 0.2.3+23
 
 environment:
   sdk: '>=3.5.0 <4.0.0'
@@ -9,13 +9,12 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # Retained for historical account/backup regression tests; tree-shaken from release.
   shared_preferences: ^2.5.3
   xml: ^6.5.0
   file_picker: 10.3.10
-  # Isolated SQLite/Drift experiment only; not used by lib/main.dart yet.
   drift: 2.32.1
   crypto: 3.0.6
-  # Used only by the separate SQLite probe app.
   path_provider: ^2.1.5
 
 dev_dependencies:

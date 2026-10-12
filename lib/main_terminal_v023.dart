@@ -1,4 +1,4 @@
-/// Terminal X V0.2.1 performance/time preview. Independent app ID and data.
+/// Terminal X V0.2.3 stable app-line active simulated-market preview.
 /// Existing V0.2 + V0.1 apps and backups are never accessed.
 import 'dart:async';
 import 'dart:io';
@@ -11,42 +11,44 @@ import 'engine/tx_engine.dart';
 import 'engine/tx_session.dart';
 import 'market/tx_live_candles.dart';
 import 'market/tx_simulation_clock.dart';
+import 'market/tx_realtime_clock.dart';
 import 'storage/tx_sqlite_store.dart';
 import 'storage/tx_trading_service.dart';
 import 'widgets/tx_candle_chart.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const TerminalXV021());
+  runApp(const TerminalXV023());
 }
 
-class TerminalXV021 extends StatelessWidget {
-  const TerminalXV021({super.key});
+class TerminalXV023 extends StatelessWidget {
+  const TerminalXV023({super.key});
 
   @override
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
-    title: 'Terminal X V0.2.1',
+    title: 'Terminal X',
     theme: ThemeData.dark(useMaterial3: true).copyWith(
       scaffoldBackgroundColor: const Color(0xFF0D121D),
       colorScheme: ColorScheme.fromSeed(
         seedColor: const Color(0xFF4F94F9), brightness: Brightness.dark),
       cardTheme: const CardThemeData(color: Color(0xFF161F2D)),
     ),
-    home: const TerminalHomeV021(),
+    home: const TerminalHomeV023(),
   );
 }
 
-class TerminalHomeV021 extends StatefulWidget {
-  const TerminalHomeV021({super.key});
+class TerminalHomeV023 extends StatefulWidget {
+  const TerminalHomeV023({super.key});
   @override
-  State<TerminalHomeV021> createState() => _TerminalHomeV021State();
+  State<TerminalHomeV023> createState() => _TerminalHomeV023State();
 }
 
-class _TerminalHomeV021State extends State<TerminalHomeV021>
+class _TerminalHomeV023State extends State<TerminalHomeV023>
     with WidgetsBindingObserver {
   static const green = Color(0xFF3DD3A5);
   static const red = Color(0xFFFF707A);
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.2.3');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
@@ -57,11 +59,12 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
   int _symbol = 0;
   int _speed = 1;
   int _autoCount = 0;
+  int _fractionalSeconds = 0;
   bool _auto = false;
   bool _busy = false;
   bool _loading = true;
   bool _limit = false;
-  bool _fills = false;
+  int _recordMode = 0;
   String _notice = '正在检查 SQLite';
   String? _fault;
 
@@ -88,14 +91,23 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
     if (_auto && mounted) setState(() => _auto = false);
   }
 
-  /// One-shot scheduling: next tick is scheduled only after the previous
-  /// transaction and UI update. Never accumulate overdue callbacks.
+  /// Exactly one real-time second per callback; each callback adds [speed]
+  /// simulated seconds. Economic state advances only on complete game minutes.
+  /// A slow SQLite commit pauses the scheduler rather than piling up ticks.
   void _scheduleNext() {
     _timer?.cancel();
     if (!_auto || !_ready) return;
-    _timer = Timer(TxSimulationClock.delayForSpeed(_speed), () {
+    _timer = Timer(const Duration(seconds: 1), () {
       if (!mounted || !_auto || !_ready) return;
-      _tick(automatic: true);
+      final commits = TxRealtimeClock.minuteCommits(_fractionalSeconds, _speed);
+      final remainder = TxRealtimeClock.remainderSeconds(_fractionalSeconds, _speed);
+      if (commits == 0) {
+        setState(() => _fractionalSeconds = remainder);
+        _scheduleNext();
+      } else {
+        // The maximum allowed speed is 60x: at most one DB commit per second.
+        _tick(automatic: true, remainderSeconds: remainder);
+      }
     });
   }
 
@@ -116,9 +128,10 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
     TxTradingService? service;
     try {
       final dir = await getApplicationSupportDirectory();
-      final sqlite = File('${dir.path}/terminal_x_v021.sqlite');
+      final sqlite = File('${dir.path}/terminal_x_game.sqlite');
       service = TxTradingService(TxSqliteStore(
-        NativeDatabase.createInBackground(sqlite)));
+        NativeDatabase.createInBackground(sqlite)),
+        initialSessionFactory: TxSession.freshWithAgents);
       final initial = await service.open();
       // Once, not on every committed tick. 64 recent revisions are enough to
       // reconstruct recent candles without loading the entire database.
@@ -146,17 +159,18 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
   }
 
   void _operate(Future<String> Function(TxTradingService) work,
-      {bool automated = false}) {
+      {bool automated = false, int? remainderSeconds}) {
     if (!_ready) return;
     // While any step is outstanding, no additional scheduled tick is queued.
     _timer?.cancel();
     _timer = null;
     setState(() => _busy = true);
-    _operation = _perform(work, automated: automated);
+    _operation = _perform(work, automated: automated,
+        remainderSeconds: remainderSeconds);
   }
 
   Future<void> _perform(Future<String> Function(TxTradingService) work,
-      {required bool automated}) async {
+      {required bool automated, int? remainderSeconds}) async {
     try {
       final trader = _trader!;
       final before = trader.current;
@@ -166,6 +180,10 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
       // no readHistory(160) for each game minute.
       if (before.revision != after.revision) {
         _candles!.addCommit(before, after);
+      }
+      if (remainderSeconds != null) {
+        // Only display a complete simulated minute after its commit succeeds.
+        _fractionalSeconds = remainderSeconds;
       }
       if (automated) {
         _autoCount++;
@@ -191,12 +209,12 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
     }
   }
 
-  void _tick({bool automatic = false}) => _operate((service) async {
+  void _tick({bool automatic = false, int? remainderSeconds}) => _operate((service) async {
     final next = await service.nextTick();
     return '模拟第 ${TxSimulationClock.gameDay(next.session.step)} 天 '
         '${TxSimulationClock.hhmm(next.session.step)} · '
         'SQLite r${next.revision}';
-  }, automated: automatic);
+  }, automated: automatic, remainderSeconds: remainderSeconds);
 
   int? _cents(String raw) {
     if (!RegExp(r'^\d{1,10}(\.\d{1,2})?$').hasMatch(raw.trim())) return null;
@@ -305,7 +323,20 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
     );
   }
 
+  String _regimeName(int step, int symbolIndex) {
+    final minute = step < 1 ? 1 : step;
+    return switch (TxSession.marketRegime(minute, symbolIndex)) {
+      0 => '上行趋势',
+      1 => '区间震荡',
+      2 => '下行趋势',
+      _ => '高波动',
+    };
+  }
+
   Widget _market(TxSession session) {
+    final minuteFills = session.currentMinuteFills
+        .where((f) => f.symbol == _symbolName).toList();
+    final minuteVolume = minuteFills.fold<int>(0, (sum, f) => sum + f.quantity);
     final price = session.lastPrice(_symbolName);
     final candles = _candles!.forSymbol(_symbolName);
     return ListView(padding: const EdgeInsets.all(14), children: [
@@ -315,12 +346,28 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
           Text(_symbolName, style: const TextStyle(color: Colors.white70)),
           Text('¥${money(price)}', style: const TextStyle(
               fontSize: 34, fontWeight: FontWeight.bold)),
-          Text('模拟日 ${TxSimulationClock.gameDay(session.step)} '
-              '${TxSimulationClock.hhmm(session.step)} · 每步=1游戏分钟'),
+          Text('模拟日 ${TxRealtimeClock.gameDay(session.step, _fractionalSeconds)} '
+              '${TxRealtimeClock.hhmmss(session.step, _fractionalSeconds)}'
+              ' · 1×=现实1秒/游戏1秒'),
         ],
       ))),
       Card(child: Padding(padding: const EdgeInsets.all(12),
           child: TxCandleChart(candles: candles))),
+      Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('模拟市场参与者', style: TextStyle(fontWeight: FontWeight.bold)),
+          const Text('2 个有限库存做市商 + 4 个独立资金账户的模拟交易者；'
+              '它们会主动交易和提供流动性，玩家不操作也可能有成交。',
+              style: TextStyle(color: Colors.white70, fontSize: 12)),
+          const SizedBox(height: 6),
+          Text('当前市场环境：${_regimeName(session.step, _symbol)}'),
+          Text('本游戏分钟：${minuteFills.length} 笔真实撮合 · '
+              '$minuteVolume 股成交量'),
+          const Text('所有成交均在真实订单簿按价格与时间撮合；'
+              '不模拟外部证券、不保证每一分钟都有成交。',
+              style: TextStyle(color: Colors.white54, fontSize: 11)),
+        ],
+      ))),
       _depth(session),
       _title('游戏时间与行情速度', sub: '24 小时制，前台运行；失败或切后台立即暂停'),
       Card(child: Padding(padding: const EdgeInsets.all(12),
@@ -335,18 +382,17 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
             OutlinedButton(onPressed: _ready ? () => _tick() : null,
                 child: const Text('+1 分钟')),
             const SizedBox(width: 8),
-            DropdownButton<int>(value: _speed, items: const [
-              DropdownMenuItem(value: 1, child: Text('1×')),
-              DropdownMenuItem(value: 5, child: Text('5×')),
-              DropdownMenuItem(value: 10, child: Text('10×')),
-            ], onChanged: (v) {
+            DropdownButton<int>(value: _speed,
+              items: TxRealtimeClock.speeds.map((value) =>
+                  DropdownMenuItem(value: value, child: Text('$value×'))).toList(),
+              onChanged: (v) {
               if (v == null) return;
               setState(() => _speed = v);
               if (_auto && _ready) _scheduleNext();
             }),
           ]),
-          const Text('1×: 5 秒/游戏分钟 · 5×: 1 秒/游戏分钟 · '
-              '10×: 0.5 秒/游戏分钟。存档慢时自动降速，不补跳。',
+          const Text('1×/2×/5×/10×/15×/30×/60×：每现实秒推进对应游戏秒数。'
+              '每游戏分钟提交一次 SQLite；存档慢时自动降速，不补跳。',
               style: TextStyle(color: Colors.white60, fontSize: 11)),
           const SizedBox(height: 4),
           Text('每次连续运行最多 60 游戏分钟，自动暂停防止数据库过快增长。',
@@ -354,8 +400,8 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
         ]),
       )),
       const SizedBox(height: 8),
-      const Text('所有 K 线由已提交的价格/成交生成；无成交的分钟成交量为零。'
-          '仅为合成市场，不代表真实证券行情。',
+      const Text('K 线的开高低收取自已提交的参考价格及真实撮合记录；'
+          '成交量不包含挂单，只统计实际成交的股份。',
           style: TextStyle(color: Colors.white54, fontSize: 11)),
     ]);
   }
@@ -437,37 +483,58 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
       Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(
         crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('修订 ${saved.revision} · 模拟步数 ${session.step}'),
-          Text('第 ${TxSimulationClock.gameDay(session.step)} 天 '
-              '${TxSimulationClock.hhmm(session.step)}'),
+          Text('第 ${TxRealtimeClock.gameDay(session.step, _fractionalSeconds)} 天 '
+              '${TxRealtimeClock.hhmmss(session.step, _fractionalSeconds)}'),
           Text('校验 ${saved.sha256.substring(0,16)}…'),
         ],
       ))),
     ]);
   }
 
+  String _participantLabel(String accountId) {
+    if (accountId == TxSession.playerId) return '玩家';
+    if (accountId.startsWith('LP_')) return '做市商 $accountId';
+    if (accountId.startsWith('NPC_')) return '模拟交易者 ${accountId.substring(4)}';
+    return accountId;
+  }
+
   Widget _records(TxSession session) {
     final orders = session.playerOrders.take(100).toList();
-    final fills = session.playerFills.take(100).toList();
+    final playerFills = session.playerFills.take(100).toList();
+    final tape = session.engine.fills.reversed.take(100).toList();
     return ListView(padding: const EdgeInsets.all(14), children: [
-      _title('交易记录', sub: '最多显示最近 100 条'),
-      SegmentedButton<bool>(segments: const [
-        ButtonSegment(value: false, label: Text('委托')),
-        ButtonSegment(value: true, label: Text('成交')),
-      ], selected: {_fills},
-        onSelectionChanged: (v) => setState(() => _fills = v.first)),
-      if (!_fills && orders.isEmpty) const ListTile(title: Text('暂无委托')),
-      if (_fills && fills.isEmpty) const ListTile(title: Text('暂无成交')),
-      if (!_fills) for (final o in orders)
+      _title('真实成交与交易记录', sub: '我的成交与市场逐笔分开显示；最多展示最近 100 条'),
+      SegmentedButton<int>(segments: const [
+        ButtonSegment(value: 0, label: Text('我的委托')),
+        ButtonSegment(value: 1, label: Text('我的成交')),
+        ButtonSegment(value: 2, label: Text('市场逐笔')),
+      ], selected: {_recordMode},
+        onSelectionChanged: (v) => setState(() => _recordMode = v.first)),
+      if (_recordMode == 0 && orders.isEmpty)
+        const ListTile(title: Text('暂无个人委托')),
+      if (_recordMode == 1 && playerFills.isEmpty)
+        const ListTile(title: Text('暂无个人成交')),
+      if (_recordMode == 2 && tape.isEmpty)
+        const ListTile(title: Text('市场尚无实际成交')),
+      if (_recordMode == 0) for (final order in orders)
         Card(child: ListTile(dense: true,
-          title: Text('${o.id} ${o.symbol} ${o.side == TxSide.buy ? '买' : '卖'}'),
-          subtitle: Text('${o.status.name} · 成交${o.filled} · 余${o.remaining}'),
-          trailing: Text(o.limitPriceCents == null ? '市价' :
-              '¥${money(o.limitPriceCents!)}'))),
-      if (_fills) for (final f in fills)
+          title: Text('${order.id} ${order.symbol} '
+              '${order.side == TxSide.buy ? '买' : '卖'}'),
+          subtitle: Text('${order.status.name} · '
+              '成交${order.filled} · 余${order.remaining}'),
+          trailing: Text(order.limitPriceCents == null ? '市价' :
+              '¥${money(order.limitPriceCents!)}'))),
+      if (_recordMode == 1) for (final f in playerFills)
         Card(child: ListTile(dense: true,
           title: Text('${f.id} ${f.symbol} ${f.quantity}股'),
           subtitle: Text(session.engine.order(f.buyOrderId).ownerId ==
-              TxSession.playerId ? '买入' : '卖出'),
+              TxSession.playerId ? '玩家买入' : '玩家卖出'),
+          trailing: Text('¥${money(f.priceCents)}'))),
+      if (_recordMode == 2) for (final f in tape)
+        Card(child: ListTile(dense: true,
+          title: Text('${f.id} ${f.symbol} ${f.quantity}股'),
+          subtitle: Text('${_participantLabel(session.engine.order(f.buyOrderId).ownerId)} 买'
+              ' ← ${_participantLabel(session.engine.order(f.sellOrderId).ownerId)} 卖'),
           trailing: Text('¥${money(f.priceCents)}'))),
     ]);
   }
@@ -498,13 +565,13 @@ class _TerminalHomeV021State extends State<TerminalHomeV021>
 
     final stored = _trader!.current;
     final session = stored.session;
-    final day = TxSimulationClock.gameDay(session.step);
-    final hhmm = TxSimulationClock.hhmm(session.step);
+    final day = TxRealtimeClock.gameDay(session.step, _fractionalSeconds);
+    final hhmm = TxRealtimeClock.hhmmss(session.step, _fractionalSeconds);
     return Scaffold(
-      appBar: AppBar(title: const Column(
+      appBar: AppBar(title: Column(
         crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('TERMINAL X', style: TextStyle(fontWeight: FontWeight.w700)),
-          Text('V0.2.1 · 离线稳定性预览', style: TextStyle(fontSize: 11)),
+          Text('版本 $appVersion · 离线模拟交易', style: const TextStyle(fontSize: 11)),
         ]), actions: [
           IconButton(tooltip: _auto ? '暂停' : '运行',
               onPressed: _ready ? _toggle : null,

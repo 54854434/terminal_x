@@ -1,17 +1,15 @@
-/// Fail-closed trading service for the NEW V0.1d SQLite-only simulator.
-///
-/// Every operation works on a defensive session clone. The displayed state is
-/// advanced only AFTER the SQLite transaction commits successfully. A storage
-/// exception disables further trades until the app has been reopened and the
-/// database revalidated. No legacy preferences or backup files are read.
+/// Fail-closed trading service. Each mutation happens on a defensive clone;
+/// the new snapshot becomes visible only after SQLite commits successfully.
 import '../engine/tx_engine.dart';
 import '../engine/tx_session.dart';
 import 'tx_sqlite_store.dart';
 
 class TxTradingService {
-  TxTradingService(this.database);
+  TxTradingService(this.database, {TxSession Function()? initialSessionFactory})
+      : _initialSessionFactory = initialSessionFactory ?? TxSession.fresh;
 
   final TxSqliteStore database;
+  final TxSession Function() _initialSessionFactory;
   TxStoredSession? _current;
   bool _busy = false;
   bool _storageFault = false;
@@ -28,9 +26,9 @@ class TxTradingService {
     if (_busy) throw StateError('Storage is busy');
     _busy = true;
     try {
-      // initializeFresh itself checks for an existing account and never resets
-      // one. A damaged existing database throws rather than silently resetting.
-      final loaded = await database.initializeFresh(TxSession.fresh());
+      // initializeFresh never overwrites an existing valid account; a damaged
+      // DB fails closed. The factory is only used if the store is truly empty.
+      final loaded = await database.initializeFresh(_initialSessionFactory());
       loaded.session.engine.checkInvariants();
       _current = loaded;
       return loaded;
@@ -52,10 +50,7 @@ class TxTradingService {
     _ensureReady();
     final proposed = TxSession.importJson(current.session.exportJson());
     final order = proposed.placePlayer(
-      symbol: symbol,
-      side: side,
-      kind: kind,
-      quantity: quantity,
+      symbol: symbol, side: side, kind: kind, quantity: quantity,
       limitPriceCents: limitPriceCents,
     );
     await _commit(proposed);
@@ -91,14 +86,10 @@ class TxTradingService {
     try {
       candidate.engine.checkInvariants();
       final saved = await database.saveSession(
-        candidate,
-        expectedRevision: current.revision,
+        candidate, expectedRevision: current.revision,
       );
-      // No display/UI mutations happen until the transaction is committed.
       _current = saved;
     } catch (_) {
-      // A failed or ambiguously completed storage operation must not be
-      // followed by another order using a potentially stale revision.
       _storageFault = true;
       rethrow;
     } finally {

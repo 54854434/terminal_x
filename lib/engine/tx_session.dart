@@ -2,6 +2,7 @@
 /// Existing JSON snapshots remain schema-compatible and are never reset.
 import 'dart:convert';
 import 'tx_engine.dart';
+import '../market/tx_npc_market.dart';
 
 class TxSession {
   TxSession._(
@@ -37,6 +38,15 @@ class TxSession {
     final result = TxSession._(e, 0, [1000, 2500], 1, [], [], false);
     result._quoteMakers();
     return result;
+  }
+
+  /// New, separately installed market-simulation preview only.
+  /// Older tests and V0.1/V0.2 sessions retain their original fresh() book.
+  static TxSession freshWithAgents() {
+    final session = fresh();
+    TxNpcMarket.registerNewAccounts(session.engine);
+    session.engine.checkInvariants();
+    return session;
   }
 
   /// Read-only legacy import is retained for tests and old flows, but the
@@ -79,14 +89,30 @@ class TxSession {
     return session;
   }
 
-  /// The upgraded market model is deterministic from the saved simulation step;
-  /// no wall clock, mutable PRNG state or external market data is involved.
-  /// Trend regimes rotate every 120 simulated minutes. No false fills are made.
+  /// V0.2.2 showcases several market phases within a one-hour session.
+  /// All transitions depend solely on the saved minute and symbol.
+  static const int marketRegimeMinutes = 20;
+
+  static int marketRegime(int minute, int symbolIndex) {
+    if (minute < 1 || symbolIndex < 0 || symbolIndex >= symbols.length) {
+      throw ArgumentError('Invalid simulation minute or symbol');
+    }
+    return ((minute - 1) ~/ marketRegimeMinutes + symbolIndex * 2) % 4;
+  }
+
+  /// Keep the older passive-mode pricing rule stable for existing tests.
   static int referenceMove(int minute, int symbolIndex) {
     if (minute < 1 || symbolIndex < 0 || symbolIndex >= symbols.length) {
       throw ArgumentError('Invalid simulation minute or symbol');
     }
     final regime = ((minute - 1) ~/ 120 + symbolIndex * 2) % 4;
+    return _moveForRegime(minute, symbolIndex, regime);
+  }
+
+  static int activeReferenceMove(int minute, int symbolIndex) =>
+      _moveForRegime(minute, symbolIndex, marketRegime(minute, symbolIndex));
+
+  static int _moveForRegime(int minute, int symbolIndex, int regime) {
     final mix = ((minute * 1103515245 + symbolIndex * 12345 + 1013904223)
         ^ (minute * 2654435761)) & 0x7fffffff;
     final noise = ((mix ^ (mix >> 7) ^ (mix >> 13)) % 13) - 6;
@@ -99,6 +125,7 @@ class TxSession {
   }
 
   void nextTick() {
+    TxNpcMarket.cancelResting(engine);
     final restingMakerOrders = engine.orders.values.where((o) =>
         o.ownerId.startsWith('LP_') &&
         (o.status == TxStatus.open || o.status == TxStatus.partiallyFilled))
@@ -109,11 +136,18 @@ class TxSession {
     }
     step++;
     _quoteFillStart = engine.fills.length;
+    final movements = <int>[];
+    final activeParticipants = TxNpcMarket.isEnabled(engine);
     for (var i = 0; i < symbols.length; i++) {
-      referenceCents[i] = (referenceCents[i] + referenceMove(step, i))
+      final move = activeParticipants
+          ? activeReferenceMove(step, i) : referenceMove(step, i);
+      movements.add(move);
+      referenceCents[i] = (referenceCents[i] + move)
           .clamp(10, 1000000).toInt();
     }
     _quoteMakers();
+    TxNpcMarket.tradeMinute(
+        engine, step, symbols, referenceCents, movements);
     engine.checkInvariants();
   }
 
@@ -170,6 +204,11 @@ class TxSession {
     }
     return referenceCents[symbols.indexOf(symbol)];
   }
+
+  /// Real fills since the start of the most recent simulated minute.
+  /// No fake print events and no exposure of historical NPC order payloads.
+  List<TxFill> get currentMinuteFills =>
+      engine.fills.sublist(_quoteFillStart);
 
   int get totalAssetsCents {
     final player = engine.account(playerId);

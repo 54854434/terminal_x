@@ -1,8 +1,10 @@
-/// OHLC calculated ONLY from verified committed SQLite session snapshots.
+/// Verified OHLC/volume derived only from committed engine snapshots.
 ///
-/// One candle represents one simulation step. Multiple committed trades in the
-/// same step update OHLC and volume; the first observed revision in a truncated
-/// history defines the first candle's open. We do not invent market history.
+/// Background participants may match multiple times *inside* one simulated
+/// minute, so scanning the real new fill prices is necessary to preserve
+/// actual candle high/low. Quotes alone never count as traded volume.
+import 'dart:math' as math;
+
 import '../engine/tx_session.dart';
 import '../storage/tx_sqlite_store.dart';
 
@@ -29,8 +31,8 @@ class TxCandle {
 class TxCandleHistory {
   const TxCandleHistory._();
 
-  /// Revisions MUST be in strictly increasing order; step numbers may repeat.
-  /// The first available revision is a baseline for incremental volume.
+  /// The first verified snapshot is just a baseline. All subsequent OHLC
+  /// extensions require recorded market observations and real engine fills.
   static List<TxCandle> fromSnapshots(
     List<TxStoredSession> snapshots,
     String symbol,
@@ -39,56 +41,65 @@ class TxCandleHistory {
       throw ArgumentError.value(symbol, 'symbol', 'Unsupported symbol');
     }
     if (snapshots.isEmpty) return const <TxCandle>[];
-    final results = <TxCandle>[];
-    var previousRevision = 0;
-    var previousStep = -1;
-    var previousFillCount = 0;
+    final result = <TxCandle>[];
+    var lastRevision = 0;
+    var lastStep = -1;
+    var lastFillCount = 0;
     var first = true;
     for (final stored in snapshots) {
-      if (stored.revision <= previousRevision) {
+      if (stored.revision <= lastRevision) {
         throw StateError('Snapshot revisions are not strictly increasing');
       }
       final session = stored.session;
-      if (session.step < previousStep) {
+      if (session.step < lastStep) {
         throw StateError('Simulation clock went backwards');
       }
       final price = session.lastPrice(symbol);
       if (price <= 0) throw StateError('Invalid historical price');
       final fills = session.engine.fills;
-      if (!first && fills.length < previousFillCount) {
+      if (!first && fills.length < lastFillCount) {
         throw StateError('Trade history shrank between snapshots');
       }
       var volume = 0;
+      var low = price;
+      var high = price;
       if (!first) {
-        for (var i = previousFillCount; i < fills.length; i++) {
-          if (fills[i].symbol == symbol) volume += fills[i].quantity;
+        for (var i = lastFillCount; i < fills.length; i++) {
+          final fill = fills[i];
+          if (fill.symbol != symbol) continue;
+          volume += fill.quantity;
+          low = math.min(low, fill.priceCents);
+          high = math.max(high, fill.priceCents);
         }
       }
-      if (results.isEmpty || session.step != results.last.step) {
-        results.add(TxCandle(
+      if (result.isEmpty || session.step != result.last.step) {
+        // A new minute opens at the last observable mark. The first snapshot
+        // in a shortened history has no known earlier opening mark.
+        final open = result.isEmpty ? price : result.last.closeCents;
+        result.add(TxCandle(
           step: session.step,
-          openCents: price,
-          highCents: price,
-          lowCents: price,
+          openCents: open,
+          highCents: math.max(high, open),
+          lowCents: math.min(low, open),
           closeCents: price,
           volumeShares: volume,
         ));
       } else {
-        final old = results.removeLast();
-        results.add(TxCandle(
+        final old = result.removeLast();
+        result.add(TxCandle(
           step: old.step,
           openCents: old.openCents,
-          highCents: old.highCents > price ? old.highCents : price,
-          lowCents: old.lowCents < price ? old.lowCents : price,
+          highCents: math.max(old.highCents, high),
+          lowCents: math.min(old.lowCents, low),
           closeCents: price,
           volumeShares: old.volumeShares + volume,
         ));
       }
-      previousRevision = stored.revision;
-      previousStep = session.step;
-      previousFillCount = fills.length;
+      lastRevision = stored.revision;
+      lastStep = session.step;
+      lastFillCount = fills.length;
       first = false;
     }
-    return results;
+    return result;
   }
 }
