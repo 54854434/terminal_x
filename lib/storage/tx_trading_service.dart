@@ -9,10 +9,12 @@ import 'tx_sqlite_store.dart';
 // Pure Dart market evaluation is moved away from the Flutter UI isolate.
 // The authoritative session is never mutated: the isolate gets a serialized
 // copy, and only the returned candidate can be committed.
-TxSession _advanceMinute(String snapshot) {
-  final candidate = TxSession.importJson(snapshot);
-  candidate.nextTick();
-  return candidate;
+TxSession _advanceMinute(TxSession session) {
+  // Isolate.run copies this pure-Dart object graph to a worker isolate.
+  // Neither the persisted nor the UI-visible source instance is mutated.
+  // Avoid serializing the entire growing order/ledger history on the UI thread.
+  session.nextTick();
+  return session;
 }
 
 class TxTradingService {
@@ -37,8 +39,12 @@ class TxTradingService {
     if (_busy) throw StateError('Storage is busy');
     _busy = true;
     try {
-      final loaded = await database.initializeFresh(_initialSessionFactory());
-      // initializeFresh/readCurrent already verifies the engine and checksum.
+      // Fast existing-account path: don't allocate/validate a fresh market
+      // (including 6 simulated accounts and its order book) on every reopen.
+      // readCurrent throws on damage; NEVER treat corruption as an empty DB.
+      final loaded = await database.readCurrent() ??
+          await database.initializeFresh(_initialSessionFactory());
+      // readCurrent/initializeFresh verify checksums and full engine ledgers.
       _current = loaded;
       return loaded;
     } catch (_) {
@@ -81,8 +87,11 @@ class TxTradingService {
     // Serialization and SQLite checksum checks remain a measurable P1 cost.
     _busy = true; // Reserve the revision during the worker's computation.
     try {
-      final snapshot = current.session.exportJson();
-      final candidate = await Isolate.run(() => _advanceMinute(snapshot));
+      // The isolate receives an independent copy of this sendable pure-Dart
+      // graph; no main-isolate exportJson() per minute. SQLite still audits,
+      // hashes and commits the returned candidate before it is made visible.
+      final source = current.session;
+      final candidate = await Isolate.run(() => _advanceMinute(source));
       await _commit(candidate);
       return current;
     } finally {
