@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../market/tx_candle_history.dart';
 import '../market/tx_indicators.dart';
+import '../market/tx_timeframe.dart';
 
 /// Committed simulated OHLC (real fills plus explicitly marked reference
 /// prices for no-trade periods) with a distinct indicative preview.
@@ -15,33 +16,45 @@ class TxCandleChart extends StatefulWidget {
 
 class _TxCandleChartState extends State<TxCandleChart> {
   int _window = 32, _olderOffset = 0;
+  int? _inspectedStep;
+  TxChartPeriod _period = TxChartPeriod.oneMinute;
+  TxAggregatedBars? _aggregate;
+  List<TxCandle> _activeBars = const <TxCandle>[];
+  TxChartPeriod? _cachedPeriod;
   double _dragAccumulator = 0;
   bool _showMA = true;
   int _maLength = -1, _maFirstStep = -1;
   TxCandle? _maLast;
   List<double?>? _ma5, _ma10, _ma20;
   int? _previewStep, _previewHigh, _previewLow;
-  int get _maxOffset => math.max(0, widget.candles.length -
-      math.min(_window, widget.candles.length));
+  int get _maxOffset => math.max(0, _activeBars.length -
+      math.min(_window, _activeBars.length));
 
   void _refreshCache() {
-    final data = widget.candles;
-    if (data.isEmpty) return;
-    // This view may be the SAME List object after a successful SQLite commit.
-    if (_maLength != data.length || _maFirstStep != data.first.step ||
-        !identical(_maLast, data.last)) {
-      _maLength = data.length;
-      _maFirstStep = data.first.step;
-      _maLast = data.last;
-      _ma5 = TxIndicators.sma(data, 5);
-      _ma10 = TxIndicators.sma(data, 10);
-      _ma20 = TxIndicators.sma(data, 20);
+    final source = widget.candles;
+    if (source.isEmpty) return;
+    // The live view is a stable List object mutated on committed revisions.
+    // Recompute only for a new revision or a requested interval.
+    if (_maLength != source.length ||
+        _maFirstStep != source.first.step ||
+        !identical(_maLast, source.last) || _cachedPeriod != _period) {
+      _maLength = source.length;
+      _maFirstStep = source.first.step;
+      _maLast = source.last;
+      _cachedPeriod = _period;
+      _aggregate = TxTimeframe.aggregate(source,
+          _period == TxChartPeriod.timeline ? 1 : _period.minutes);
+      _activeBars = _aggregate!.bars;
+      _ma5 = TxIndicators.sma(_activeBars, 5);
+      _ma10 = TxIndicators.sma(_activeBars, 10);
+      _ma20 = TxIndicators.sma(_activeBars, 20);
+      if (_olderOffset > _maxOffset) _olderOffset = _maxOffset;
     }
-    final step = data.last.step;
+    final step = source.last.step;
     if (_previewStep != step) {
       _previewStep = step;
-      _previewHigh = data.last.closeCents;
-      _previewLow = data.last.closeCents;
+      _previewHigh = source.last.closeCents;
+      _previewLow = source.last.closeCents;
     }
     final price = widget.indicativePriceCents;
     if (price != null) {
@@ -58,7 +71,9 @@ class _TxCandleChartState extends State<TxCandleChart> {
       // extrema; otherwise the price axis shows a fictitious large wick.
       _previewStep = null;
       _maLength = -1;
+      _cachedPeriod = null;
       _olderOffset = 0;
+      _inspectedStep = null;
     }
     if (_olderOffset > _maxOffset) _olderOffset = _maxOffset;
   }
@@ -70,30 +85,70 @@ class _TxCandleChartState extends State<TxCandleChart> {
           child: Center(child: Text('暂无已保存的模拟行情记录')));
     }
     _refreshCache();
-    final all = widget.candles;
+    final all = _activeBars;
     final end = (all.length - _olderOffset).clamp(1, all.length).toInt();
     final start = math.max(0, end - _window);
     final visible = all.sublist(start, end);
+    TxCandle? inspected;
+    for (final bar in visible) {
+      if (bar.step == _inspectedStep) { inspected = bar; break; }
+    }
+    // Preview is a NON-traded reference. Only show it at the far-right edge.
     final preview = _olderOffset == 0 ? widget.indicativePriceCents : null;
     return Column(children: [
       Row(children: [
-        const Text('模拟 K 线 · 1分钟', style: TextStyle(fontSize: 12,
-            color: Colors.white70)),
+        Text(_period == TxChartPeriod.timeline ? '模拟分时 · 已提交分钟价格'
+            : '模拟 K 线 · ${_period.label}',
+            style: const TextStyle(fontSize: 12, color: Colors.white70)),
         const Spacer(),
         Text('步 ${visible.first.step}–${visible.last.step}',
             style: const TextStyle(fontSize: 12, color: Colors.white70)),
       ]),
+      SizedBox(height: 43, child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [for (final period in TxChartPeriod.values)
+          Padding(padding: const EdgeInsets.only(right: 5),
+            child: ChoiceChip(
+              label: Text(period.label, style: const TextStyle(fontSize: 11)),
+              visualDensity: VisualDensity.compact,
+              selected: period == _period,
+              onSelected: (_) => setState(() {
+                _period = period;
+                _olderOffset = 0;
+                _inspectedStep = null;
+                _cachedPeriod = null;
+              }),
+            )),
+        ],
+      )),
+      if (_period.minutes > 1 && _aggregate != null &&
+          (_aggregate!.leftIncomplete || _aggregate!.rightIncomplete ||
+           _aggregate!.hasGaps))
+        const Text('大周期含未完整区间／历史缺口，仅聚合可用分钟',
+            style: TextStyle(fontSize: 10, color: Colors.amberAccent)),
       Row(children: [
         FilterChip(label: const Text('MA5 / MA10 / MA20',
             style: TextStyle(fontSize: 11)), selected: _showMA,
             visualDensity: VisualDensity.compact,
-            onSelected: (v) => setState(() => _showMA = v)),
+            onSelected: _period == TxChartPeriod.timeline ? null :
+                (v) => setState(() => _showMA = v)),
         const SizedBox(width: 6),
-        if (preview != null) const Expanded(child: Text('空心K/虚线：指示价（非成交）',
+        if (preview != null && _period == TxChartPeriod.oneMinute)
+          const Expanded(child: Text('空心K/虚线：指示价（非成交）',
             maxLines: 1, overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 10, color: Colors.white54))),
       ]),
-      GestureDetector(behavior: HitTestBehavior.opaque,
+      LayoutBuilder(builder: (context, constraints) =>
+        GestureDetector(behavior: HitTestBehavior.opaque,
+        onTapDown: (details) {
+          final plotWidth = constraints.maxWidth - 55;
+          if (plotWidth <= 0 || details.localPosition.dx >= plotWidth) return;
+          final slot = plotWidth / (visible.length +
+              (_period == TxChartPeriod.timeline ? 0 : 1));
+          final index = ((details.localPosition.dx / slot) - .5)
+              .round().clamp(0, visible.length - 1).toInt();
+          setState(() => _inspectedStep = visible[index].step);
+        },
         onHorizontalDragUpdate: (details) {
           _dragAccumulator += details.delta.dx;
           final shift = (_dragAccumulator / 14).truncate();
@@ -104,15 +159,25 @@ class _TxCandleChartState extends State<TxCandleChart> {
         },
         child: RepaintBoundary(child: SizedBox(height: 230,
           width: double.infinity,
-          child: CustomPaint(painter: _CandlePainter(visible,
-            ma5: _showMA ? _ma5!.sublist(start, end) : null,
-            ma10: _showMA ? _ma10!.sublist(start, end) : null,
-            ma20: _showMA ? _ma20!.sublist(start, end) : null,
-            indicativePriceCents: preview,
-            indicativeHighCents: preview == null ? null : _previewHigh,
-            indicativeLowCents: preview == null ? null : _previewLow)),
+          child: CustomPaint(painter: _period == TxChartPeriod.timeline
+            ? _TimelinePainter(visible, indicativePriceCents: preview)
+            : _CandlePainter(visible,
+                ma5: _showMA ? _ma5!.sublist(start, end) : null,
+                ma10: _showMA ? _ma10!.sublist(start, end) : null,
+                ma20: _showMA ? _ma20!.sublist(start, end) : null,
+                indicativePriceCents: _period == TxChartPeriod.oneMinute ? preview : null,
+                indicativeHighCents: _period == TxChartPeriod.oneMinute ? _previewHigh : null,
+                indicativeLowCents: _period == TxChartPeriod.oneMinute ? _previewLow : null)),
         )),
-      ),
+      )),
+      if (inspected != null)
+        Text('区间 ${inspected.step}  O:${(inspected.openCents / 100).toStringAsFixed(2)}'
+            '  H:${(inspected.highCents / 100).toStringAsFixed(2)}'
+            '  L:${(inspected.lowCents / 100).toStringAsFixed(2)}'
+            '  C:${(inspected.closeCents / 100).toStringAsFixed(2)}'
+            '  V:${inspected.volumeShares}',
+            maxLines: 1, overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 10, color: Colors.white70)),
       Row(children: [
         const Text('缩放', style: TextStyle(fontSize: 12)),
         Expanded(child: Slider(value: _window.toDouble(), min: 12, max: 80,
@@ -123,7 +188,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
           }))),
         Text('$_window', style: const TextStyle(fontSize: 12)),
       ]),
-      const Text('无影线：极值未越过实体；零成交只作参考标价、不造量',
+      const Text('点击图表看 OHLCV · 无影线可能正常 · 不伪造成交量',
           style: TextStyle(color: Colors.white54, fontSize: 10)),
     ]);
   }
@@ -249,4 +314,84 @@ class _CandlePainter extends CustomPainter {
       (ma5==null)!=(other.ma5==null) ||
       (candles.isNotEmpty && (candles.first.step!=other.candles.first.step ||
           !identical(candles.last,other.candles.last)));
+}
+
+
+/// Minute-closing mark line, not a seconds-level executed trade stream.
+/// The final blue dash can be indicative; it is never persisted as a fill.
+class _TimelinePainter extends CustomPainter {
+  _TimelinePainter(this.candles, {this.indicativePriceCents});
+  final List<TxCandle> candles;
+  final int? indicativePriceCents;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (candles.isEmpty || size.width < 80 || size.height < 100) return;
+    final right = size.width - 55, bottom = size.height - 39;
+    var low = candles.first.closeCents.toDouble();
+    var high = low;
+    for (final item in candles) {
+      low = math.min(low, item.closeCents.toDouble());
+      high = math.max(high, item.closeCents.toDouble());
+    }
+    if (indicativePriceCents != null) {
+      low = math.min(low, indicativePriceCents!.toDouble());
+      high = math.max(high, indicativePriceCents!.toDouble());
+    }
+    final margin = math.max(2.0, (high - low) * .09);
+    final top = high + margin;
+    final range = math.max(1.0, high - low + 2 * margin);
+    double y(double price) => (top - price) / range * bottom;
+    final axis = Paint()..color = const Color(0xFF293448)
+        ..strokeWidth = .8;
+    for (var i = 0; i <= 4; i++) {
+      final yy = bottom * i / 4;
+      canvas.drawLine(Offset(0, yy), Offset(right, yy), axis);
+      final label = TextPainter(text: TextSpan(
+        text: ((top - range * i / 4) / 100).toStringAsFixed(2),
+        style: const TextStyle(fontSize: 10, color: Color(0xFF9BA7BB))),
+        textDirection: TextDirection.ltr)..layout();
+      label.paint(canvas, Offset(right + 6, yy - 6));
+    }
+    final width = right / math.max(1, candles.length);
+    final path = Path();
+    for (var i = 0; i < candles.length; i++) {
+      final x = width * (i + .5);
+      final yy = y(candles[i].closeCents.toDouble());
+      if (i == 0) { path.moveTo(x, yy); } else { path.lineTo(x, yy); }
+    }
+    if (candles.length == 1) {
+      canvas.drawCircle(Offset(width * .5, y(candles.first.closeCents.toDouble())),
+          2.5, Paint()..color = const Color(0xFF3DD3A5));
+    }
+    canvas.drawPath(path, Paint()
+      ..color = const Color(0xFF3DD3A5)
+      ..strokeWidth = 1.8
+      ..style = PaintingStyle.stroke
+      ..isAntiAlias = true);
+    if (indicativePriceCents != null) {
+      final x = right - 2;
+      final prevX = width * (candles.length - .5);
+      final p = Paint()..color = const Color(0xFF54CEE5)
+        ..strokeWidth = 1.4;
+      // A discontinuous preview, not a synthetic traded line segment.
+      for (double dx = prevX; dx < x; dx += 7) {
+        canvas.drawLine(Offset(dx, y(indicativePriceCents!.toDouble())),
+          Offset(math.min(dx + 3, x), y(indicativePriceCents!.toDouble())), p);
+      }
+    }
+    final text = TextPainter(text: const TextSpan(
+      text: '分时收盘参考价格 / 非逐笔成交',
+      style: TextStyle(fontSize: 10, color: Colors.white54)),
+      textDirection: TextDirection.ltr)..layout();
+    text.paint(canvas, Offset(4, size.height - 24));
+  }
+
+  @override
+  bool shouldRepaint(covariant _TimelinePainter old) =>
+      indicativePriceCents != old.indicativePriceCents ||
+      candles.length != old.candles.length ||
+      (candles.isNotEmpty &&
+          (candles.first.step != old.candles.first.step ||
+           !identical(candles.last, old.candles.last)));
 }

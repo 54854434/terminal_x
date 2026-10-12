@@ -5,9 +5,9 @@ import '../engine/tx_session.dart';
 import '../storage/tx_sqlite_store.dart';
 import 'tx_candle_history.dart';
 
-/// Small memory-only cache. SQLite is the source of truth; on restart the
-/// cache is reconstructed once from checksummed committed snapshots.
-/// No readHistory() call per tick, avoiding repeated O(history * save-size).
+/// A bounded in-memory read-only minute series. Only committed SQLite
+/// revisions extend it. It is intentionally not an authoritative persistence
+/// layer: reopening still reconstructs from recently verified snapshots.
 class TxLiveCandles {
   TxLiveCandles._(this._values) {
     for (final entry in _values.entries) {
@@ -15,9 +15,11 @@ class TxLiveCandles {
     }
   }
 
-  static const maxCandles = 160;
+  // Retain a full game day (plus spare bars) while the app stays active.
+  // Larger intervals need >160 minutes; do not increase startup snapshot reads.
+  static const maxCandles = 1500;
   final Map<String, List<TxCandle>> _values;
-  final Map<String, List<TxCandle>> _views = {}; 
+  final Map<String, List<TxCandle>> _views = {};
 
   factory TxLiveCandles.fromVerifiedHistory(List<TxStoredSession> history) {
     final bySymbol = <String, List<TxCandle>>{};
@@ -29,11 +31,11 @@ class TxLiveCandles {
     return TxLiveCandles._(bySymbol);
   }
 
-  /// Stable read-only views avoid allocating new copies on every UI second.
   List<TxCandle> forSymbol(String symbol) =>
       _views[symbol] ?? (throw ArgumentError.value(symbol));
 
-  /// A single successful SQLite commit; never infer or fabricate fills.
+  /// Append/update a real, verified, committed minute. Never extrapolate a
+  /// candle from a display-only indicative preview.
   void addCommit(TxStoredSession before, TxStoredSession after) {
     if (after.revision != before.revision + 1) {
       throw StateError('Missing committed SQLite revision');
