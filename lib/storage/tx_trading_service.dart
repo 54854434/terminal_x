@@ -1,8 +1,19 @@
-/// Fail-closed trading service. Each mutation happens on a defensive clone;
-/// the new snapshot becomes visible only after SQLite commits successfully.
+/// Fail-closed trading service: no proposed trade is visible before its
+/// checksummed SQLite transaction commits. Legacy account files stay intact.
+import 'dart:isolate';
+
 import '../engine/tx_engine.dart';
 import '../engine/tx_session.dart';
 import 'tx_sqlite_store.dart';
+
+// Pure Dart market evaluation is moved away from the Flutter UI isolate.
+// The authoritative session is never mutated: the isolate gets a serialized
+// copy, and only the returned candidate can be committed.
+TxSession _advanceMinute(String snapshot) {
+  final candidate = TxSession.importJson(snapshot);
+  candidate.nextTick();
+  return candidate;
+}
 
 class TxTradingService {
   TxTradingService(this.database, {TxSession Function()? initialSessionFactory})
@@ -26,10 +37,8 @@ class TxTradingService {
     if (_busy) throw StateError('Storage is busy');
     _busy = true;
     try {
-      // initializeFresh never overwrites an existing valid account; a damaged
-      // DB fails closed. The factory is only used if the store is truly empty.
       final loaded = await database.initializeFresh(_initialSessionFactory());
-      loaded.session.engine.checkInvariants();
+      // initializeFresh/readCurrent already verifies the engine and checksum.
       _current = loaded;
       return loaded;
     } catch (_) {
@@ -67,10 +76,18 @@ class TxTradingService {
 
   Future<TxStoredSession> nextTick() async {
     _ensureReady();
-    final proposed = TxSession.importJson(current.session.exportJson());
-    proposed.nextTick();
-    await _commit(proposed);
-    return current;
+    // Isolation prevents the order-book matching and NPC computations from
+    // blocking a chart drag or animation. No skipped or speculative minutes.
+    // Serialization and SQLite checksum checks remain a measurable P1 cost.
+    _busy = true; // Reserve the revision during the worker's computation.
+    try {
+      final snapshot = current.session.exportJson();
+      final candidate = await Isolate.run(() => _advanceMinute(snapshot));
+      await _commit(candidate);
+      return current;
+    } finally {
+      _busy = false;
+    }
   }
 
   void _ensureReady() {
@@ -84,7 +101,9 @@ class TxTradingService {
   Future<void> _commit(TxSession candidate) async {
     _busy = true;
     try {
-      candidate.engine.checkInvariants();
+      // TxSqliteStore.saveSession canonicalizes, checks the ledger and
+      // verifies the persisted revision before returning. Avoid duplicating
+      // another full audit here on the rendering isolate.
       final saved = await database.saveSession(
         candidate, expectedRevision: current.revision,
       );

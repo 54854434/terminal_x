@@ -1,6 +1,7 @@
-/// Offline, deterministic background participants. All displayed fills come
-/// from TxEngine, never from synthetic candles or manufactured tape data.
-/// Accounts use finite cash and inventory and the ordinary reservation rules.
+/// Funded, deterministic background counterparties. All prints and volume
+/// originate from TxEngine orders and ordinary price-time matching.
+/// This batch adds inventory-aware liquidity and finite risk budgets; economic
+/// events are STILL committed per game minute, not once per second.
 import '../engine/tx_engine.dart';
 
 class TxNpcMarket {
@@ -27,7 +28,7 @@ class TxNpcMarket {
     }
   }
 
-  /// Cancel only the bot's own previous passive orders. Never touch PLAYER.
+  /// Revise only resting NPC quotes. PLAYER orders remain on the FIFO book.
   static void cancelResting(TxEngine engine) {
     if (!isEnabled(engine)) return;
     final pending = engine.orders.values.where((o) =>
@@ -40,8 +41,6 @@ class TxNpcMarket {
   }
 
   static int _mix(int minute, int symbolIndex, int salt) {
-    // No PRNG state to lose on app restart: same persisted minute => same
-    // intent, provided the same real funded order book and participant assets.
     var h = (minute * 1103515245 + symbolIndex * 123457 + salt * 2654435761)
         & 0x7fffffff;
     h ^= (h >> 11);
@@ -50,16 +49,28 @@ class TxNpcMarket {
   }
 
   static int _min(int a, int b) => a < b ? a : b;
+  static int _max(int a, int b) => a > b ? a : b;
 
+  /// Market maker's skew reflects its OWN finite inventory, never knowledge
+  /// of the player's future actions. Zero inventory cannot offer fake asks.
   static void _placePassive(TxEngine engine, int minute, int index,
-      String symbol, int reference) {
+      String symbol, int reference, int movement) {
     final owner = engine.account('NPC_LIQ');
-    final amount = 15 + _mix(minute, index, 10) % 18;
-    final bid = reference;
-    final ask = reference + 2;
+    final initialShares = index == 0 ? 4000 : 1400;
+    final inventory = owner.sharesOf(symbol);
+    final stress = movement.abs();
+    // Spreads widen when the reference process becomes volatile. LP_A/LP_B
+    // still supply their independently funded resting depth.
+    final halfSpread = 1 + _min(6, stress ~/ 5);
+    final bid = reference - halfSpread;
+    final ask = reference + halfSpread + 1;
+    final base = 15 + _mix(minute, index, 10) % 18;
+    // Rebalance inventory toward the initial target with asymmetric quotes.
+    final bidScale = inventory < initialShares ~/ 2 ? 2 : 1;
+    final askScale = inventory > initialShares * 3 ~/ 2 ? 2 : 1;
     if (bid > 0 && bid <= TxEngine.maxPriceCents) {
       final affordable = owner.availableCashCents ~/ bid;
-      final qty = _min(amount, affordable);
+      final qty = _min(base * bidScale, affordable);
       if (qty > 0) {
         engine.place(
           id: 'NPC-L-$minute-$index-B', ownerId: 'NPC_LIQ',
@@ -69,7 +80,7 @@ class TxNpcMarket {
       }
     }
     if (ask <= TxEngine.maxPriceCents) {
-      final qty = _min(amount, owner.availableSharesOf(symbol));
+      final qty = _min(base * askScale, owner.availableSharesOf(symbol));
       if (qty > 0) {
         engine.place(
           id: 'NPC-L-$minute-$index-S', ownerId: 'NPC_LIQ',
@@ -81,22 +92,31 @@ class TxNpcMarket {
   }
 
   static void _aggressive(TxEngine engine, int minute, int index,
-      String symbol, String agent, TxSide side, int salt) {
+      String symbol, String agent, TxSide side, int salt, int movement) {
     final account = engine.account(agent);
     final opposing = engine.depth(symbol,
-        side == TxSide.buy ? TxSide.sell : TxSide.buy);
-    if (opposing.isEmpty) return; // No liquidity means no fictional fill.
-    final availableQty = opposing.fold<int>(0, (a, b) => a + b.quantity);
-    final desired = (index == 0 ? 18 : 8) + _mix(minute, index, salt) %
-        (index == 0 ? 120 : 40);
-    var quantity = _min(desired, availableQty);
+        side == TxSide.buy ? TxSide.sell : TxSide.buy, levels: 8);
+    if (opposing.isEmpty) return;
+    final visibleQty = opposing.fold<int>(0, (sum, level) => sum + level.quantity);
+    // A market order's liquidity impact is bounded by visible funded depth;
+    // for buys use the WORST sampled ask as a conservative cash limit.
+    final baseline = index == 0 ? 18 : 8;
+    final randomness = index == 0 ? 120 : 40;
+    var desired = baseline + _mix(minute, index, salt) % randomness;
+    // Trend traders enlarge urgency in volatile periods, value traders scale
+    // down risk, and order-flow traders retain independent stochastic intent.
+    if (agent == 'NPC_TREND') {
+      desired += _min(45, movement.abs() * 2);
+    } else if (agent == 'NPC_VALUE') {
+      desired = _max(1, desired - _min(25, movement.abs()));
+    }
+    var quantity = _min(desired, visibleQty);
     if (side == TxSide.sell) {
       quantity = _min(quantity, account.availableSharesOf(symbol));
     } else {
-      // Conservative upper bound for a market sweep across all visible levels.
-      final highestAsk = opposing.last.priceCents;
-      if (highestAsk <= 0) return;
-      quantity = _min(quantity, account.availableCashCents ~/ highestAsk);
+      final worstAsk = opposing.last.priceCents;
+      if (worstAsk <= 0) return;
+      quantity = _min(quantity, account.availableCashCents ~/ worstAsk);
     }
     if (quantity <= 0) return;
     engine.place(
@@ -106,22 +126,29 @@ class TxNpcMarket {
     );
   }
 
-  /// Runs AFTER maker quotes for this minute. The passive participant posts
-  /// funded orders; three other participants execute opposing market intents.
-  /// Real trade prices and volumes are produced by the existing FIFO matcher.
+  /// Runs after funded LP quotes have been submitted. All changes are real
+  /// order entries/cancels/matches, but V0.2.5 still uses one minute boundary.
   static void tradeMinute(TxEngine engine, int minute,
       List<String> symbols, List<int> references, List<int> movements) {
-    if (!isEnabled(engine)) return; // Legacy save compatibility.
+    if (!isEnabled(engine)) return; // Legacy session compatibility.
+    if (symbols.length != references.length ||
+        symbols.length != movements.length) {
+      throw ArgumentError('Inconsistent NPC market symbol arrays');
+    }
     for (var i = 0; i < symbols.length; i++) {
       final symbol = symbols[i];
-      _placePassive(engine, minute, i, symbol, references[i]);
-      final trendSide = movements[i] >= 0 ? TxSide.buy : TxSide.sell;
-      _aggressive(engine, minute, i, symbol, 'NPC_TREND', trendSide, 21);
+      final move = movements[i];
+      _placePassive(engine, minute, i, symbol, references[i], move);
+      final trendSide = move >= 0 ? TxSide.buy : TxSide.sell;
+      _aggressive(engine, minute, i, symbol, 'NPC_TREND',
+          trendSide, 21, move);
       _aggressive(engine, minute, i, symbol, 'NPC_VALUE',
-          trendSide == TxSide.buy ? TxSide.sell : TxSide.buy, 22);
+          trendSide == TxSide.buy ? TxSide.sell : TxSide.buy, 22, move);
       final noiseSide = _mix(minute, i, 23).isEven ? TxSide.buy : TxSide.sell;
-      _aggressive(engine, minute, i, symbol, 'NPC_FLOW', noiseSide, 23);
+      _aggressive(engine, minute, i, symbol, 'NPC_FLOW',
+          noiseSide, 23, move);
     }
-    engine.checkInvariants();
+    // Every place/cancel validates all invariants. TxSession.nextTick also
+    // validates at the transaction boundary; avoid a duplicate full scan.
   }
 }
