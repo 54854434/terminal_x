@@ -4,6 +4,7 @@ import 'dart:isolate';
 
 import '../engine/tx_engine.dart';
 import '../engine/tx_session.dart';
+import '../market/tx_market_event_tape.dart';
 import 'tx_sqlite_store.dart';
 
 // Pure Dart market evaluation is moved away from the Flutter UI isolate.
@@ -15,6 +16,29 @@ TxSession _advanceMinute(TxSession session) {
   // Avoid serializing the entire growing order/ledger history on the UI thread.
   session.nextTick();
   return session;
+}
+
+/// Isolate proposals keep the original session immutable until SQLite commit.
+class _TradeProposal {
+  const _TradeProposal(this.session, this.orderId);
+  final TxSession session;
+  final String orderId;
+}
+
+_TradeProposal _placeOnWorker(
+    TxSession original, String symbol, TxSide side, TxKind kind,
+    int quantity, int? limitPriceCents) {
+  final proposed = TxSession.importJson(original.exportJson());
+  final order = proposed.placePlayer(
+    symbol: symbol, side: side, kind: kind, quantity: quantity,
+    limitPriceCents: limitPriceCents);
+  return _TradeProposal(proposed, order.id);
+}
+
+_TradeProposal _cancelOnWorker(TxSession original, String orderId) {
+  final proposed = TxSession.importJson(original.exportJson());
+  final order = proposed.cancelPlayer(orderId);
+  return _TradeProposal(proposed, order.id);
 }
 
 class TxTradingService {
@@ -55,6 +79,8 @@ class TxTradingService {
     }
   }
 
+  /// User actions use the same isolated clone-then-commit principle as ticks.
+  /// Their expanding JSON history no longer serializes on the Flutter thread.
   Future<TxOrder> place({
     required String symbol,
     required TxSide side,
@@ -63,21 +89,38 @@ class TxTradingService {
     int? limitPriceCents,
   }) async {
     _ensureReady();
-    final proposed = TxSession.importJson(current.session.exportJson());
-    final order = proposed.placePlayer(
-      symbol: symbol, side: side, kind: kind, quantity: quantity,
-      limitPriceCents: limitPriceCents,
-    );
-    await _commit(proposed);
-    return order;
+    _busy = true;
+    try {
+      final source = current.session;
+      final proposal = await Isolate.run(() => _placeOnWorker(
+        source, symbol, side, kind, quantity, limitPriceCents));
+      await _commit(proposal.session);
+      return current.session.engine.order(proposal.orderId);
+    } finally {
+      _busy = false;
+    }
   }
 
   Future<TxOrder> cancel(String orderId) async {
     _ensureReady();
-    final proposed = TxSession.importJson(current.session.exportJson());
-    final order = proposed.cancelPlayer(orderId);
-    await _commit(proposed);
-    return order;
+    _busy = true;
+    try {
+      final source = current.session;
+      final proposal = await Isolate.run(
+        () => _cancelOnWorker(source, orderId));
+      await _commit(proposal.session);
+      return current.session.engine.order(proposal.orderId);
+    } finally {
+      _busy = false;
+    }
+  }
+
+  /// Capture only genuine matched trades from consecutive committed revisions.
+  /// Callers may use this for replay/diagnostics; an ordinal is not a timestamp.
+  Future<TxMinuteEventTape> nextTickWithTape() async {
+    final before = current;
+    final after = await nextTick();
+    return TxMinuteEventTape.fromCommits(before, after);
   }
 
   Future<TxStoredSession> nextTick() async {
