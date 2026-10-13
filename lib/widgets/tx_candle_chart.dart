@@ -135,7 +135,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
             nextMinuteStep: _previewStep(widget.candles),
             periodMinutes: _period.minutes,
             framePriceCents: preview,
-            previewHighCents: _indicativeWick.highCents!,
+            previewHighCents: _indicativeWick.highCents ?? preview,
             previewLowCents: _indicativeWick.lowCents!);
     return Column(children: [
       Row(children: [
