@@ -159,6 +159,20 @@ class TxContinuousFlowClock {
     _awaitingCommit = false;
   }
 
+  /// Rebase the visual clock only after the storage layer has reread and
+  /// audited the durable SQLite head. Ambiguous provisional seconds are
+  /// intentionally discarded; replaying them would risk duplicating a
+  /// minute or a Rust market pulse.
+  void recoverAfterStorageAudit() {
+    if (!_faulted) {
+      throw StateError('No storage fault requires recovery');
+    }
+    _running = false;
+    _awaitingCommit = false;
+    _fractionalGameMicros = 0;
+    _faulted = false;
+  }
+
   TxFlowFrame _frame(bool newCommit, {bool pulse = false}) => TxFlowFrame(
     second: second,
     fractionOfMinute: minuteProgress,
