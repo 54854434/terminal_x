@@ -84,7 +84,9 @@ jobs:
                   type(code) is not int or code < 32 or
                   artifact != 'terminal-x-v'+version.replace('.','')+'-signed-arm64-apk' or
                   not isinstance(tests,list) or len(set(tests)) != len(tests) or
-                  not 1 <= len(tests) <= 40 or
+                  # Keep the batch contract above the current 41-file suite;
+                  # the exact source-test set is still checked below.
+                  not 1 <= len(tests) <= 100 or
                   any(t not in paths and not Path(t).is_file() for t in tests)):
                   raise SystemExit('Unsafe or incompatible Rust ARM64 build configuration.')
               old = Path('pubspec.yaml').read_text()
