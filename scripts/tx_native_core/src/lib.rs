@@ -3,7 +3,8 @@
 //! The Android release workflow compiles and packages this crate for ARM64.
 //! Dart remains the persisted UI projection; Rust owns executable Android-
 //! worker matching and must pass the parity/audit gate before commit.
-//! R36 adds a deterministic command journal + replay test seam.
+//! R36 adds a deterministic command journal + replay test seam. R48 adds
+//! post-only, IOC and FOK limit execution policies without changing ABI v2.
 //!
 //! Integer cents and quantities only. No hidden liquidity, guessed fills,
 //! floating-point financial math, wall-clock scheduling or global mutable data.
@@ -21,6 +22,19 @@ const PARTIAL: i32 = 1;
 const FILLED: i32 = 2;
 const CANCELLED: i32 = 3;
 const REJECTED: i32 = 4;
+const LIMIT_GTC: u32 = 0;
+const MARKET: u32 = 1;
+const POST_ONLY: u32 = 2;
+const IOC: u32 = 3;
+const FOK: u32 = 4;
+
+fn is_limit(kind: u32) -> bool {
+    kind == LIMIT_GTC || kind == POST_ONLY || kind == IOC || kind == FOK
+}
+
+fn can_rest(kind: u32) -> bool {
+    kind == LIMIT_GTC || kind == POST_ONLY
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Account {
@@ -147,7 +161,7 @@ impl Engine {
 
     fn insert_resting(&mut self, idx: usize) {
         let o = &self.orders[idx];
-        if o.kind == 0 && o.remaining > 0 &&
+        if can_rest(o.kind) && o.remaining > 0 &&
            (o.status == OPEN || o.status == PARTIAL) {
             self.resting.entry((o.symbol, o.side)).or_default()
                 .insert(RestingKey::new(o, idx));
@@ -156,11 +170,11 @@ impl Engine {
 
     fn place(&mut self, id: u64, owner: u64, symbol: u32, side: u32,
              kind: u32, quantity: i64, price: i64) -> i32 {
-        if id == 0 || owner == 0 || side > 1 || kind > 1 ||
+        if id == 0 || owner == 0 || side > 1 || kind > FOK ||
            quantity <= 0 || quantity > MAX_QTY ||
-           (kind == 0 && (price <= 0 || price > MAX_PRICE ||
+           (is_limit(kind) && (price <= 0 || price > MAX_PRICE ||
               i128::from(price) * i128::from(quantity) > MAX_NOTIONAL)) ||
-           (kind == 1 && price != 0) { return INVALID; }
+           (kind == MARKET && price != 0) { return INVALID; }
         if let Some(&i) = self.order_index.get(&id) {
             let o = &self.orders[i];
             return if o.owner == owner && o.symbol == symbol &&
@@ -179,7 +193,7 @@ impl Engine {
         if let Some(book) = self.resting.get(&(symbol, 1 - side)) {
             for key in book {
                 let maker = &self.orders[key.index];
-                if kind == 0 && ((side == 0 && maker.price > price) ||
+                if is_limit(kind) && ((side == 0 && maker.price > price) ||
                                  (side == 1 && maker.price < price)) { break; }
                 matches.push(key.index);
             }
@@ -187,22 +201,26 @@ impl Engine {
         let mut needed = quantity;
         let mut market_cost: i128 = 0;
         let mut fill_plan: Vec<(usize, i64)> = Vec::new();
+        if kind == POST_ONLY && !matches.is_empty() {
+            incoming.status = REJECTED;
+        }
         for i in matches {
             if needed == 0 { break; }
             let maker = &self.orders[i];
             let take = needed.min(maker.remaining);
             if maker.owner == owner { incoming.status = REJECTED; break; }
-            if kind == 1 && side == 0 {
+            if kind == MARKET && side == 0 {
                 market_cost += i128::from(take) * i128::from(maker.price);
                 if market_cost > MAX_NOTIONAL { incoming.status = REJECTED; break; }
             }
             fill_plan.push((i, take));
             needed -= take;
         }
+        if kind == FOK && needed > 0 { incoming.status = REJECTED; }
         let actor = &self.accounts[&owner];
         if incoming.status != REJECTED {
             let cash_required = if side == 0 {
-                if kind == 0 { i128::from(quantity) * i128::from(price) }
+                if is_limit(kind) { i128::from(quantity) * i128::from(price) }
                 else { market_cost }
             } else { 0 };
             if cash_required > i128::from(actor.free_cash()) ||
@@ -242,7 +260,7 @@ impl Engine {
             self.journal.push(event);
             return REJECTED;
         }
-        if kind == 0 {
+        if is_limit(kind) {
             let actor = self.accounts.get_mut(&owner).expect("preflighted actor");
             if side == 0 { actor.reserved_cash += quantity * price; }
             else { *actor.reserved_shares.entry(symbol).or_default() += quantity; }
@@ -264,7 +282,7 @@ impl Engine {
                 let buyer = self.accounts.get_mut(&buy_owner).expect("known buyer");
                 buyer.cash -= notional;
                 *buyer.shares.entry(symbol).or_default() += take;
-                if buy_owner == owner && kind == 0 {
+                if buy_owner == owner && is_limit(kind) {
                     buyer.reserved_cash -= take * price;
                 } else if buy_owner == maker_owner && maker_side == 0 {
                     buyer.reserved_cash -= take * execution_price;
@@ -274,7 +292,7 @@ impl Engine {
                 let seller = self.accounts.get_mut(&sell_owner).expect("known seller");
                 seller.cash += notional;
                 *seller.shares.entry(symbol).or_default() -= take;
-                if sell_owner == owner && kind == 0 {
+                if sell_owner == owner && is_limit(kind) {
                     *seller.reserved_shares.entry(symbol).or_default() -= take;
                 } else if sell_owner == maker_owner && maker_side == 1 {
                     *seller.reserved_shares.entry(symbol).or_default() -= take;
@@ -291,8 +309,17 @@ impl Engine {
                 }
             }
         }
+        if incoming.remaining > 0 && kind == IOC {
+            let actor = self.accounts.get_mut(&owner).expect("known owner");
+            if side == 0 {
+                actor.reserved_cash -= incoming.remaining * price;
+            } else {
+                *actor.reserved_shares.entry(symbol).or_default() -=
+                    incoming.remaining;
+            }
+        }
         incoming.status = if incoming.remaining == 0 { FILLED }
-            else if kind == 1 { CANCELLED }
+            else if kind == MARKET || kind == IOC { CANCELLED }
             else if incoming.remaining == quantity { OPEN }
             else { PARTIAL };
         let idx = self.orders.len();
@@ -363,7 +390,7 @@ impl Engine {
                 !self.accounts.contains_key(&order.owner) { return false; }
             match order.status {
                 OPEN | PARTIAL => {
-                    if order.kind != 0 || order.remaining == 0 ||
+                    if !can_rest(order.kind) || order.remaining == 0 ||
                        (order.status == OPEN && order.remaining != order.quantity) ||
                        (order.status == PARTIAL && order.remaining == order.quantity) {
                         return false;
@@ -391,7 +418,7 @@ impl Engine {
             for key in book {
                 let Some(order) = self.orders.get(key.index) else { return false; };
                 if order.symbol != *symbol || order.side != *side ||
-                    order.kind != 0 || order.remaining <= 0 ||
+                    !can_rest(order.kind) || order.remaining <= 0 ||
                     (order.status != OPEN && order.status != PARTIAL) ||
                     RestingKey::new(order, key.index) != *key { return false; }
                 indexed += 1;
@@ -645,6 +672,47 @@ mod tests {
         let mut e = funded();
         assert_eq!(e.place(1, 1, 0, 0, 1, 10, 0), CANCELLED);
         assert_eq!(e.fills.len(), 0);
+        assert!(e.verify());
+    }
+
+    #[test]
+    fn post_only_rejects_a_cross_without_reserving_or_filling() {
+        let mut e = funded();
+        assert_eq!(e.place(80, 2, 0, 1, LIMIT_GTC, 5, 100), OPEN);
+        assert_eq!(e.place(81, 1, 0, 0, POST_ONLY, 2, 101), REJECTED);
+        assert_eq!(e.fills.len(), 0);
+        assert_eq!(e.accounts[&1].reserved_cash, 0);
+        assert_eq!(e.orders[e.order_index[&80]].remaining, 5);
+        assert_eq!(e.resting.get(&(0, 1)).unwrap().len(), 1);
+        assert!(e.verify());
+    }
+
+    #[test]
+    fn ioc_releases_unfilled_limit_reservation_after_partial_fill() {
+        let mut e = funded();
+        assert_eq!(e.place(82, 2, 0, 1, LIMIT_GTC, 3, 100), OPEN);
+        assert_eq!(e.place(83, 1, 0, 0, IOC, 5, 110), CANCELLED);
+        assert_eq!(e.orders[e.order_index[&83]].remaining, 2);
+        assert_eq!(e.accounts[&1].cash, 9_700);
+        assert_eq!(e.accounts[&1].reserved_cash, 0);
+        assert_eq!(e.accounts[&1].shares[&0], 3);
+        assert_eq!(e.fills.len(), 1);
+        assert_eq!(e.fills[0].quantity, 3);
+        assert!(e.verify());
+    }
+
+    #[test]
+    fn fok_is_atomic_until_all_visible_depth_is_available() {
+        let mut e = funded();
+        assert_eq!(e.place(84, 2, 0, 1, LIMIT_GTC, 2, 100), OPEN);
+        assert_eq!(e.place(85, 1, 0, 0, FOK, 3, 100), REJECTED);
+        assert_eq!(e.fills.len(), 0);
+        assert_eq!(e.accounts[&1].reserved_cash, 0);
+        assert_eq!(e.place(86, 2, 0, 1, LIMIT_GTC, 3, 101), OPEN);
+        assert_eq!(e.place(87, 1, 0, 0, FOK, 5, 110), FILLED);
+        assert_eq!(e.fills.iter().map(|f| f.quantity).collect::<Vec<_>>(),
+                   vec![2, 3]);
+        assert_eq!(e.accounts[&1].reserved_cash, 0);
         assert!(e.verify());
     }
     #[test]
