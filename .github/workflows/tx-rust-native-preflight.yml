@@ -1,0 +1,83 @@
+name: Terminal X - Rust ARM64 Native Preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tx-rust-native-preflight.yml'
+      - 'scripts/tx_native_core/**'
+      - 'lib/engine/tx_native_core_ffi.dart'
+
+permissions:
+  contents: read
+
+jobs:
+  test-rust-and-android-arm64:
+    name: Test Rust ABI and compile Android ARM64
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout Rust prototype
+        uses: actions/checkout@v4
+
+      - name: Prepare pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup override set 1.88.0
+          rustup target add aarch64-linux-android
+          rustc --version
+          cargo --version
+
+      - name: Validate ABI and Rust unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/tx_native_core/check_abi.py
+          clang -std=c11 -Wall -Wextra -Werror -fsyntax-only scripts/tx_native_core/ffi_abi_smoke.c
+          cargo test --locked --all-targets --manifest-path scripts/tx_native_core/Cargo.toml
+          cargo check --locked --target aarch64-linux-android --manifest-path scripts/tx_native_core/Cargo.toml
+
+      - name: Prepare Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$SDK"
+          MANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$MANAGER" ]]; then
+            MANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager | sort | head -1)"
+          fi
+          test -x "$MANAGER"
+          "$MANAGER" --install 'ndk;26.3.11579264'
+          test -d "$SDK/ndk/26.3.11579264"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Compile genuine Rust AArch64 ELF shared object
+        shell: bash
+        run: |
+          set -euo pipefail
+          TX_RUST_NATIVE_ENABLED=1 bash scripts/tx_native_core/build_android_arm64.sh
+          LIB='android/app/src/main/jniLibs/arm64-v8a/libterminal_x_core.so'
+          test -s "$LIB"
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          p = Path('android/app/src/main/jniLibs/arm64-v8a/libterminal_x_core.so')
+          native = p.read_bytes()
+          if (len(native) < 64 or native[:4] != b'\x7fELF'
+              or native[4] != 2 or native[5] != 1
+              or struct.unpack_from('<H', native, 18)[0] != 183):
+              raise SystemExit('Rust output is not ELF64 AArch64')
+          print('Verified Rust Android ARM64 .so:', len(native), 'bytes')
+          PY
+
+      - name: Upload native prototype as build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-x-rust-arm64-preflight
+          path: android/app/src/main/jniLibs/arm64-v8a/libterminal_x_core.so
+          if-no-files-found: error
+          retention-days: 7
