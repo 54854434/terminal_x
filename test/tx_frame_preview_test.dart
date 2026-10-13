@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../lib/engine/tx_session.dart';
+import '../lib/engine/tx_engine.dart';
 import '../lib/market/tx_candle_history.dart';
 import '../lib/market/tx_frame_preview.dart';
 import '../lib/market/tx_quote_preview.dart';
@@ -133,6 +135,125 @@ void main() {
         lastAggregated: committed, nextMinuteStep: 1, periodMinutes: 5,
         framePriceCents: 1010.0, previewHighCents: 1010.0,
         previewLowCents: 1000.0), throwsStateError);
+  });
+
+  test('R32 cyan wick extrema survive successive 1m SQLite saves in 5m bar', () {
+    final wick = TxIndicativeWickMemory();
+    wick.observe(nextMinuteStep: 21, periodMinutes: 5,
+        committedCloseCents: 1000, framePriceCents: 1040);
+    expect(wick.groupStep, 20);
+    expect(wick.highCents, 1040);
+    wick.observe(nextMinuteStep: 21, periodMinutes: 5,
+        committedCloseCents: 1000, framePriceCents: 985);
+    expect(wick.lowCents, 985);
+    // At the next one-minute commit the parent 5m bucket remains unchanged.
+    wick.observe(nextMinuteStep: 22, periodMinutes: 5,
+        committedCloseCents: 1010, framePriceCents: 1003);
+    expect(wick.groupStep, 20);
+    expect(wick.highCents, 1040);
+    expect(wick.lowCents, 985);
+    // Even a frame with no preview cannot shrink the current cyan envelope.
+    wick.observe(nextMinuteStep: 23, periodMinutes: 5,
+        committedCloseCents: 1001);
+    expect(wick.highCents, 1040);
+    expect(wick.lowCents, 985);
+    // But once a 5m bar closes, speculative prices NEVER enter committed OHLC.
+    wick.observe(nextMinuteStep: 25, periodMinutes: 5,
+        committedCloseCents: 1008, framePriceCents: 1009);
+    expect(wick.groupStep, 25);
+    expect(wick.highCents, 1009);
+    expect(wick.lowCents, 1008);
+  });
+
+  test('R32 all timeframe buckets reset only at their own boundary', () {
+    for (final period in [1, 5, 15, 60, 240, 1440]) {
+      final wick = TxIndicativeWickMemory();
+      wick.observe(nextMinuteStep: period, periodMinutes: period,
+          committedCloseCents: 1000, framePriceCents: 1050);
+      for (var step = period + 1; step < period * 2; step++) {
+        wick.observe(nextMinuteStep: step, periodMinutes: period,
+            committedCloseCents: 999, framePriceCents: 1002);
+      }
+      expect(wick.highCents, 1050);
+      wick.observe(nextMinuteStep: period * 2, periodMinutes: period,
+          committedCloseCents: 990, framePriceCents: 992);
+      expect(wick.highCents, 992);
+      expect(wick.lowCents, 990);
+      wick.reset();
+      expect(wick.highCents, isNull);
+    }
+  });
+
+  test('R32 indicative extrema reject malformed floats without changing state', () {
+    final wick = TxIndicativeWickMemory();
+    wick.observe(nextMinuteStep: 3, periodMinutes: 5,
+        committedCloseCents: 1000, framePriceCents: 1004);
+    expect(() => wick.observe(nextMinuteStep: 4, periodMinutes: 5,
+        committedCloseCents: 1002, framePriceCents: double.nan),
+        throwsArgumentError);
+    expect(wick.groupStep, 0);
+    expect(wick.highCents, 1004);
+  });
+
+  test('R33 minute line extends right continuously and retains prior samples', () {
+    final trace = TxTimelinePreviewTrace();
+    trace.observe(nextMinuteStep: 21, seconds: 0,
+        committedCloseCents: 2500, framePriceCents: 2500);
+    trace.observe(nextMinuteStep: 21, seconds: 5.5,
+        committedCloseCents: 2500, framePriceCents: 2504);
+    trace.observe(nextMinuteStep: 21, seconds: 12.5,
+        committedCloseCents: 2500, framePriceCents: 2493);
+    expect(trace.minute, 21);
+    expect(trace.points.map((p) => p.seconds).toList(), [0, 5.5, 12.5]);
+    expect(trace.points.map((p) => p.priceCents).toList(),
+        [2500, 2504, 2493]);
+    // Pause with same fractional seconds does not introduce an extra kink.
+    trace.observe(nextMinuteStep: 21, seconds: 12.5,
+        committedCloseCents: 2500, framePriceCents: 2493);
+    expect(trace.points.length, 3);
+    trace.observe(nextMinuteStep: 22, seconds: 0,
+        committedCloseCents: 2501, framePriceCents: 2501);
+    expect(trace.points.length, 1);
+    expect(trace.points.single.priceCents, 2501);
+    expect(() => trace.observe(nextMinuteStep: 22,
+        seconds: double.nan, committedCloseCents: 2501,
+        framePriceCents: 2501), throwsArgumentError);
+  });
+
+  test('R33 frame-line sample count remains bounded at any refresh rate', () {
+    final trace = TxTimelinePreviewTrace();
+    for (var i = 0; i < 480; i++) {
+      trace.observe(nextMinuteStep: 3, seconds: i / 10,
+          committedCloseCents: 1000, framePriceCents: 1000 + (i % 17));
+    }
+    expect(trace.points.length, lessThanOrEqualTo(192));
+    expect(trace.points.first.seconds, 0);
+    expect(trace.points.last.seconds, 47.9);
+    // Clock rollback resets uncommitted trace, never damages saved OHLC.
+    trace.observe(nextMinuteStep: 3, seconds: 2,
+        committedCloseCents: 1002, framePriceCents: 1004);
+    expect(trace.points.length, 2);
+    expect(trace.points.first.priceCents, 1002);
+  });
+
+  test('R33 funded NPC book revises genuine resting LP quotes each minute', () {
+    final session = TxSession.freshWithAgents();
+    List<String> book() => [
+      for (final symbol in TxSession.symbols)
+        for (final side in [TxSide.buy, TxSide.sell])
+          for (final level in session.engine.depth(symbol,side))
+            '${symbol}:${side.name}:${level.priceCents}:${level.quantity}',
+    ];
+    final first = book();
+    session.nextTick();
+    final second = book();
+    session.nextTick();
+    final third = book();
+    expect(second, isNot(first));
+    expect(second, isNot(third));
+    session.engine.checkInvariants();
+    final player = session.engine.account(TxSession.playerId);
+    expect(player.cashCents, 100000000);
   });
 
   testWidgets('frame preview survives every timeframe and historical browsing',

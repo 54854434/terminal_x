@@ -27,6 +27,8 @@ import 'market/tx_runtime_health.dart';
 import 'market/tx_market_phase_timeline.dart';
 import 'market/tx_frame_render_gate.dart';
 import 'market/tx_storage_footprint.dart';
+import 'market/tx_market_tape_window.dart';
+import 'market/tx_live_portfolio_valuation.dart';
 import 'storage/tx_sqlite_store.dart';
 import 'storage/tx_delta_codec.dart';
 import 'storage/tx_trading_service.dart';
@@ -64,7 +66,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const green = TxTerminalColors.buy;
   static const red = TxTerminalColors.sell;
-  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.0');
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.1');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
@@ -87,7 +89,6 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   int _page = 0;
   int _symbol = 0;
   int _speed = 1;
-  int _autoCount = 0;
   final ValueNotifier<double> _seconds = ValueNotifier<double>(0.0);
   bool _auto = false;
   bool _busy = false;
@@ -95,6 +96,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   bool _limit = false;
   TxSide _ticketSide = TxSide.buy;
   int _recordMode = 0;
+  int _marketTapeRequested = TxMarketTapeWindow.pageSize;
   String _notice = '正在检查 SQLite';
   String? _fault;
 
@@ -112,7 +114,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _playbackTicker = createTicker(_onPlaybackFrame);
-    _open();
+    // Paint the first loading frame before opening a long historical store.
+    // DB verification is required, but must not block the Flutter first frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _open();
+    });
   }
 
   @override
@@ -134,10 +140,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   // Vsync advances ONLY provisional time. The chart's cyan preview never
   // adds a fill, cash transaction or committed OHLCV observation.
   void _onPlaybackFrame(Duration elapsed) {
-    if (!mounted || !_auto || _fault != null || _busy) return;
+    if (!mounted || !_auto || _fault != null) return;
     final previous = _previousFrame;
+    // Keep the Ticker alive during SQLite I/O, but drop elapsed wall time
+    // while the one-and-only minute commit is unresolved. Never catch up
+    // by skipping economic minutes or advancing uncommitted ledger time.
     _previousFrame = elapsed;
-    if (previous == null) return;
+    if (_busy || _flow.awaitingCommit || previous == null) return;
     final delta = elapsed - previous;
     if (delta.isNegative) return;
     final frame = _flow.advance(delta);
@@ -150,11 +159,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _seconds.value = frameSeconds;
     }
     if (frame.needsMinuteCommit) {
-      // Stop vsync while the single in-flight worker + SQLite revision settles.
-      // No timer-based catch-up; the measured speed is reduced by backpressure.
-      _playbackTicker.stop();
-      _previousFrame = null;
-      _frameRenderGate.reset();
+      // Do not stop/restart the vsync ticker every single SQLite minute.
+      // The next frames are ignored until this durable commit completes.
+      // Backpressure lowers achieved speed without inventing transactions.
       _tick(automatic: true);
     }
   }
@@ -173,7 +180,6 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         minute: _trader!.current.session.step);
     setState(() {
       _auto = true;
-      _autoCount = 0;
     });
     _previousFrame = null;
     _frameRenderGate.reset();
@@ -227,10 +233,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     if (!_ready) return;
     // User-initiated operations suspend visual playback before any write.
     if (!automated && _auto) _pause();
-    _playbackTicker.stop();
-    _previousFrame = null;
-    _frameRenderGate.reset();
-    setState(() => _busy = true);
+    if (!automated) {
+      _playbackTicker.stop();
+      _previousFrame = null;
+      _frameRenderGate.reset();
+      setState(() => _busy = true);
+    } else {
+      // Automatic minute commits stay single-flight, but do not flash a
+      // global loading indicator or rebuild the entire UI before each save.
+      _busy = true;
+    }
     _operation = _perform(work, automated: automated);
   }
 
@@ -244,6 +256,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       // This operation uses only the previous and current verified states;
       // no readHistory(160) for each game minute.
       if (before.revision != after.revision) {
+        for (final symbol in TxSession.symbols) {
+          _previousBookQty[symbol] =
+              _currentDepthQuantities(before.session, symbol);
+        }
         _candles!.addCommit(before, after);
       }
       if (automated) {
@@ -256,15 +272,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             minute: after.session.step,
           );
         }
-        _autoCount++;
-        if (_autoCount >= 60) {
-          _pause();
-          if (mounted) setState(() =>
-              _notice = '$notice · 已运行 60 分钟，自动暂停以保护存储');
-          return;
-        }
+        // No arbitrary 60-minute playback cut-off. The database checkpoint
+        // interval independently bounds recovery work; every minute still
+        // finishes a verified atomic commit before the next minute begins.
       }
-      if (mounted) setState(() => _notice = notice);
+      // finally performs the single build for this committed minute.
+      // Avoid a second full-page build while displaying the new revision.
+      if (mounted) _notice = notice;
     } catch (e) {
       // Whether the DB commit was ambiguous or a chart invariant failed,
       // stop instead of risking another order against stale state.
@@ -276,6 +290,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       if (mounted) {
         setState(() => _busy = false);
         if (_auto && _fault == null && !_playbackTicker.isActive) {
+          // Can occur after an explicit manual operation. Automatic commits
+          // never stop the ticker, so this branch is normally unused.
           _previousFrame = null;
           _frameRenderGate.reset();
           _playbackTicker.start();
@@ -404,6 +420,57 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ),
   );
 
+  // A speed change is applied only between completed durable minute writes.
+  void _changeSpeed(int next) {
+    if (!_ready || _flow.awaitingCommit || _flow.faulted) return;
+    next = next.clamp(1, TxContinuousFlowClock.maxSupportedSpeed).toInt();
+    if (_speed == next) return;
+    _flow.setSpeed(next);
+    _committedSpeed.reset();
+    _speedStopwatch..reset();
+    if (_auto) {
+      _speedStopwatch.start();
+      _committedSpeed.record(elapsedMilliseconds: 0,
+          minute: _trader!.current.session.step);
+    }
+    setState(() => _speed = next);
+  }
+
+  Future<void> _showCustomSpeed() async {
+    if (!_ready) return;
+    final controller = TextEditingController(text: '$_speed');
+    final choice = await showDialog<int>(context: context, builder: (context) =>
+      AlertDialog(title: const Text('自定义游戏倍率'), content: TextField(
+        controller: controller, autofocus: true,
+        keyboardType: TextInputType.number,
+        decoration: const InputDecoration(
+            labelText: '1～360000 倍', suffixText: '×')),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(
+              int.tryParse(controller.text.trim())),
+              child: const Text('应用')),
+        ]));
+    controller.dispose();
+    if (!mounted || choice == null || choice < 1 ||
+        choice > TxContinuousFlowClock.maxSupportedSpeed) return;
+    _changeSpeed(choice);
+  }
+
+  // Previous committed book for real post-commit deltas, not simulated orders.
+  final Map<String, Map<String, int>> _previousBookQty = {};
+
+  Map<String, int> _currentDepthQuantities(TxSession session, String symbol) {
+    final values = <String,int>{};
+    for (final side in [TxSide.sell, TxSide.buy]) {
+      for (final level in session.engine.depth(symbol, side)) {
+        values['${side.name}:${level.priceCents}'] = level.quantity;
+      }
+    }
+    return values;
+  }
+
   Widget _depth(TxSession session) {
     final asks = session.engine.depth(_symbolName, TxSide.sell);
     final bids = session.engine.depth(_symbolName, TxSide.buy);
@@ -411,7 +478,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final quantities = [...asks.map((e) => e.quantity),
       ...bids.map((e) => e.quantity), 1];
     final maxQty = quantities.reduce((a,b) => a > b ? a : b);
-    Widget level(String label, int cents, int quantity, Color tint) => InkWell(
+    final prior = _previousBookQty[_symbolName];
+    Widget level(String label, int cents, int quantity, Color tint,
+        TxSide side) {
+      final old = prior?['${side.name}:$cents'];
+      final change = old == null ? null : quantity - old;
+      return InkWell(
       onTap: () => setState(() {
         _limit = true;
         _price.text = money(cents);
@@ -426,12 +498,24 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                 style: TextStyle(fontSize: 12, color: tint))),
             Expanded(child: Text('¥${money(cents)}')),
             Text('$quantity 股'),
+            if (prior != null && old == null) Padding(
+              padding: const EdgeInsets.only(left: 7),
+              child: Text('新挂', style: TextStyle(fontSize: 10, color: tint))),
+            if (change != null && change != 0) Padding(
+              padding: const EdgeInsets.only(left: 7),
+              child: Text('${change > 0 ? '+' : ''}$change',
+                style: TextStyle(fontSize: 10,
+                  color: change > 0 ? green : red))),
           ]),
         ])),
     );
+    }
     return Card(child: Padding(padding: const EdgeInsets.all(12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('真实五档盘口', style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text('真实五档盘口 · 已提交委托',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text('做市商逐分钟真实挂撤单 · 新挂 / + / − 标出提交后变化',
+            style: TextStyle(fontSize: 10, color: Colors.white54)),
         const SizedBox(height: 6),
         Text(insight.spreadCents == null
           ? '买卖价差：—（盘口一侧缺少挂单）'
@@ -453,10 +537,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             style: const TextStyle(fontSize: 11, color: Colors.white54)),
         ],
         for (var i = asks.length - 1; i >= 0; i--)
-          level('卖${i+1}', asks[i].priceCents, asks[i].quantity, red),
+          level('卖${i+1}', asks[i].priceCents, asks[i].quantity, red, TxSide.sell),
         const Divider(),
         for (var i = 0; i < bids.length; i++)
-          level('买${i+1}', bids[i].priceCents, bids[i].quantity, green),
+          level('买${i+1}', bids[i].priceCents, bids[i].quantity, green, TxSide.buy),
         const Text('点价格可填入限价单',
             style: TextStyle(color: Colors.white54, fontSize: 11)),
       ])),
@@ -508,8 +592,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           valueListenable: _seconds,
           builder: (context, seconds, child) => TxCandleChart(
             candles: candles,
-            indicativeFramePriceCents: seconds == 0 ? null :
-                _indication(session, seconds)))))),
+            // At exactly 0 seconds of an automatically running minute,
+            // retain the cyan display-only price marker. Otherwise it
+            // vanishes for one frame after *every* durable SQLite commit.
+            indicativeFramePriceCents: (_auto || seconds > 0)
+                ? _indication(session, seconds) : null,
+            previewSeconds: (_auto || seconds > 0) ? seconds : null))))),
       Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(
         crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('模拟市场参与者', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -540,28 +628,33 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             OutlinedButton(onPressed: _ready ? () => _tick() : null,
                 child: const Text('+1 分钟')),
             const SizedBox(width: 8),
-            DropdownButton<int>(value: _speed,
-              items: TxContinuousFlowClock.uiSpeeds.map((value) =>
-                  DropdownMenuItem(value: value, child: Text('$value×'))).toList(),
-              onChanged: !_ready ? null : (v) {
-                if (v == null) return;
-                _flow.setSpeed(v);
-                _committedSpeed.reset();
-                _speedStopwatch..reset();
-                if (_auto) {
-                  _speedStopwatch.start();
-                  _committedSpeed.record(elapsedMilliseconds: 0,
-                    minute: _trader!.current.session.step);
-                }
-                setState(() => _speed = v);
-              }),
+            OutlinedButton.icon(
+              onPressed: _ready ? _showCustomSpeed : null,
+              icon: const Icon(Icons.tune, size: 17),
+              label: Text('$_speed×')),
           ]),
-          const Text('逐帧形成空心指示 K，不是逐秒真实成交。'
+          const SizedBox(height: 8),
+          SingleChildScrollView(scrollDirection: Axis.horizontal,
+            child: Row(children: [
+              for (final value in [1, 5, 10, 30, 60, 100, 300, 600, 1200, 3600])
+                Padding(padding: const EdgeInsets.only(right: 5),
+                  child: ChoiceChip(label: Text('$value×'),
+                    selected: _speed == value,
+                    onSelected: _ready ? (_) => _changeSpeed(value) : null)),
+            ])),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            for (final change in [-10, -1, 1, 10])
+              Padding(padding: const EdgeInsets.symmetric(horizontal: 5),
+                child: OutlinedButton(
+                  onPressed: _ready ? () => _changeSpeed(_speed + change) : null,
+                  child: Text('${change > 0 ? '+' : ''}$change'))),
+          ]),
+          const Text('分时逐帧连线为未成交指示价格，不是逐秒真实成交。'
               '目标倍速不等于实际达成倍速；SQLite 慢时自动背压，不补跳。',
               style: TextStyle(color: Colors.white60, fontSize: 11)),
           const SizedBox(height: 4),
           Text('目标 ${_speed}× · 实际已提交 ${_committedSpeed.achievedMultiplier.toStringAsFixed(1)}×'
-              ' · 单次安全上限 60 游戏分钟',
+              ' · 每分钟安全提交',
               style: const TextStyle(color: Colors.white60, fontSize: 11)),
           if (_commitLatency.count > 0) ...[
             Text('最近 ${_commitLatency.count} 次有效分钟提交耗时 p95 '
@@ -589,7 +682,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         ]),
       )),
       const SizedBox(height: 8),
-      const Text('所有周期的青色空心蜡烛／虚线仅为逐帧指示性预览；实心 K、均线及成交量均取自已提交记录。'
+      const Text('分时右端青色连续线及各周期青色空心蜡烛为未结算指示报价；真实 OHLC、均线与成交量均取自已提交记录。'
           '成交量仅统计真实撮合，不把秒级报价变动伪造成交易。',
           style: TextStyle(color: Colors.white54, fontSize: 11)),
     ]);
@@ -993,15 +1086,22 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     Widget pnlValue(String label, int amount) =>
       _metric(label, signedMoney(amount));
     return ListView(padding: const EdgeInsets.all(14), children: [
-      _title('资金与资产', sub: '使用已提交行情计价，浮动盈亏不等于已实现利润'),
-      Card(child: Padding(padding: const EdgeInsets.all(12), child: Wrap(children: [
-        _metric('总资产估值', '¥${money(session.totalAssetsCents)}'),
-        _metric('现金余额', '¥${money(account.cashCents)}'),
-        _metric('可用现金', '¥${money(account.availableCashCents)}'),
-        _metric('冻结资金', '¥${money(account.reservedCashCents)}'),
-        if (reliable) pnlValue('合计浮动盈亏', unrealized),
-        if (reliable) pnlValue('累计已实现盈亏', realized),
-      ]))),
+      _title('资金与资产', sub: '估值随分时指示价连续变动；现金与已实现收益只按真实成交结算'),
+      ValueListenableBuilder<double>(valueListenable: _seconds,
+        builder: (context, seconds, _) {
+          final mark = TxLivePortfolioValuation.evaluate(
+              session, holdings, seconds);
+          return Card(child: Padding(padding: const EdgeInsets.all(12),
+            child: Wrap(children: [
+              _metric('实时预估总资产', '¥${money(mark.totalAssetsCents)}'),
+              _metric('现金余额', '¥${money(account.cashCents)}'),
+              _metric('可用现金', '¥${money(account.availableCashCents)}'),
+              _metric('冻结资金', '¥${money(account.reservedCashCents)}'),
+              if (mark.unrealizedPnlCents != null)
+                pnlValue('实时预估浮动盈亏', mark.unrealizedPnlCents!),
+              if (reliable) pnlValue('累计已实现盈亏', realized),
+          ])));
+        }),
       _title('仓位风险仪表盘', sub: '仅分析已提交资产；参考阈值用于模拟游戏，不发出交易指令'),
       Card(child: Padding(padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1059,11 +1159,23 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           if (holdings[symbol]!.costKnown) ...[
             Text('平均成本 ¥${(holdings[symbol]!.averagePriceCents/100).toStringAsFixed(4)} '
                 '· 持仓成本 ¥${money(holdings[symbol]!.costBasisCents)}'),
-            Text('最新标记价 ¥${money(session.lastPrice(symbol))} '
-                '· 市值 ¥${money(holdings[symbol]!.marketValueCents)}'),
-            Text('浮动盈亏 ${signedMoney(holdings[symbol]!.unrealizedPnlCents)} '
-                '(${holdings[symbol]!.unrealizedPercent.toStringAsFixed(2)}%)',
-                style: TextStyle(color: holdings[symbol]!.unrealizedPnlCents >= 0 ? green : red)),
+            ValueListenableBuilder<double>(valueListenable: _seconds,
+              builder: (context, seconds, _) {
+                final mark = TxLivePortfolioValuation.evaluate(
+                    session, holdings, seconds);
+                final market = mark.marketValuesCents[symbol]!;
+                final basis = holdings[symbol]!.costBasisCents;
+                final floatPnl = market - basis;
+                final percent = basis <= 0 ? 0.0 : floatPnl * 100 / basis;
+                return Column(crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                  Text('实时指示价 ¥${money(mark.pricesCents[symbol]!)} '
+                      '· 预估市值 ¥${money(market)}'),
+                  Text('预估浮动盈亏 ${signedMoney(floatPnl)} '
+                      '(${percent.toStringAsFixed(2)}%)',
+                      style: TextStyle(color: floatPnl >= 0 ? green : red)),
+                ]);
+              }),
             Text('累计已实现 ${signedMoney(holdings[symbol]!.realizedPnlCents)}'),
           ] else const Text('历史库存与成交记录不完整，成本/收益暂不可核算',
               style: TextStyle(color: Colors.amberAccent)),
@@ -1160,21 +1272,63 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     return accountId;
   }
 
+  Widget _marketTape(TxSession session) {
+    final total = session.engine.fillCount;
+    final shown = TxMarketTapeWindow.visibleCount(
+        total, _marketTapeRequested);
+    return Column(children: [
+      Padding(padding: const EdgeInsets.fromLTRB(14, 14, 14, 4),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _title('市场真实逐笔', sub: '默认最新 24 条，按需显示；历史成交及资金账本永久保留'),
+            SingleChildScrollView(scrollDirection: Axis.horizontal,
+              child: SegmentedButton<int>(segments: const [
+                ButtonSegment(value: 0, label: Text('我的委托')),
+                ButtonSegment(value: 1, label: Text('我的成交')),
+                ButtonSegment(value: 2, label: Text('市场逐笔')),
+                ButtonSegment(value: 3, label: Text('交易复盘')),
+              ], selected: {_recordMode}, onSelectionChanged: (v) =>
+                  setState(() => _recordMode = v.first))),
+            Padding(padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text('显示最近 $shown / $total 笔真实成交 · 列表按需绘制',
+                style: const TextStyle(color: Colors.white60, fontSize: 12))),
+          ])),
+      Expanded(child: ListView.builder(
+        padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+        itemCount: shown == 0 ? 1 : shown +
+            (shown < total && shown < TxMarketTapeWindow.maximum ? 1 : 0),
+        itemBuilder: (context, index) {
+          if (shown == 0) {
+            return const ListTile(title: Text('市场尚无实际成交'));
+          }
+          if (index == shown) {
+            return TextButton(
+              onPressed: () => setState(() => _marketTapeRequested =
+                  TxMarketTapeWindow.expand(_marketTapeRequested)),
+              child: const Text('加载更早的 24 条'));
+          }
+          final f = session.engine.fillAt(
+              TxMarketTapeWindow.newestFirstFillIndex(total, index));
+          return Card(child: ListTile(dense: true,
+            title: Text('${f.id} ${f.symbol} ${f.quantity}股'),
+            subtitle: Text('${_participantLabel(session.engine.order(f.buyOrderId).ownerId)} 买'
+                ' ← ${_participantLabel(session.engine.order(f.sellOrderId).ownerId)} 卖'),
+            trailing: Text('¥${money(f.priceCents)}')));
+        },
+      )),
+    ]);
+  }
+
   Widget _records(TxSession session) {
+    if (_recordMode == 2) return _marketTape(session);
     // Only prepare the visible tab. In particular, opening the orders tab
     // must not walk the entire ever-growing market fill history.
     final orders = _recordMode == 0
         ? session.recentPlayerOrders(limit: 100) : const <TxOrder>[];
     final playerFills = _recordMode == 1
         ? session.recentPlayerFills(limit: 100) : const <TxFill>[];
-    final totalFills = _recordMode == 2 ? session.engine.fillCount : 0;
-    final shownFills = totalFills < 100 ? totalFills : 100;
     final journal = _recordMode == 3
         ? _journalForRevision(session,_trader!.current.revision) : null;
-    final tape = _recordMode == 2
-        ? List<TxFill>.generate(shownFills,
-            (i) => session.engine.fillAt(totalFills - 1 - i), growable: false)
-        : const <TxFill>[];
     return ListView(padding: const EdgeInsets.all(14), children: [
       _title('真实成交与交易复盘', sub: '委托与逐笔展示最近 100 条；复盘汇总全部已提交成交'),
       SingleChildScrollView(scrollDirection:Axis.horizontal,
@@ -1219,8 +1373,6 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         const ListTile(title: Text('暂无个人委托')),
       if (_recordMode == 1 && playerFills.isEmpty)
         const ListTile(title: Text('暂无个人成交')),
-      if (_recordMode == 2 && tape.isEmpty)
-        const ListTile(title: Text('市场尚无实际成交')),
       if (_recordMode == 0) for (final order in orders)
         Card(child: ListTile(dense: true,
           title: Text('${order.id} ${order.symbol} '
@@ -1234,12 +1386,6 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           title: Text('${f.id} ${f.symbol} ${f.quantity}股'),
           subtitle: Text(session.engine.order(f.buyOrderId).ownerId ==
               TxSession.playerId ? '玩家买入' : '玩家卖出'),
-          trailing: Text('¥${money(f.priceCents)}'))),
-      if (_recordMode == 2) for (final f in tape)
-        Card(child: ListTile(dense: true,
-          title: Text('${f.id} ${f.symbol} ${f.quantity}股'),
-          subtitle: Text('${_participantLabel(session.engine.order(f.buyOrderId).ownerId)} 买'
-              ' ← ${_participantLabel(session.engine.order(f.sellOrderId).ownerId)} 卖'),
           trailing: Text('¥${money(f.priceCents)}'))),
     ]);
   }
@@ -1262,8 +1408,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Scaffold(body: Center(
-        child: CircularProgressIndicator()));
+    if (_loading) return const Scaffold(body: SafeArea(child: Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text('TERMINAL X', style: TextStyle(
+              fontWeight: FontWeight.bold, fontSize: 26, letterSpacing: 4)),
+          SizedBox(height: 20),
+          CircularProgressIndicator(),
+          SizedBox(height: 14),
+          Text('正在后台校验存档并恢复行情…',
+              style: TextStyle(color: Colors.white70)),
+        ]))));
     if (_trader == null) return Scaffold(appBar: AppBar(
       title: const Text('Terminal X · 存档保护')),
       body: Padding(padding: const EdgeInsets.all(18),

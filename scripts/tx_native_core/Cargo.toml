@@ -1,0 +1,20 @@
+[package]
+name = "terminal_x_native_core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "UNLICENSED"
+description = "Offline deterministic funded limit order matcher for Terminal X"
+
+[lib]
+name = "terminal_x_core"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+
+[dependencies]
+# Intentionally dependency-free. No network, randomness, clock or Flutter APIs.

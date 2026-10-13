@@ -159,17 +159,38 @@ class TxSession {
       final sizes = i == 0
           ? [100, 200, 300, 450, 600]
           : [20, 35, 50, 60, 80];
+      // Historical fresh()/legacy sessions retain their exact old maker
+      // book. Agent-enabled sessions revise genuine, fully funded orders
+      // once per committed game minute. This is NOT a painted fake depth:
+      // every price/quantity goes through ordinary engine.place().
+      final dynamicBook = step > 0 && TxNpcMarket.isEnabled(engine);
+      final account = engine.account(owner);
       for (var level = 1; level <= 5; level++) {
         for (final side in [TxSide.sell, TxSide.buy]) {
-          final price = referenceCents[i] + (side == TxSide.sell ? level : -level);
-          if (price <= 0) continue;
+          final seed = ((step * 1103515245 + i * 123457 + level * 7919 +
+                  (side == TxSide.buy ? 104729 : 15485863)) & 0x7fffffff);
+          final depthOffset = dynamicBook ? seed % 3 : 0;
+          final distance = level + depthOffset;
+          final price = referenceCents[i] +
+              (side == TxSide.sell ? distance : -distance);
+          if (price <= 0 || price > TxEngine.maxPriceCents) continue;
+          final scale = dynamicBook ? (65 + (seed ~/ 97) % 76) : 100;
+          var quantity = sizes[level - 1] * scale ~/ 100;
+          if (side == TxSide.sell) {
+            quantity = quantity > account.availableSharesOf(symbols[i])
+                ? account.availableSharesOf(symbols[i]) : quantity;
+          } else {
+            final affordable = account.availableCashCents ~/ price;
+            quantity = quantity > affordable ? affordable : quantity;
+          }
+          if (quantity <= 0) continue;
           engine.place(
             id: 'LP-$i-$step-${side.name}-$level',
             ownerId: owner,
             symbol: symbols[i],
             side: side,
             kind: TxKind.limit,
-            quantity: sizes[level - 1],
+            quantity: quantity,
             limitPriceCents: price,
           );
         }

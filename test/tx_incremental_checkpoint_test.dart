@@ -630,4 +630,25 @@ void main() {
       await store.close();
     }
   });
+
+  test('R34 off-thread cold restore still fails closed on a damaged head', () async {
+    final store = TxSqliteStore(NativeDatabase.memory());
+    try {
+      var saved = await store.initializeFresh(TxSession.freshWithAgents());
+      for (var i = 0; i < 3; i++) {
+        final next = TxSession.importJson(saved.session.exportJson())
+          ..nextTick();
+        saved = await store.saveSession(next, expectedRevision: saved.revision);
+      }
+      final intact = await store.readCurrent();
+      expect(intact!.revision, saved.revision);
+      expect(intact.session.step, 3);
+      await store.customStatement(
+        "UPDATE snapshots SET sha256 = 'BAD' WHERE revision = ?",
+        [saved.revision]);
+      await expectLater(store.readCurrent(), throwsStateError);
+    } finally {
+      await store.close();
+    }
+  });
 }

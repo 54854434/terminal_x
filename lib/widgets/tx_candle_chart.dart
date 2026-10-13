@@ -9,10 +9,12 @@ import '../market/tx_frame_preview.dart';
 /// prices for no-trade periods) with a distinct indicative preview.
 class TxCandleChart extends StatefulWidget {
   const TxCandleChart({super.key, required this.candles,
-      this.indicativePriceCents, this.indicativeFramePriceCents});
+      this.indicativePriceCents, this.indicativeFramePriceCents,
+      this.previewSeconds});
   final List<TxCandle> candles;
   final int? indicativePriceCents;
   final double? indicativeFramePriceCents;
+  final double? previewSeconds;
   @override
   State<TxCandleChart> createState() => _TxCandleChartState();
 }
@@ -29,8 +31,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
   int _maLength = -1, _maFirstStep = -1;
   TxCandle? _maLast;
   List<double?>? _ma5, _ma10, _ma20;
-  int? _previewStep;
-  double? _previewHigh, _previewLow;
+  final TxIndicativeWickMemory _indicativeWick = TxIndicativeWickMemory();
+  final TxTimelinePreviewTrace _timelineTrace = TxTimelinePreviewTrace();
   int get _maxOffset => math.max(0, _activeBars.length -
       math.min(_window, _activeBars.length));
 
@@ -54,17 +56,25 @@ class _TxCandleChartState extends State<TxCandleChart> {
       _ma20 = TxIndicators.sma(_activeBars, 20);
       if (_olderOffset > _maxOffset) _olderOffset = _maxOffset;
     }
-    final step = source.last.step;
-    if (_previewStep != step) {
-      _previewStep = step;
-      _previewHigh = source.last.closeCents.toDouble();
-      _previewLow = source.last.closeCents.toDouble();
-    }
     final price = widget.indicativeFramePriceCents ??
         widget.indicativePriceCents?.toDouble();
-    if (price != null) {
-      _previewHigh = math.max(_previewHigh!, price);
-      _previewLow = math.min(_previewLow!, price);
+    if (price != null && widget.previewSeconds != null) {
+      _timelineTrace.observe(
+        nextMinuteStep: source.last.step + 1,
+        seconds: widget.previewSeconds!,
+        committedCloseCents: source.last.closeCents.toDouble(),
+        framePriceCents: price);
+    }
+    // Timeline uses periodMinutes == 0 as a display-only sentinel. It has
+    // a continuous price trace, not a candle bucket or a candle wick.
+    // Never pass that sentinel into the positive-period wick accumulator.
+    if (_period != TxChartPeriod.timeline) {
+      _indicativeWick.observe(
+        nextMinuteStep: source.last.step + 1,
+        periodMinutes: _period.minutes,
+        committedCloseCents: source.last.closeCents.toDouble(),
+        framePriceCents: price,
+      );
     }
   }
 
@@ -74,7 +84,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
     if (!identical(oldWidget.candles, widget.candles)) {
       // Switching symbols must discard the previous security's indicative
       // extrema; otherwise the price axis shows a fictitious large wick.
-      _previewStep = null;
+      _indicativeWick.reset();
+      _timelineTrace.reset();
       _maLength = -1;
       _cachedPeriod = null;
       _olderOffset = 0;
@@ -108,8 +119,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
             nextMinuteStep: widget.candles.last.step + 1,
             periodMinutes: _period.minutes,
             framePriceCents: preview,
-            previewHighCents: _previewHigh!,
-            previewLowCents: _previewLow!);
+            previewHighCents: _indicativeWick.highCents!,
+            previewLowCents: _indicativeWick.lowCents!);
     return Column(children: [
       Row(children: [
         Text(_period == TxChartPeriod.timeline ? '模拟分时 · 已提交分钟价格'
@@ -132,6 +143,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 _olderOffset = 0;
                 _inspectedStep = null;
                 _cachedPeriod = null;
+                _indicativeWick.reset();
               }),
             )),
         ],
@@ -149,7 +161,9 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 (v) => setState(() => _showMA = v)),
         const SizedBox(width: 6),
         if (preview != null && _period != TxChartPeriod.timeline)
-          const Expanded(child: Text('空心K/虚线：指示价（非成交）',
+          Expanded(child: Text(_period.minutes == 1
+              ? '虚线：指示价（非成交） · 影线只显示已提交 OHLC'
+              : '青色空心K/虚线：指示价（非成交）',
             maxLines: 1, overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 10, color: Colors.white54))),
       ]),
@@ -175,7 +189,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
         child: RepaintBoundary(child: SizedBox(height: 230,
           width: double.infinity,
           child: CustomPaint(painter: _period == TxChartPeriod.timeline
-            ? _TimelinePainter(visible, indicativePriceCents: preview)
+            ? _TimelinePainter(visible, indicativePriceCents: preview,
+                trace: _timelineTrace.points)
             : _CandlePainter(visible,
                 ma5: _showMA ? _ma5!.sublist(start, end) : null,
                 ma10: _showMA ? _ma10!.sublist(start, end) : null,
@@ -184,7 +199,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 indicativeHighCents: projection?.highCents,
                 indicativeLowCents: projection?.lowCents,
                 indicativeOpenCents: projection?.openCents,
-                overlayLastCommitted: projection?.overlaysLastCommitted ?? false)),
+                overlayLastCommitted: projection?.overlaysLastCommitted ?? false,
+                // At 100× or faster, a 1m indicative wick expires every
+                // 600ms or less. Do not paint that ephemeral shape as though
+                // it were the persistent traded OHLC wick.
+                showIndicativeWick: _period.minutes > 1)),
         )),
       )),
       if (inspected != null)
@@ -215,12 +234,13 @@ class _CandlePainter extends CustomPainter {
   _CandlePainter(this.candles, {this.ma5, this.ma10, this.ma20,
     this.indicativePriceCents, this.indicativeHighCents,
     this.indicativeLowCents, this.indicativeOpenCents,
-    this.overlayLastCommitted = false});
+    this.overlayLastCommitted = false, this.showIndicativeWick = true});
   final List<TxCandle> candles;
   final List<double?>? ma5, ma10, ma20;
   final double? indicativePriceCents, indicativeHighCents,
       indicativeLowCents, indicativeOpenCents;
   final bool overlayLastCommitted;
+  final bool showIndicativeWick;
   static const rise = Color(0xFF32D0A1), fall = Color(0xFFFF647C);
   static const grid = Color(0xFF293448),
       shortMA = Color(0xFFF5C54D), mediumMA = Color(0xFF7E9DFF),
@@ -246,8 +266,12 @@ class _CandlePainter extends CustomPainter {
       maxVolume = math.max(maxVolume, c.volumeShares);
     }
     if (indicativePriceCents != null) {
-      high = math.max(high, indicativeHighCents!.toDouble());
-      low = math.min(low, indicativeLowCents!.toDouble());
+      // For a one-minute preview only the moving cyan price marker is real
+      // UI state; its uncommitted wick is intentionally not drawn or scaled.
+      high = math.max(high, showIndicativeWick
+          ? indicativeHighCents!.toDouble() : indicativePriceCents!);
+      low = math.min(low, showIndicativeWick
+          ? indicativeLowCents!.toDouble() : indicativePriceCents!);
     }
     for (final series in [ma5, ma10, ma20]) {
       if (series == null) continue;
@@ -272,12 +296,16 @@ class _CandlePainter extends CustomPainter {
       final c=candles[i], x=bar*(i+.5);
       final color=c.rising ? rise : fall;
       final paint=Paint()..color=color..strokeWidth=1.5;
-      // Stored OHLC only; a flat bar gets no fabricated wick.
-      canvas.drawLine(Offset(x,y(c.highCents.toDouble())),
+      // The *one* aggregated active candle is painted in cyan below. Do
+      // not draw the last committed body underneath it as a fake 1m ghost.
+      final hiddenForAggregatePreview = overlayLastCommitted &&
+          showIndicativeWick && indicativePriceCents != null &&
+          i == candles.length - 1;
+      if (!hiddenForAggregatePreview) canvas.drawLine(Offset(x,y(c.highCents.toDouble())),
           Offset(x,y(c.lowCents.toDouble())),paint);
       final top=y(math.max(c.openCents,c.closeCents).toDouble());
       final bottom=y(math.min(c.openCents,c.closeCents).toDouble());
-      canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
+      if (!hiddenForAggregatePreview) canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
           math.max(1.5,bottom-top)),paint);
       if (maxVolume>0 && c.volumeShares>0) {
         final vh=27*c.volumeShares/maxVolume;
@@ -293,10 +321,14 @@ class _CandlePainter extends CustomPainter {
       final bottom=y(math.min(open,mark));
       final p=Paint()..color=const Color(0xFF54CEE5)
           ..style=PaintingStyle.stroke..strokeWidth=1.6;
-      canvas.drawLine(Offset(x,y(indicativeHighCents!.toDouble())),
-          Offset(x,y(indicativeLowCents!.toDouble())),p);
-      canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
-          math.max(2.0,bottom-top)),p);
+      if (showIndicativeWick) {
+        canvas.drawLine(Offset(x,y(indicativeHighCents!.toDouble())),
+            Offset(x,y(indicativeLowCents!.toDouble())),p);
+        canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
+            math.max(2.0,bottom-top)),p);
+      } else {
+        canvas.drawCircle(Offset(x, y(mark)), 2.5, p);
+      }
       final yy=y(mark);
       for (double dx=0;dx<right;dx+=10) {
         canvas.drawLine(Offset(dx,yy),Offset(math.min(dx+5,right),yy),
@@ -332,6 +364,7 @@ class _CandlePainter extends CustomPainter {
       indicativeLowCents!=other.indicativeLowCents ||
       indicativeOpenCents!=other.indicativeOpenCents ||
       overlayLastCommitted!=other.overlayLastCommitted ||
+      showIndicativeWick!=other.showIndicativeWick ||
       candles.length!=other.candles.length ||
       (ma5==null)!=(other.ma5==null) ||
       (candles.isNotEmpty && (candles.first.step!=other.candles.first.step ||
@@ -342,9 +375,11 @@ class _CandlePainter extends CustomPainter {
 /// Minute-closing mark line, not a seconds-level executed trade stream.
 /// The final blue dash can be indicative; it is never persisted as a fill.
 class _TimelinePainter extends CustomPainter {
-  _TimelinePainter(this.candles, {this.indicativePriceCents});
+  _TimelinePainter(this.candles, {this.indicativePriceCents,
+      this.trace = const <TxTimelineTracePoint>[]});
   final List<TxCandle> candles;
   final double? indicativePriceCents;
+  final List<TxTimelineTracePoint> trace;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -357,8 +392,12 @@ class _TimelinePainter extends CustomPainter {
       high = math.max(high, item.closeCents.toDouble());
     }
     if (indicativePriceCents != null) {
-      low = math.min(low, indicativePriceCents!.toDouble());
-      high = math.max(high, indicativePriceCents!.toDouble());
+      low = math.min(low, indicativePriceCents!);
+      high = math.max(high, indicativePriceCents!);
+      for (final sample in trace) {
+        low = math.min(low, sample.priceCents);
+        high = math.max(high, sample.priceCents);
+      }
     }
     final margin = math.max(2.0, (high - low) * .09);
     final top = high + margin;
@@ -375,7 +414,10 @@ class _TimelinePainter extends CustomPainter {
         textDirection: TextDirection.ltr)..layout();
       label.paint(canvas, Offset(right + 6, yy - 6));
     }
-    final width = right / math.max(1, candles.length);
+    // Reserve exactly one full minute on the right for the continuously
+    // advancing uncommitted line. The next committed close becomes the new
+    // last solid point and the preview starts again from that close.
+    final width = right / (candles.length + 1);
     final path = Path();
     for (var i = 0; i < candles.length; i++) {
       final x = width * (i + .5);
@@ -391,16 +433,27 @@ class _TimelinePainter extends CustomPainter {
       ..strokeWidth = 1.8
       ..style = PaintingStyle.stroke
       ..isAntiAlias = true);
-    if (indicativePriceCents != null) {
-      final x = right - 2;
+    if (indicativePriceCents != null && trace.isNotEmpty) {
+      // Join the LAST verified close to successive intraminute samples.
+      // The x coordinate grows monotonically with fractional game seconds,
+      // rather than drawing a stationary cyan point on the right border.
       final prevX = width * (candles.length - .5);
-      final p = Paint()..color = const Color(0xFF54CEE5)
-        ..strokeWidth = 1.4;
-      // A discontinuous preview, not a synthetic traded line segment.
-      for (double dx = prevX; dx < x; dx += 7) {
-        canvas.drawLine(Offset(dx, y(indicativePriceCents!.toDouble())),
-          Offset(math.min(dx + 3, x), y(indicativePriceCents!.toDouble())), p);
+      final segment = Path()..moveTo(prevX,
+          y(candles.last.closeCents.toDouble()));
+      for (final sample in trace) {
+        final px = prevX + width * (sample.seconds / 60.0);
+        segment.lineTo(px, y(sample.priceCents));
       }
+      canvas.drawPath(segment, Paint()
+        ..color = const Color(0xFF54CEE5)
+        ..strokeWidth = 1.9
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..isAntiAlias = true);
+      final last = trace.last;
+      canvas.drawCircle(Offset(prevX + width * last.seconds / 60,
+          y(last.priceCents)), 2.7,
+          Paint()..color = const Color(0xFF54CEE5));
     }
     final text = TextPainter(text: const TextSpan(
       text: '分时收盘参考价格 / 非逐笔成交',
@@ -412,6 +465,7 @@ class _TimelinePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _TimelinePainter old) =>
       indicativePriceCents != old.indicativePriceCents ||
+      !identical(trace,old.trace) ||
       candles.length != old.candles.length ||
       (candles.isNotEmpty &&
           (candles.first.step != old.candles.first.step ||

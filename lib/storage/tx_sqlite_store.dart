@@ -83,6 +83,72 @@ Future<_PreparedSnapshot> _prepareSnapshotOffThread(
       cachedHash, checkpointInterval));
 }
 
+/// Only plain Dart values cross this boundary. Never capture a Drift DB,
+/// sqlite3 pointer or GeneratedDatabase method in an Isolate.run closure.
+class _HeadSnapshotRow {
+  const _HeadSnapshotRow(this.revision, this.stored, this.hash);
+  final int revision;
+  final String stored;
+  final String hash;
+}
+
+class _AuditedHead {
+  const _AuditedHead(this.canonical, this.session);
+  final String canonical;
+  final TxSession session;
+}
+
+_AuditedHead _replayAndAuditHead(
+    List<_HeadSnapshotRow> newestFirst, int requiredRevision) {
+  if (newestFirst.isEmpty || newestFirst.first.revision != requiredRevision) {
+    throw StateError('Missing SQLite revision');
+  }
+  final ordered = newestFirst.reversed.toList(growable: false);
+  var checkpoint = -1;
+  for (var i = ordered.length - 1; i >= 0; i--) {
+    if (!TxDeltaCodec.isDelta(ordered[i].stored)) {
+      checkpoint = i;
+      break;
+    }
+  }
+  if (checkpoint < 0) throw StateError('Missing SQLite delta checkpoint');
+  String? canonical;
+  String? previousHash;
+  int? previousRevision;
+  for (var i = checkpoint; i < ordered.length; i++) {
+    final row = ordered[i];
+    if (TxDeltaCodec.checksum(row.stored) != row.hash) {
+      throw StateError('Corrupted historical SQLite checksum');
+    }
+    if (previousRevision != null && row.revision != previousRevision + 1) {
+      throw StateError('Gap in SQLite delta history');
+    }
+    if (TxDeltaCodec.isDelta(row.stored)) {
+      if (canonical == null || previousHash == null ||
+          previousRevision == null) {
+        throw StateError('Missing SQLite delta base');
+      }
+      canonical = TxDeltaCodec.replay(
+        previousCanonical: canonical,
+        previousRevision: previousRevision,
+        previousHash: previousHash,
+        stored: row.stored,
+      );
+    } else {
+      canonical = TxDeltaCodec.decodeFull(row.stored);
+    }
+    previousHash = row.hash;
+    previousRevision = row.revision;
+  }
+  // One mandatory full audit before the loaded economic state becomes usable.
+  final session = TxSession.importJson(canonical!);
+  return _AuditedHead(canonical, session);
+}
+
+Future<_AuditedHead> _restoreHeadOffThread(
+    List<_HeadSnapshotRow> rows, int revision) =>
+  Isolate.run(() => _replayAndAuditHead(rows, revision));
+
 class TxStoredSession {
   const TxStoredSession({
     required this.session,
@@ -398,14 +464,31 @@ class TxSqliteStore extends GeneratedDatabase {
         storedHash == null || TxDeltaCodec.checksum(payload) != storedHash) {
       throw StateError('Corrupted SQLite session pointer or checksum');
     }
-    final canonical = await _readCanonicalAt(activeRevision);
-    final session = TxSession.importJson(canonical);
-    // TxSession.importJson already enforces TxEngine.checkInvariants().
+    // SQLite queries stay on Drift's background executor; the bounded delta
+    // replay, decompression, JSON import and O(history) ledger audit are all
+    // computed outside Flutter's frame isolate during a cold start.
+    final historyRows = await customSelect('''
+      SELECT revision, payload_json, sha256 FROM snapshots
+      WHERE session_id = ? AND revision <= ?
+      ORDER BY revision DESC LIMIT ?
+    ''', variables: [
+      Variable.withString(primarySessionId),
+      Variable.withInt(activeRevision),
+      Variable.withInt(TxDeltaCodec.maxCheckpointInterval + 1),
+    ]).get();
+    final plain = historyRows.map((item) => _HeadSnapshotRow(
+      item.read<int>('revision'), item.read<String>('payload_json'),
+      item.read<String>('sha256'))).toList(growable: false);
+    if (plain.isEmpty || plain.first.stored != payload ||
+        plain.first.hash != storedHash) {
+      throw StateError('SQLite session pointer changed during restore');
+    }
+    final restored = await _restoreHeadOffThread(plain, activeRevision);
     _verifiedRevision = activeRevision;
     _verifiedHash = storedHash;
-    _headCanonical = canonical;
+    _headCanonical = restored.canonical;
     final committed = TxStoredSession(
-      session: session,
+      session: restored.session,
       revision: activeRevision,
       sha256: storedHash,
     );
