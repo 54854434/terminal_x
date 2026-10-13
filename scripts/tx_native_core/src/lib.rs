@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(e.fills[0].buy, 10);
         assert_eq!(e.accounts[&1].cash, 9700);
         assert_eq!(e.accounts[&1].reserved_cash, 200);
-        assert_eq!(e.accounts[&1].shares[0], 3);
+        assert_eq!(e.accounts[&1].shares[＆0], 3);
         assert_eq!(e.cancel(10, 1), CANCELLED);
         assert_eq!(e.accounts[&1].reserved_cash, 0);
         assert!(e.verify());
