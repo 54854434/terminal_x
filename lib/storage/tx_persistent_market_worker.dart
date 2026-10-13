@@ -21,6 +21,7 @@ class TxPersistentMarketWorker {
   final Isolate _isolate;
   final SendPort _commands;
   bool _closed = false;
+  Future<void> _commandTail = Future<void>.value();
 
   static Future<TxPersistentMarketWorker> start(TxSession committed,
       {bool useNative = false}) async {
@@ -46,6 +47,28 @@ class TxPersistentMarketWorker {
   }
 
   Future<TxMarketProposal> _request(String command, List<dynamic> args) async {
+    return _enqueueCommand(() => _requestNow(command, args));
+  }
+
+  Future<T> _enqueueCommand<T>(Future<T> Function() request) {
+    final previous = _commandTail;
+    late Future<T> result;
+    result = previous.then<T>((_) => request());
+    _commandTail = result.then<void>(
+      (_) {
+        // Keep the tail successful so the next command can observe the
+        // original request failure and continue in order.
+      },
+      onError: (Object _, StackTrace __) {
+        // The result future still reports the error to its caller; only the
+        // serialisation tail is deliberately recovered.
+      },
+    );
+    return result;
+  }
+
+  Future<TxMarketProposal> _requestNow(
+      String command, List<dynamic> args) async {
     if (_closed) throw StateError('Market worker is closed');
     final reply = ReceivePort();
     try {
@@ -91,18 +114,20 @@ class TxPersistentMarketWorker {
   /// The previously proposed revision has passed SQLite's atomic commit.
   /// Advances only the worker's volatile delta cursors; no snapshot roundtrip.
   Future<void> acknowledgeCommitted() async {
-    if (_closed) throw StateError('Market worker is closed');
-    final reply = ReceivePort();
-    try {
-      _commands.send(<dynamic>['ack', const <dynamic>[], reply.sendPort]);
-      final result = await reply.first.timeout(const Duration(seconds: 30));
-      if (result is! List || result.length != 3 || result[0] != true ||
-          result[1] != 'ack') {
-        throw StateError('Market worker commit acknowledgement failed');
+    return _enqueueCommand(() async {
+      if (_closed) throw StateError('Market worker is closed');
+      final reply = ReceivePort();
+      try {
+        _commands.send(<dynamic>['ack', const <dynamic>[], reply.sendPort]);
+        final result = await reply.first.timeout(const Duration(seconds: 30));
+        if (result is! List || result.length != 3 || result[0] != true ||
+            result[1] != 'ack') {
+          throw StateError('Market worker commit acknowledgement failed');
+        }
+      } finally {
+        reply.close();
       }
-    } finally {
-      reply.close();
-    }
+    });
   }
 
 

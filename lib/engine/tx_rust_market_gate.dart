@@ -163,21 +163,39 @@ class TxRustMarketGate implements TxEngineNativeGate {
     }
   }
 
+  /// The Dart projection calls the native gate before it checks its own
+  /// archived order map. A deterministic NPC retry therefore reaches this
+  /// method even when the order was already accepted by Rust. Comparing the
+  /// immutable command fields here makes that delivery genuinely idempotent;
+  /// it avoids submitting the same ID to Rust a second time.
+  static bool sameOrder(
+      TxOrder existing, String ownerId, String symbol, TxSide side,
+      TxKind kind, int quantity, int? limitPriceCents,
+      TxTimeInForce timeInForce) =>
+    existing.ownerId == ownerId && existing.symbol == symbol &&
+    existing.side == side && existing.kind == kind &&
+    existing.quantity == quantity &&
+    existing.limitPriceCents == limitPriceCents &&
+    existing.timeInForce == timeInForce;
+
   @override
   void place(String id, String ownerId, String symbol, TxSide side,
       TxKind kind, int quantity, int? limitPriceCents,
       {TxTimeInForce timeInForce = TxTimeInForce.gtc}) {
     final owner = _accountIds[ownerId];
     if (owner == null) throw StateError('Rust account not found: $ownerId');
-    final existing = _orderIds[id];
-    if (existing != null) {
-      // Native duplicate ID handling is immutable and idempotent.
-      final result = native.place(orderId: existing, ownerId: owner,
-          symbol: _symbolId(symbol), side: side.index,
-          kind: _nativeKind(kind, timeInForce),
-          quantity: quantity, priceCents: limitPriceCents ?? 0);
-      if (result < 0) throw StateError('Conflicting native retry: $id');
+    final projected = session.engine.orders[id];
+    if (projected != null) {
+      if (!sameOrder(projected, ownerId, symbol, side, kind, quantity,
+          limitPriceCents, timeInForce)) {
+        throw StateError('Conflicting native retry: $id');
+      }
+      // Rust already owns this immutable command. Do not call native.place
+      // again: a second call is not a retry, it is a duplicate submission.
       return;
+    }
+    if (_orderIds.containsKey(id)) {
+      throw StateError('Native order journal missing Dart order: $id');
     }
     _placeRaw(id, _nextOrderId + 1, owner, _symbolId(symbol),
         side.index, _nativeKind(kind, timeInForce), quantity,

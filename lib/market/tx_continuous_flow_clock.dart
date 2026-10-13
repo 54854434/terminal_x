@@ -160,16 +160,21 @@ class TxContinuousFlowClock {
   }
 
   /// Rebase the visual clock only after the storage layer has reread and
-  /// audited the durable SQLite head. Ambiguous provisional seconds are
-  /// intentionally discarded; replaying them would risk duplicating a
-  /// minute or a Rust market pulse.
-  void recoverAfterStorageAudit() {
+  /// audited the durable SQLite head. A verified intraminute pulse may supply
+  /// its saved second; all other ambiguous provisional time is discarded.
+  void recoverAfterStorageAudit({int pulseSecond = 0}) {
     if (!_faulted) {
       throw StateError('No storage fault requires recovery');
     }
+    if (pulseSecond < 0 || pulseSecond >= 60 ||
+        (pulseSecond > 0 && pulseSecond < 5)) {
+      throw ArgumentError.value(pulseSecond, 'pulseSecond');
+    }
     _running = false;
     _awaitingCommit = false;
-    _fractionalGameMicros = 0;
+    // A safely recovered intraminute candidate keeps its verified visual
+    // position. The default remains zero for a normal minute-boundary audit.
+    _fractionalGameMicros = pulseSecond * 1000000;
     _faulted = false;
   }
 

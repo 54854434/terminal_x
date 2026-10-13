@@ -42,6 +42,19 @@ void main() {
     expect(audit, returnsNormally);
   });
 
+  test('Rust gate treats an identical archived command as idempotent', () {
+    final engine = TxEngine()..registerAccount('buyer', cashCents: 10000);
+    final order = engine.place(
+      id: 'NPC-L-69-0-B', ownerId: 'buyer', symbol: 'LOW',
+      side: TxSide.buy, kind: TxKind.limit, quantity: 3,
+      limitPriceCents: 900, timeInForce: TxTimeInForce.gtc,
+    );
+    expect(TxRustMarketGate.sameOrder(order, 'buyer', 'LOW', TxSide.buy,
+        TxKind.limit, 3, 900, TxTimeInForce.gtc), isTrue);
+    expect(TxRustMarketGate.sameOrder(order, 'buyer', 'LOW', TxSide.buy,
+        TxKind.limit, 4, 900, TxTimeInForce.gtc), isFalse);
+  });
+
   group('V0.1b price-time matching and finite depth', () {
     test('price priority, then FIFO, and multi-level market slippage', () {
       final e = TxEngine()

@@ -94,12 +94,15 @@ class TxTradingService {
   TxStoredSession? _current;
   TxStoredSession? _durableCurrent;
   bool _busy = false;
+  Future<void>? _automaticTail;
+  int _automaticPending = 0;
   bool _storageFault = false;
   TxTickTimings? _lastTickTimings;
   int _automaticSaveMinutes = TxSqliteStore.defaultAutomaticSaveMinutes;
   int _pendingAutomaticOperations = 0;
   int _pendingGameMinutes = 0;
   String? _lastStorageFailure;
+  bool _lastRecoveryPreservedPending = false;
 
 
   /// Null until the first complete, durably committed and acknowledged tick.
@@ -111,6 +114,28 @@ class TxTradingService {
   int get pendingAutomaticOperations => _pendingAutomaticOperations;
   int get pendingGameMinutes => _pendingGameMinutes;
   String? get lastStorageFailure => _lastStorageFailure;
+  bool get lastRecoveryPreservedPending => _lastRecoveryPreservedPending;
+
+  /// Automatic playback is allowed to wait behind one worker/SQLite command.
+  /// A fast target multiplier must create back-pressure, not turn a harmless
+  /// ordering race into a storage fault. The tail swallows its own error so a
+  /// later queued command can still observe the service's blocked state and
+  /// fail closed with the original error.
+  Future<T> _enqueueAutomatic<T>(Future<T> Function() operation) {
+    _automaticPending++;
+    final previous = _automaticTail ?? Future<void>.value();
+    late Future<T> result;
+    result = previous.then<T>((_) => operation());
+    _automaticTail = result.then<void>(
+      (_) {
+        _automaticPending--;
+      },
+      onError: (Object _, StackTrace __) {
+        _automaticPending--;
+      },
+    );
+    return result;
+  }
 
   TxStoredSession get current {
     if (_current == null) throw StateError('SQLite session not initialized');
@@ -232,7 +257,16 @@ class TxTradingService {
   /// runtime state; player actions and lifecycle flushes force a durable save.
   Future<TxStoredSession> marketPulse(int second,
       {bool deferSave = false}) async {
-    _ensureReady();
+    if (deferSave) {
+      return _enqueueAutomatic(() => _marketPulseNow(second,
+          deferSave: true));
+    }
+    return _marketPulseNow(second, deferSave: false);
+  }
+
+  Future<TxStoredSession> _marketPulseNow(int second,
+      {required bool deferSave}) async {
+    _ensureReady(automatic: deferSave);
     if (second < 5 || second >= 60) {
       throw ArgumentError.value(second, 'second');
     }
@@ -263,7 +297,14 @@ class TxTradingService {
   }
 
   Future<TxStoredSession> nextTick({bool deferSave = false}) async {
-    _ensureReady();
+    if (deferSave) {
+      return _enqueueAutomatic(() => _nextTickNow(deferSave: true));
+    }
+    return _nextTickNow(deferSave: false);
+  }
+
+  Future<TxStoredSession> _nextTickNow({required bool deferSave}) async {
+    _ensureReady(automatic: deferSave);
     _busy = true;
     _lastTickTimings = null;
     final clock = Stopwatch()..start();
@@ -318,6 +359,14 @@ class TxTradingService {
   /// Persist the current automatic candidate. This is the only path used by
   /// lifecycle/exit safety and by changing the automatic save cadence.
   Future<TxStoredSession> flushPending() async {
+    // A lifecycle transition may arrive just after the frame clock queued an
+    // automatic pulse. Let the queued worker command settle before flushing;
+    // otherwise the lifecycle save competes with it and reports a false
+    // "save already in progress" failure.
+    final tail = _automaticTail;
+    if (_automaticPending > 0 && !_busy && tail != null) {
+      await tail;
+    }
     _ensureReady();
     if (!hasPendingPersistence) return current;
     _busy = true;
@@ -369,12 +418,15 @@ class TxTradingService {
   /// the only safe recovery operation: it adopts whichever revision is
   /// actually on disk and discards the uncommitted in-memory candidate.
   Future<TxStoredSession> reopenAndVerify() async {
-    if (_busy) throw StateError('A save is already in progress');
+    if (_busy) throw StateError('Storage operation is still settling');
     _busy = true;
+    _lastRecoveryPreservedPending = false;
     try {
       _worker?.close();
       _worker = null;
-      final loaded = await database.readCurrent();
+      final candidate = _current;
+      final durable = _durableCurrent;
+      var loaded = await database.readCurrent();
       if (loaded == null) {
         throw StateError('SQLite session is missing; recovery refused');
       }
@@ -385,6 +437,31 @@ class TxTradingService {
         throw StateError('Invalid automatic SQLite save cadence');
       }
       _automaticSaveMinutes = configured;
+
+      // A deferred automatic candidate is a complete, deterministic session
+      // that has never been exposed as a player transaction. If the audited
+      // SQLite head is still exactly the old durable head, it is safe to make
+      // one ordinary atomic save attempt and preserve the visible game time.
+      // This is deliberately limited to pending automatic state: never retry
+      // an ambiguous player order, which could duplicate a real trade.
+      final canPreserve = candidate != null && durable != null &&
+          candidate.pending && candidate.revision == durable.revision &&
+          loaded.revision == durable.revision &&
+          loaded.sha256 == durable.sha256;
+      if (canPreserve) {
+        try {
+          loaded = await database.saveSession(candidate.session,
+              expectedRevision: loaded.revision);
+          _lastRecoveryPreservedPending = true;
+        } catch (_) {
+          // The save may have failed or its acknowledgement may be
+          // ambiguous. Re-read the actual head and adopt only that result.
+          loaded = await database.readCurrent();
+          if (loaded == null) {
+            throw StateError('SQLite session disappeared during recovery');
+          }
+        }
+      }
       _current = loaded;
       _durableCurrent = loaded;
       _pendingAutomaticOperations = 0;
@@ -421,11 +498,14 @@ class TxTradingService {
     }
   }
 
-  void _ensureReady() {
+  void _ensureReady({bool automatic = false}) {
     if (_storageFault) {
       throw StateError('SQLite storage error: reopen and verify before trading');
     }
-    if (_busy) throw StateError('A save is already in progress');
+    if (_busy) throw StateError('Storage operation is already in progress');
+    if (!automatic && _automaticPending > 0) {
+      throw StateError('Automatic market operation is still settling');
+    }
     if (_current == null) throw StateError('Session has not loaded');
   }
 
@@ -447,6 +527,8 @@ class TxTradingService {
 
   Future<void> close() async {
     try {
+      final tail = _automaticTail;
+      if (_automaticPending > 0 && !_busy && tail != null) await tail;
       if (!_storageFault && hasPendingPersistence && !_busy) {
         await flushPending();
       }

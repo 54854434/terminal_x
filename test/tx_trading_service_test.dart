@@ -172,6 +172,44 @@ void main() {
     expect((await db.readCurrent())!.session.playerFills, isNotEmpty);
   });
 
+  test('automatic market requests serialize instead of raising busy errors',
+      () async {
+    await db.close();
+    db = TxSqliteStore(NativeDatabase.memory());
+    service = TxTradingService(db,
+        initialSessionFactory: TxSession.freshWithAgents,
+        persistentMarketWorker: true, automaticSaveMinutes: 2);
+    await service.open();
+    final first = service.nextTick(deferSave: true);
+    final second = service.nextTick(deferSave: true);
+    final results = await Future.wait<TxStoredSession>([first, second]);
+    expect(results.last.session.step, 2);
+    expect(results.last.pending, isFalse);
+    expect(service.blocked, isFalse);
+    await service.close();
+    db = TxSqliteStore(NativeDatabase.memory());
+  });
+
+  test('recovery preserves a safe pending automatic candidate', () async {
+    var writes = 0;
+    await db.close();
+    db = TxSqliteStore(NativeDatabase.memory(), testCheckpoint: (point) {
+      if (point == 'after_session_insert' && ++writes == 2) {
+        throw StateError('injected automatic save failure');
+      }
+    });
+    service = TxTradingService(db);
+    final first = await service.open();
+    final pulse = await service.marketPulse(15, deferSave: true);
+    expect(pulse.pending, isTrue);
+    await expectLater(service.nextTick(), throwsStateError);
+    final recovered = await service.reopenAndVerify();
+    expect(service.lastRecoveryPreservedPending, isTrue);
+    expect(recovered.revision, first.revision + 1);
+    expect(recovered.session.lastPulseSecond, 15);
+    expect(recovered.session.marketTimeStep, 1);
+  });
+
   test('ticks persist and new service instance reads same account', () async {
     await service.open();
     await service.nextTick();

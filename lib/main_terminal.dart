@@ -24,7 +24,6 @@ import 'market/tx_ticket_sizing.dart';
 import 'market/tx_frame_preview.dart';
 import 'market/tx_trade_journal.dart';
 import 'market/tx_portfolio_scenarios.dart';
-import 'market/tx_runtime_health.dart';
 import 'market/tx_market_phase_timeline.dart';
 import 'market/tx_frame_render_gate.dart';
 import 'market/tx_storage_footprint.dart';
@@ -97,6 +96,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   int _symbol = 0;
   int _speed = 1;
   final ValueNotifier<double> _seconds = ValueNotifier<double>(0.0);
+  final ValueNotifier<int> _marketRepaint = ValueNotifier<int>(0);
   final ValueNotifier<bool> _settling = ValueNotifier<bool>(false);
   final ValueNotifier<double> _settlementPhase = ValueNotifier<double>(0.0);
   bool _auto = false;
@@ -283,9 +283,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     await service.close();
   }
 
-  /// Adopt only the revision that is actually present in SQLite after a
-  /// failed/ambiguous operation. The provisional clock and chart are rebased
-  /// to that audited head; no in-memory candidate is retried automatically.
+  /// Adopt the audited SQLite head after a failed operation. A deferred,
+  /// automatic candidate is preserved by the storage service when the on-disk
+  /// head is unchanged; ambiguous player orders are never retried.
   Future<void> _recoverStorage() async {
     final service = _trader;
     if (service == null || _recoveringStorage) return;
@@ -294,11 +294,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _historyWarming = true;
       _startupProgress = .72;
       _startupStage = '正在重新校验 SQLite 并恢复已落盘状态';
-      _notice = '正在读取真实 SQLite 修订；未确认的临时行情将被安全丢弃';
+      _notice = '正在读取真实 SQLite 修订；优先保留可安全补写的自动行情';
     });
     try {
       final loaded = await service.reopenAndVerify();
-      _flow.recoverAfterStorageAudit();
+      _flow.recoverAfterStorageAudit(
+          pulseSecond: loaded.session.lastPulseSecond);
       _previousBookQty.clear();
       _positionCache = null;
       _positionCacheRevision = null;
@@ -311,9 +312,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         _candles = baseline;
         _fault = null;
         _auto = false;
-        _seconds.value = 0;
+        _seconds.value = loaded.session.lastPulseSecond.toDouble();
         _startupStage = '存档已恢复，正在重建真实 K 线缓存';
         _startupProgress = .78;
+        _notice = service.lastRecoveryPreservedPending
+            ? '已校验 SQLite；未落盘的自动行情已安全补写，游戏时间未回退'
+            : '已恢复最后安全落盘状态；未确认的玩家操作不会自动重试';
       });
       _candleWarmup = _warmCandleHistory(service, loaded);
       await _candleWarmup;
@@ -478,6 +482,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
               _currentDepthQuantities(before.session, symbol);
         }
         _candles!.addObservation(before.session, after.session);
+        // Keep the market page's session projection in step with the mutable
+        // live candle cache. The per-frame preview still uses [_seconds], so
+        // this notifier only fires after a real Rust candidate completes.
+        if (mounted) _marketRepaint.value++;
       }
       if (automated) {
         // The isolated candidate finished computing. If the save cadence is
@@ -863,7 +871,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _page = 1;
   });
 
-  Widget _market(TxSession session) {
+  Widget _market(TxSession session) => ValueListenableBuilder<int>(
+    valueListenable: _marketRepaint,
+    builder: (context, _, child) => _marketContent(
+        _trader?.current.session ?? session),
+  );
+
+  Widget _marketContent(TxSession session) {
     final minuteFills = session.currentMinuteFills
         .where((f) => f.symbol == _symbolName).toList();
     final minuteVolume = minuteFills.fold<int>(0, (sum, f) => sum + f.quantity);
@@ -921,6 +935,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       ))),
       _depth(session),
       _phaseTimeline(session.step),
+      /*
       _title('游戏时间与行情速度', sub: '24 小时制，前台运行；失败或切后台立即暂停'),
       Card(child: Padding(padding: const EdgeInsets.all(12),
         child: Column(children: [
@@ -1020,6 +1035,22 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       const Text('分时右端青色连续线及各周期青色空心蜡烛为未结算指示报价；真实 OHLC、均线与成交量均取自真实撮合。'
           '自动保存周期内的实时图可包含已标注的待保存候选，重启只恢复 SQLite 已落盘记录；成交量不把秒级报价变动伪造成交易。',
           style: TextStyle(color: Colors.white54, fontSize: 11)),
+      */
+      _title('运行设置', sub: '倍率、Rust 盘口节奏和 SQLite 存档策略统一在设置中心管理'),
+      Card(child: Padding(padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('当前 ${_auto ? '运行中' : '已暂停'} · ${_speed}× · '
+              '盘口每 ${_flow.pulseSeconds}s · 自动保存每 $_automaticSaveMinutes 分钟'),
+          const SizedBox(height: 5),
+          const Text('行情页保留真实盘口和 K 线；可操作设置不再在多个页面重复出现。',
+              style: TextStyle(color: Colors.white60, fontSize: 11)),
+          Align(alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => setState(() => _page = 4),
+              icon: const Icon(Icons.settings_outlined, size: 17),
+              label: const Text('打开设置中心'))),
+        ])),
+      ),
     ]);
   }
 
@@ -1602,6 +1633,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                 _page = 1;
               }), child: const Text('交易此标的 →'))),
         ]))),
+      /*
       _title('存档周期设置', sub: '控制完整检查点的频率，不会延迟交易或分钟提交'),
       Card(child: Padding(padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1674,6 +1706,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             '但不会破坏已保存的 SQLite 链。玩家下单、切后台和退出前会强制保存。',
             style: TextStyle(fontSize: 11, color: Colors.white60)),
         ]))),
+      */
       _title('存档状态'),
       Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(
         crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1963,6 +1996,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _startupTimer?.cancel();
     _startupStopwatch.stop();
     _seconds.dispose();
+    _marketRepaint.dispose();
     _settling.dispose();
     _settlementPhase.dispose();
     _qty.dispose();
