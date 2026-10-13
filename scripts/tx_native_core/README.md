@@ -19,7 +19,8 @@ existing SQLite schema-1 projection and UI snapshot format.
 - `Cargo.toml`: no third-party dependencies; builds `libterminal_x_core.so`
   (Android ARM64) or `.dylib/.dll/.so` for host parity tests.
 - `src/lib.rs`: dynamic u32 symbols, active-only price/time order index, funded cash and share
-  limits, limit reservations, cancel, market IOC, fill records, conservation
+  limits, limit reservations, cancel, maker-price fills, market/IOC/FOK and
+  post-only policies, fill records, conservation audit, stable numeric API.
   audit, stable numeric API.
 - `terminal_x_core.h`: independently compilable C ABI v2 contract.
 - `lib/engine/tx_native_core_ffi.dart` (repo root): explicit per-isolate Dart bridge.
@@ -73,9 +74,9 @@ SQLite commit. Existing full ledger validation must remain authoritative.
   states and actual fills on the same funded order sequence.
 - Execute `bash scripts/tx_native_core/ci_native.sh` on a development runner
   with rustc, cargo, clang and optionally Dart; Android NDK is needed for the
-  ARM64 target check. This handoff run directly compiled Rust 1.88.0 and ran
-  its 13 native tests, but Cargo/Flutter/Dart parity and the Android linker
-  gates still require a normal CI or development runner.
+  ARM64 target check. A prior handoff compiled Rust 1.88.0 and ran its native
+  tests, but the v0.3.5 execution-policy changes in this working tree require
+  a fresh Cargo/Flutter/Dart parity run before release.
 - The signed Android ARM64 APK now embeds the `.so` and the persistent market
   worker owns the native handle. Before calling a build production-ready,
   still require native CI, deterministic equivalence, cold restore, and

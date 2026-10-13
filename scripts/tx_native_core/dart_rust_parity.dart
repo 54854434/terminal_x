@@ -39,7 +39,8 @@ void compare(TxEngine dart, TxNativeCoreFfi rust) {
     insist(order.remaining == rust.remaining(id), 'remaining ${order.id}');
     insist(order.status.index == rust.orderStatus(id),
         'status ${order.id}');
-    if (order.kind == TxKind.limit && order.remaining > 0 &&
+    if (order.kind == TxKind.limit && order.timeInForce.canRest &&
+        order.remaining > 0 &&
         (order.status == TxStatus.open ||
          order.status == TxStatus.partiallyFilled)) resting++;
   }

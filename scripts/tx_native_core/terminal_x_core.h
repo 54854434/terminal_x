@@ -5,7 +5,8 @@
 extern "C" {
 #endif
 /* ABI v2; opaque engine, never cross DLL boundary with Rust-owned allocations. */
-/* Symbol IDs are extensible: 0=SIM-A01, 1=SIM-A02. Sides 0=buy,1=sell; kinds 0=limit,1=market. */
+/* Symbol IDs are extensible: 0=SIM-A01, 1=SIM-A02. Sides 0=buy,1=sell;
+ * order kinds: 0=limit/GTC, 1=market, 2=post-only, 3=IOC, 4=FOK. */
 /* Place results: 0=open,1=partial,2=filled,3=cancelled,4=rejected. */
 /* Error results: -1=null handle, -2=invalid input, -3=unknown ID, -4=conflict. */
 void* tx_core_new(void);
