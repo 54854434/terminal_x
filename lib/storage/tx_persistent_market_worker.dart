@@ -81,7 +81,9 @@ class TxPersistentMarketWorker {
     required TxKind kind,
     required int quantity,
     int? limitPriceCents,
-  }) => _request('place', <dynamic>[symbol, side, kind, quantity, limitPriceCents]);
+    TxTimeInForce timeInForce = TxTimeInForce.gtc,
+  }) => _request('place', <dynamic>[symbol, side, kind, quantity,
+      limitPriceCents, timeInForce]);
 
   Future<TxMarketProposal> cancel(String orderId) =>
       _request('cancel', <dynamic>[orderId]);
@@ -149,6 +151,7 @@ void _runMarketWorker(List<dynamic> launch) {
           kind: args[2] as TxKind,
           quantity: args[3] as int,
           limitPriceCents: args[4] as int?,
+          timeInForce: args[5] as TxTimeInForce,
         );
         orderId = order.id;
       } else if (command == 'cancel') {

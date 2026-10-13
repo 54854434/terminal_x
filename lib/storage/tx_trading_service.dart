@@ -28,11 +28,11 @@ class _TradeProposal {
 
 _TradeProposal _placeOnWorker(
     TxSession original, String symbol, TxSide side, TxKind kind,
-    int quantity, int? limitPriceCents) {
+    int quantity, int? limitPriceCents, TxTimeInForce timeInForce) {
   final proposed = TxSession.importJson(original.exportJson());
   final order = proposed.placePlayer(
     symbol: symbol, side: side, kind: kind, quantity: quantity,
-    limitPriceCents: limitPriceCents);
+    limitPriceCents: limitPriceCents, timeInForce: timeInForce);
   return _TradeProposal(proposed, order.id);
 }
 
@@ -47,9 +47,9 @@ _TradeProposal _cancelOnWorker(TxSession original, String orderId) {
 // closure would fail every trade and minute tick before the DB transaction.
 Future<_TradeProposal> _placeDetached(
     TxSession source, String symbol, TxSide side, TxKind kind,
-    int quantity, int? limitPriceCents) {
+    int quantity, int? limitPriceCents, TxTimeInForce timeInForce) {
   return Isolate.run(() => _placeOnWorker(
-      source, symbol, side, kind, quantity, limitPriceCents));
+      source, symbol, side, kind, quantity, limitPriceCents, timeInForce));
 }
 
 Future<_TradeProposal> _cancelDetached(TxSession source, String orderId) {
@@ -164,6 +164,7 @@ class TxTradingService {
     required TxKind kind,
     required int quantity,
     int? limitPriceCents,
+    TxTimeInForce timeInForce = TxTimeInForce.gtc,
   }) async {
     _ensureReady();
     _busy = true;
@@ -171,14 +172,15 @@ class TxTradingService {
       if (_worker != null) {
         final proposal = await _worker!.place(
           symbol: symbol, side: side, kind: kind,
-          quantity: quantity, limitPriceCents: limitPriceCents);
+          quantity: quantity, limitPriceCents: limitPriceCents,
+          timeInForce: timeInForce);
         await _commit(proposal.session);
         await _ackWorkerCommit();
         return current.session.engine.order(proposal.orderId!);
       }
       final source = current.session;
       final proposal = await _placeDetached(
-          source, symbol, side, kind, quantity, limitPriceCents);
+          source, symbol, side, kind, quantity, limitPriceCents, timeInForce);
       await _commit(proposal.session);
       return current.session.engine.order(proposal.orderId);
     } catch (_) {
