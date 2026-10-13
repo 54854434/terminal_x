@@ -170,7 +170,8 @@ void main() {
         enabled: true, onReview: () {}),
       ),
     ));
-    expect(find.text('限价 · Post Only'), findsOneWidget);
+    expect(find.text('限价'), findsOneWidget);
+    expect(find.textContaining('Post Only'), findsOneWidget);
     expect(find.text('检查并买入'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
