@@ -100,6 +100,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   bool _auto = false;
   bool _busy = false;
   bool _loading = true;
+  bool _historyWarming = false;
   bool _limit = false;
   TxSide _ticketSide = TxSide.buy;
   int _recordMode = 0;
@@ -109,8 +110,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   String _notice = '正在检查 SQLite';
   String? _fault;
   String _rustStatus = '等待 Rust 核心';
+  final Stopwatch _startupStopwatch = Stopwatch();
+  Timer? _startupTimer;
+  Duration _startupElapsed = Duration.zero;
+  double _startupProgress = .02;
+  String _startupStage = '准备启动 Terminal X';
+  Future<void>? _candleWarmup;
+  bool _serviceClosed = false;
 
   bool get _ready => !_loading && !_busy && _fault == null &&
+      !_historyWarming &&
       _trader != null && !_trader!.blocked;
   String get _symbolName => TxSession.symbols[_symbol];
   String money(int cents) => (cents / 100).toStringAsFixed(2);
@@ -124,6 +133,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _playbackTicker = createTicker(_onPlaybackFrame);
+    _startupStopwatch.start();
+    _startupTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (!mounted || (!_loading && !_historyWarming)) return;
+      setState(() => _startupElapsed = _startupStopwatch.elapsed);
+    });
     // Paint the first loading frame before opening a long historical store.
     // DB verification is required, but must not block the Flutter first frame.
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -239,52 +253,137 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _playbackTicker.start();
   }
 
+  void _setStartupStage(String stage, double progress) {
+    if (!mounted) return;
+    setState(() {
+      _startupStage = stage;
+      _startupProgress = progress.clamp(0.0, 1.0).toDouble();
+    });
+  }
+
+  void _finishStartupClock() {
+    _startupStopwatch.stop();
+    _startupTimer?.cancel();
+    _startupTimer = null;
+    if (mounted) {
+      setState(() => _startupElapsed = _startupStopwatch.elapsed);
+    }
+  }
+
+  String _startupTimeLabel() =>
+      '${(_startupElapsed.inMilliseconds / 1000).toStringAsFixed(1)}s';
+
+  Future<void> _closeService(TxTradingService service) async {
+    if (_serviceClosed) return;
+    _serviceClosed = true;
+    await service.close();
+  }
+
+  /// The account head is authoritative and must be audited before the main
+  /// screen becomes visible. The OHLC index is only a display read model, so
+  /// its cache miss is warmed after the verified account is already visible.
+  Future<void> _warmCandleHistory(
+      TxTradingService service, TxStoredSession initial) async {
+    try {
+      _setStartupStage('正在校验已缓存 K 线', .76);
+      var candles = await service.database.readCandleIndex(initial);
+      if (candles == null) {
+        _setStartupStage('缓存缺失，后台重建真实 OHLC 历史', .84);
+        final recent = await service.database.readHistory(limit: 64);
+        candles = TxLiveCandles.fromVerifiedHistory(recent);
+        _setStartupStage('正在安全写入 K 线索引', .94);
+        await service.database.seedCandleIndex(initial, candles);
+      }
+      final readyCandles = candles!;
+      if (!mounted) {
+        await _closeService(service);
+        return;
+      }
+      setState(() {
+        _candles = readyCandles;
+        _historyWarming = false;
+        _startupProgress = 1.0;
+        _startupStage = '启动完成';
+        _notice = 'Rust 交易核心已启动，独立测试账户；行情默认暂停';
+        _rustStatus = 'ARM64 ABI v2 已绑定';
+      });
+      _finishStartupClock();
+    } catch (error) {
+      // The index never authorizes a trade. Keep the verified account usable
+      // with its real current mark, while making the non-authoritative cache
+      // failure explicit instead of pretending that history was restored.
+      if (!mounted) {
+        await _closeService(service);
+        return;
+      }
+      setState(() {
+        _historyWarming = false;
+        _startupProgress = .98;
+        _startupStage = '账户已恢复，行情历史缓存未完成';
+        _notice = '账户已安全恢复；K 线历史缓存失败，当前仅显示已校验基准：$error';
+        _rustStatus = 'ARM64 ABI v2 已绑定 · K 线缓存异常';
+      });
+      _finishStartupClock();
+    }
+  }
+
   Future<void> _open() async {
     TxTradingService? service;
     try {
+      _setStartupStage('正在打开 SQLite 数据文件', .08);
       final dir = await getApplicationSupportDirectory();
       final sqlite = File('${dir.path}/terminal_x_rust_v1.sqlite');
+      _setStartupStage('正在完整校验 SQLite 存档', .18);
       service = TxTradingService(TxSqliteStore(
         NativeDatabase.createInBackground(sqlite)),
         initialSessionFactory: TxSession.freshWithAgents,
         persistentMarketWorker: true,
         nativeMarketWorker: Platform.isAndroid);
       final initial = await service.open();
-      final checkpointInterval = await service.database.readCheckpointInterval();
-      final pulseSeconds = await service.database.readMarketPulseSeconds();
+      _setStartupStage('存档已校验，正在读取独立运行设置', .60);
+      final policies = await Future.wait<int>(<Future<int>>[
+        service.database.readCheckpointInterval(),
+        service.database.readMarketPulseSeconds(),
+      ]);
+      final checkpointInterval = policies[0];
+      final pulseSeconds = policies[1];
       final automaticSaveMinutes = service.automaticSaveMinutes;
       _flow.setPulseSeconds(pulseSeconds);
-      // Once, not on every committed tick. 64 recent revisions are enough to
-      // reconstruct recent candles without loading the entire database.
-      var candles = await service.database.readCandleIndex(initial);
-      if (candles == null) {
-        final recent = await service.database.readHistory(limit: 64);
-        candles = TxLiveCandles.fromVerifiedHistory(recent);
-        await service.database.seedCandleIndex(initial, candles);
-      }
+      // A single verified mark is enough to paint the chart shell. The full
+      // bounded OHLC history is restored below, after the account is visible.
+      final candles = TxLiveCandles.fromVerifiedHistory(
+          <TxStoredSession>[initial]);
       if (!mounted) {
         await service.close();
         return;
       }
+      _serviceClosed = false;
       setState(() {
         _trader = service;
         _candles = candles;
+        _historyWarming = true;
         _checkpointInterval = checkpointInterval;
         _checkpointDraft = checkpointInterval;
         _automaticSaveMinutes = automaticSaveMinutes;
         _automaticSaveDraft = automaticSaveMinutes;
         _price.text = money(initial.session.lastPrice(_symbolName));
-        _notice = 'Rust 交易核心已启动，独立测试账户；行情默认暂停';
-        _rustStatus = 'ARM64 ABI v2 已绑定';
+        _notice = '账户已安全恢复，正在后台恢复真实 K 线；交易入口暂不可用';
+        _rustStatus = 'ARM64 ABI v2 已绑定 · K 线恢复中';
+        _startupStage = '账户已恢复，正在后台恢复真实 K 线';
+        _startupProgress = .70;
         _loading = false;
       });
+      _candleWarmup = _warmCandleHistory(service, initial);
+      unawaited(_candleWarmup!);
     } catch (e) {
       await service?.close();
       if (!mounted) return;
       setState(() {
         _loading = false;
+        _startupStage = '启动失败';
         _fault = 'SQLite 读取或校验失败，已停止交易并保留数据：$e';
       });
+      _finishStartupClock();
     }
   }
 
@@ -1665,8 +1764,17 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Future<void> _closeTrader() async {
     final trader = _trader;
     if (trader == null) return;
+    final warmup = _candleWarmup;
+    if (warmup != null) {
+      try {
+        await warmup;
+      } catch (_) {
+        // _warmCandleHistory publishes the warning itself; shutdown still
+        // proceeds against the verified account.
+      }
+    }
     try {
-      await trader.close();
+      await _closeService(trader);
     } catch (_) {
       // The widget is already being torn down; a failed flush is still
       // fail-closed in TxTradingService and is not replaced with a fake save.
@@ -1677,6 +1785,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _playbackTicker.dispose();
+    _startupTimer?.cancel();
+    _startupStopwatch.stop();
     _seconds.dispose();
     _settling.dispose();
     _settlementPhase.dispose();
@@ -1698,16 +1808,23 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   );
 
   Widget _buildScreen(BuildContext context) {
-    if (_loading) return const Scaffold(body: SafeArea(child: Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('TERMINAL X', style: TextStyle(
-              fontWeight: FontWeight.bold, fontSize: 26, letterSpacing: 4)),
-          SizedBox(height: 20),
-          CircularProgressIndicator(),
-          SizedBox(height: 14),
-          Text('正在后台校验存档并恢复行情…',
-              style: TextStyle(color: Colors.white70)),
-        ]))));
+    if (_loading) return Scaffold(body: SafeArea(child: Center(
+        child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 330),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('TERMINAL X', style: TextStyle(
+                fontWeight: FontWeight.bold, fontSize: 26, letterSpacing: 4)),
+            const SizedBox(height: 20),
+            const CircularProgressIndicator(),
+            const SizedBox(height: 14),
+            Text(_startupStage, textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 12),
+            LinearProgressIndicator(value: _startupProgress, minHeight: 4),
+            const SizedBox(height: 8),
+            Text('冷启动已用 ${_startupTimeLabel()} · 存档校验完成后先进入界面',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white38, fontSize: 11)),
+          ])))));
     if (_trader == null) return Scaffold(appBar: AppBar(
       title: const Text('Terminal X · 存档保护')),
       body: Padding(padding: const EdgeInsets.all(18),
@@ -1736,6 +1853,19 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           pendingOperations: stored.pendingOperations,
           pendingGameMinutes: _trader!.pendingGameMinutes,
           automaticSaveMinutes: _automaticSaveMinutes),
+        if (_historyWarming) Column(children: [
+          LinearProgressIndicator(value: _startupProgress, minHeight: 3),
+          Padding(padding: const EdgeInsets.fromLTRB(10, 4, 10, 2),
+            child: Row(children: [
+              const SizedBox(width: 8, height: 8,
+                child: CircularProgressIndicator(strokeWidth: 1.5)),
+              const SizedBox(width: 7),
+              Expanded(child: Text(
+                '${_startupStage} · 已用 ${_startupTimeLabel()}',
+                maxLines: 1, overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.amberAccent, fontSize: 11))),
+            ])),
+        ]),
         if (_busy) const LinearProgressIndicator(minHeight: 2),
         if (_fault != null) Padding(padding: const EdgeInsets.all(10),
             child: SelectableText(_fault!, style: const TextStyle(color: red))),

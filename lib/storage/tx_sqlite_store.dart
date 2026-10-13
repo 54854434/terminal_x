@@ -162,6 +162,66 @@ Future<_AuditedHead> _restoreHeadOffThread(
     List<_HeadSnapshotRow> rows, int revision) =>
   Isolate.run(() => _replayAndAuditHead(rows, revision));
 
+/// Replays and audits the bounded chart history away from Flutter's frame
+/// isolate. The database query itself already uses Drift's executor, but the
+/// delta decode and repeated TxSession imports used to run synchronously in
+/// the caller after the query completed, which could hold the cold-start
+/// spinner on screen and jank the first usable frame.
+List<TxStoredSession> _replayAndAuditHistory(
+    List<_HeadSnapshotRow> rows, int limit) {
+  if (rows.isEmpty) return <TxStoredSession>[];
+  final ordered = rows.reversed.toList();
+  final targetIndex = ordered.length > limit ? ordered.length - limit : 0;
+  var checkpoint = -1;
+  for (var i = targetIndex; i >= 0; i--) {
+    if (!TxDeltaCodec.isDelta(ordered[i].stored)) {
+      checkpoint = i;
+      break;
+    }
+  }
+  if (checkpoint < 0) throw StateError('Missing historical checkpoint');
+  final verified = <TxStoredSession>[];
+  String? canonical;
+  String? previousHash;
+  int? previousRevision;
+  for (var i = checkpoint; i < ordered.length; i++) {
+    final row = ordered[i];
+    if (TxDeltaCodec.checksum(row.stored) != row.hash) {
+      throw StateError('Corrupted historical SQLite checksum');
+    }
+    if (previousRevision != null && row.revision != previousRevision + 1) {
+      throw StateError('Missing historical SQLite revision');
+    }
+    if (TxDeltaCodec.isDelta(row.stored)) {
+      if (canonical == null || previousHash == null ||
+          previousRevision == null) {
+        throw StateError('Missing historical delta base');
+      }
+      canonical = TxDeltaCodec.replay(
+        previousCanonical: canonical,
+        previousRevision: previousRevision,
+        previousHash: previousHash,
+        stored: row.stored,
+      );
+    } else {
+      canonical = TxDeltaCodec.decodeFull(row.stored);
+    }
+    if (i >= targetIndex) {
+      // TxEngine.importJson performs the complete ledger audit on the worker.
+      final session = TxSession.importJson(canonical!);
+      verified.add(TxStoredSession(
+        session: session, revision: row.revision, sha256: row.hash));
+    }
+    previousRevision = row.revision;
+    previousHash = row.hash;
+  }
+  return verified;
+}
+
+Future<List<TxStoredSession>> _readHistoryOffThread(
+    List<_HeadSnapshotRow> rows, int limit) =>
+  Isolate.run(() => _replayAndAuditHistory(rows, limit));
+
 class TxStoredSession {
   const TxStoredSession({
     required this.session,
@@ -833,54 +893,9 @@ class TxSqliteStore extends GeneratedDatabase {
       Variable.withInt(limit + TxDeltaCodec.maxCheckpointInterval),
     ]).get();
     if (rows.isEmpty) return <TxStoredSession>[];
-    final ordered = rows.reversed.toList();
-    final targetIndex = ordered.length > limit ? ordered.length - limit : 0;
-    var checkpoint = -1;
-    for (var i = targetIndex; i >= 0; i--) {
-      if (!TxDeltaCodec.isDelta(ordered[i].read<String>('payload_json'))) {
-        checkpoint = i;
-        break;
-      }
-    }
-    if (checkpoint < 0) throw StateError('Missing historical checkpoint');
-    final verified = <TxStoredSession>[];
-    String? canonical;
-    String? previousHash;
-    int? previousRevision;
-    for (var i = checkpoint; i < ordered.length; i++) {
-      final row = ordered[i];
-      final revision = row.read<int>('revision');
-      final stored = row.read<String>('payload_json');
-      final hash = row.read<String>('sha256');
-      if (TxDeltaCodec.checksum(stored) != hash) {
-        throw StateError('Corrupted historical SQLite checksum');
-      }
-      if (previousRevision != null && revision != previousRevision + 1) {
-        throw StateError('Missing historical SQLite revision');
-      }
-      if (TxDeltaCodec.isDelta(stored)) {
-        if (canonical == null || previousHash == null ||
-            previousRevision == null) {
-          throw StateError('Missing historical delta base');
-        }
-        canonical = TxDeltaCodec.replay(
-          previousCanonical: canonical,
-          previousRevision: previousRevision,
-          previousHash: previousHash,
-          stored: stored,
-        );
-      } else {
-        canonical = TxDeltaCodec.decodeFull(stored);
-      }
-      if (i >= targetIndex) {
-        // TxEngine.importJson already performs the complete ledger audit.
-        final session = TxSession.importJson(canonical!);
-        verified.add(TxStoredSession(
-          session: session, revision: revision, sha256: hash));
-      }
-      previousRevision = revision;
-      previousHash = hash;
-    }
-    return verified;
+    final plain = rows.map((row) => _HeadSnapshotRow(
+      row.read<int>('revision'), row.read<String>('payload_json'),
+      row.read<String>('sha256'))).toList(growable: false);
+    return _readHistoryOffThread(plain, limit);
   }
 }
