@@ -7,10 +7,12 @@ import 'tx_terminal_theme.dart';
 /// The parent must still show its existing revision-locked confirm dialog.
 class TxTicketSubmitBar extends StatelessWidget {
   const TxTicketSubmitBar({super.key, required this.side,
-      required this.isLimit, required this.enabled, required this.onReview});
+      required this.isLimit, this.timeInForce = TxTimeInForce.gtc,
+      required this.enabled, required this.onReview});
 
   final TxSide side;
   final bool isLimit;
+  final TxTimeInForce timeInForce;
   final bool enabled;
   final VoidCallback onReview;
 
@@ -29,7 +31,7 @@ class TxTicketSubmitBar extends StatelessWidget {
             const SizedBox(width: 5),
             const Expanded(child: Text('模拟交易 · 点击后仍需核对确认',
               style: TextStyle(fontSize: 11, color: Colors.white60))),
-            Text(isLimit ? '限价' : '市价',
+            Text(isLimit ? '限价 · ${timeInForce.label}' : '市价',
               style: const TextStyle(fontSize: 11, color: Colors.white70)),
           ]),
           const SizedBox(height: 6),
