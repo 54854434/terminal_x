@@ -35,7 +35,8 @@ class TxNpcMarket {
     // The active-only index avoids scanning years of archived NPC orders.
     // Preserve the original global sequence order for deterministic ledgers.
     final pending = engine.activeOrders.where((o) =>
-        isNpc(o.ownerId) && o.kind == TxKind.limit).toList()
+        isNpc(o.ownerId) && o.kind == TxKind.limit &&
+        o.timeInForce.canRest).toList()
       ..sort((a, b) => a.sequence.compareTo(b.sequence));
     for (final order in pending) {
       engine.cancel(order.id, ownerId: order.ownerId);
@@ -100,8 +101,10 @@ class TxNpcMarket {
         side == TxSide.buy ? TxSide.sell : TxSide.buy, levels: 8);
     if (opposing.isEmpty) return;
     final visibleQty = opposing.fold<int>(0, (sum, level) => sum + level.quantity);
-    // A market order's liquidity impact is bounded by visible funded depth;
-    // for buys use the WORST sampled ask as a conservative cash limit.
+    // Aggressive NPCs use price-protected IOC limits. They can take visible
+    // liquidity and suffer partial fills, but cannot silently sweep an
+    // unbounded price tail. This gives trend/value/flow agents different
+    // execution behaviour while keeping every fill funded and auditable.
     final baseline = index == 0 ? 18 : 8;
     final randomness = index == 0 ? 120 : 40;
     var desired = baseline + _mix(minute, index, salt) % randomness;
@@ -113,18 +116,30 @@ class TxNpcMarket {
       desired = _max(1, desired - _min(25, movement.abs()));
     }
     var quantity = _min(desired, visibleQty);
+    final best = opposing.first.priceCents;
+    final worst = opposing.last.priceCents;
+    final protection = switch (agent) {
+      'NPC_TREND' => _min(8, 1 + movement.abs() ~/ 3),
+      'NPC_VALUE' => 0,
+      _ => 2,
+    };
+    final protectedPrice = agent == 'NPC_VALUE'
+        ? best
+        : side == TxSide.buy
+            ? _min(TxEngine.maxPriceCents, worst + protection)
+            : _max(1, worst - protection);
     if (side == TxSide.sell) {
       quantity = _min(quantity, account.availableSharesOf(symbol));
     } else {
-      final worstAsk = opposing.last.priceCents;
-      if (worstAsk <= 0) return;
-      quantity = _min(quantity, account.availableCashCents ~/ worstAsk);
+      if (protectedPrice <= 0) return;
+      quantity = _min(quantity, account.availableCashCents ~/ protectedPrice);
     }
     if (quantity <= 0) return;
     engine.place(
       id: 'NPC-M-$minute-$index-$salt', ownerId: agent,
-      symbol: symbol, side: side, kind: TxKind.market,
-      quantity: quantity,
+      symbol: symbol, side: side, kind: TxKind.limit,
+      quantity: quantity, limitPriceCents: protectedPrice,
+      timeInForce: TxTimeInForce.ioc,
     );
   }
 

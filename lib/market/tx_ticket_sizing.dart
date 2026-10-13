@@ -49,6 +49,7 @@ class TxTicketReview {
     required this.limited,
     required this.quantityText,
     required this.priceText,
+    this.timeInForce = TxTimeInForce.gtc,
   });
 
   final int revision;
@@ -57,6 +58,7 @@ class TxTicketReview {
   final bool limited;
   final String quantityText;
   final String priceText;
+  final TxTimeInForce timeInForce;
 
   bool isStillCurrent({
     required int revision,
@@ -65,9 +67,11 @@ class TxTicketReview {
     required bool limited,
     required String quantityText,
     required String priceText,
+    TxTimeInForce timeInForce = TxTimeInForce.gtc,
   }) =>
       revision == this.revision && symbol == this.symbol &&
       side == this.side && limited == this.limited &&
+      timeInForce == this.timeInForce &&
       quantityText == this.quantityText &&
       (!limited || priceText == this.priceText);
 }

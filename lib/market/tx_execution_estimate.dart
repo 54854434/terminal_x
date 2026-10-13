@@ -50,6 +50,7 @@ class TxExecutionEstimate {
     final sellers = side == TxSide.buy;
     final makers = engine.orders.values.where((o) =>
         o.symbol == symbol && o.side != side && o.kind == TxKind.limit &&
+        o.timeInForce.canRest &&
         o.remaining > 0 &&
         (o.status == TxStatus.open ||
             o.status == TxStatus.partiallyFilled)).toList()
