@@ -1,4 +1,4 @@
-/// Terminal X 0.3.4 unified trading interface and position analytics.
+/// Terminal X 0.3.5 unified trading interface and position analytics.
 /// Existing V0.2 + V0.1 apps and backups are never accessed.
 import 'dart:async';
 import 'dart:io';
@@ -40,6 +40,7 @@ import 'widgets/tx_market_hero.dart';
 import 'widgets/tx_terminal_status.dart';
 import 'widgets/tx_market_radar.dart';
 import 'widgets/tx_back_exit_guard.dart';
+import 'widgets/tx_settings_page.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -68,7 +69,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const green = TxTerminalColors.buy;
   static const red = TxTerminalColors.sell;
-  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.4');
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.5');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
@@ -102,6 +103,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   bool _loading = true;
   bool _historyWarming = false;
   bool _limit = false;
+  TxTimeInForce _timeInForce = TxTimeInForce.gtc;
   TxSide _ticketSide = TxSide.buy;
   int _recordMode = 0;
   int _marketTapeRequested = TxMarketTapeWindow.pageSize;
@@ -541,7 +543,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       final order = await service.place(
         symbol: _symbolName, side: side,
         kind: _limit ? TxKind.limit : TxKind.market,
-        quantity: n, limitPriceCents: limitPrice);
+        quantity: n, limitPriceCents: limitPrice,
+        timeInForce: _limit ? _timeInForce : TxTimeInForce.gtc);
       return '${order.id} · 成交${order.filled}股，余量${order.remaining}股'
           ' · ${order.status.name}';
     });
@@ -1084,9 +1087,21 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   // The compact, tap-to-fill order book is read from verified resting bids
-  // and asks. No synthetic quote enters an actual limit ticket.
+  // and asks. No synthetic quote enters an actual limit ticket. The small
+  // BBO/spread/imbalance strip makes the market microstructure visible before
+  // a player chooses a price, while keeping the actual matching engine as the
+  // only source of fills.
   Widget _tradeQuickDepth(List<TxBookLevel> bids,
       List<TxBookLevel> asks) {
+    final insight = TxOrderBookInsight.fromLevels(bids: bids, asks: asks);
+    final maxQty = [...bids.map((level) => level.quantity),
+        ...asks.map((level) => level.quantity), 1]
+      .reduce((a, b) => a > b ? a : b);
+    final bidFraction = insight.bidShareFraction;
+    String best(int? cents) => cents == null ? '—' : '¥${money(cents)}';
+    final spread = insight.spreadCents == null
+        ? '—'
+        : '¥${money(insight.spreadCents!)}';
     Widget column(String title, List<TxBookLevel> levels, Color tint) =>
       Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1098,17 +1113,25 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           for (final level in levels.take(5)) InkWell(
             onTap: !_ready ? null : () => setState(() {
               _limit = true;
+              _ticketSide = tint == green ? TxSide.sell : TxSide.buy;
+              _timeInForce = TxTimeInForce.gtc;
               _price.text = money(level.priceCents);
             }),
-            child: Padding(padding: const EdgeInsets.symmetric(vertical: 6),
-              child: Row(children: [
-                Expanded(child: Text('¥${money(level.priceCents)}',
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: tint, fontSize: 11))),
-                Text('${level.quantity}',
-                    style: const TextStyle(fontSize: 11,
-                        color: Colors.white70)),
-              ])),
+            child: SizedBox(height: 28, child: Stack(children: [
+              Align(alignment: Alignment.centerLeft,
+                child: FractionallySizedBox(
+                  widthFactor: level.quantity / maxQty,
+                  child: Container(height: 22, color: tint.withAlpha(30)))),
+              Padding(padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(children: [
+                  Expanded(child: Text('¥${money(level.priceCents)}',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: tint, fontSize: 11))),
+                  Text('${level.quantity}',
+                      style: const TextStyle(fontSize: 11,
+                          color: Colors.white70)),
+                ])),
+            ])),
           ),
         ]));
     return Card(child: Padding(
@@ -1117,10 +1140,28 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         const Text('快捷盘口 · 点击价格填入限价',
             style: TextStyle(fontWeight: FontWeight.w600)),
         const SizedBox(height: 9),
+        Wrap(spacing: 12, runSpacing: 4, children: [
+          Text('买一 ${best(insight.bestBidCents)}',
+              style: const TextStyle(color: green, fontSize: 11)),
+          Text('卖一 ${best(insight.bestAskCents)}',
+              style: const TextStyle(color: red, fontSize: 11)),
+          Text('价差 $spread',
+              style: const TextStyle(color: Colors.white70, fontSize: 11)),
+        ]),
+        if (bidFraction != null) ...[
+          const SizedBox(height: 6),
+          LinearProgressIndicator(value: bidFraction, minHeight: 4,
+              backgroundColor: red,
+              valueColor: const AlwaysStoppedAnimation<Color>(green)),
+          Text('可见五档买盘占比 ${(bidFraction * 100).toStringAsFixed(1)}%'
+              ' · 只表示当前挂单量，不是涨跌预测',
+              style: const TextStyle(color: Colors.white54, fontSize: 10)),
+        ],
+        const SizedBox(height: 5),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          column('买盘 Bids', bids, green),
+          column('买盘 Bids · 点击卖出', bids, green),
           const SizedBox(width: 14),
-          column('卖盘 Asks', asks, red),
+          column('卖盘 Asks · 点击买入', asks, red),
         ]),
         const Text('可见委托簿快照，非实时互联网行情。',
             style: TextStyle(fontSize: 10, color: Colors.white54)),
@@ -1151,7 +1192,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final side = _ticketSide;
     final review = TxTicketReview(revision: revision, symbol: symbol,
         side: side, limited: limited, quantityText: quantityText,
-        priceText: priceText);
+        priceText: priceText, timeInForce: _timeInForce);
     final best = _trader!.current.session.engine.depth(symbol,
         side == TxSide.buy ? TxSide.sell : TxSide.buy);
     final referencePrice = limitPrice ??
@@ -1162,7 +1203,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       title: Text('确认${side == TxSide.buy ? '买入' : '卖出'} · $symbol'),
       content: Column(mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(limited ? '委托类型：限价单' : '委托类型：市价单'),
+          Text(limited
+              ? '委托类型：限价单 · ${_timeInForce.label}'
+              : '委托类型：市价单'),
           Text('委托数量：$quantity 股'),
           Text(limited ? '限价：¥${money(limitPrice!)}'
               : '参考盘口价格：${referencePrice == null ? '暂无对手盘' : '¥${money(referencePrice)}'}'),
@@ -1170,7 +1213,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           Text('存档修订：r$revision'),
           const SizedBox(height: 8),
           const Text('模拟交易：市价单可能跨档滑点或无法全部成交；'
-              '限价单可能挂单并冻结资金／持仓。参考价格不是最终成交承诺。',
+              'Post Only 只做 Maker，IOC 允许部分成交后撤销，FOK 深度不足时整单取消；'
+              '参考价格不是最终成交承诺。',
               style: TextStyle(color: Colors.white70, fontSize: 12)),
           const Text('确认前行情已暂停；此时尚未提交订单。',
               style: TextStyle(color: Colors.white54, fontSize: 11)),
@@ -1184,7 +1228,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           if (!_ready || !review.isStillCurrent(
               revision: _trader!.current.revision, symbol: _symbolName,
               side: _ticketSide, limited: _limit,
-              quantityText: _qty.text.trim(), priceText: _price.text.trim())) {
+              quantityText: _qty.text.trim(), priceText: _price.text.trim(),
+              timeInForce: _timeInForce)) {
             setState(() => _notice = '存档修订或下单参数已变化；请重新检查，不执行旧委托');
             return;
           }
@@ -1204,7 +1249,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     // instead of covering the Android keyboard.
     final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
     Widget reviewButton() => TxTicketSubmitBar(side: _ticketSide,
-        isLimit: _limit, enabled: _ready, onReview: _confirmTicket);
+        isLimit: _limit, timeInForce: _timeInForce,
+        enabled: _ready, onReview: _confirmTicket);
     return Column(children: [
       Expanded(child: ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
@@ -1237,7 +1283,37 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                 icon: Icon(Icons.tune)),
           ], selected: {_limit},
           onSelectionChanged: !_ready ? null :
-              (values) => setState(() => _limit = values.first))),
+              (values) => setState(() {
+                _limit = values.first;
+                if (!_limit) _timeInForce = TxTimeInForce.gtc;
+              }))),
+        if (_limit) ...[
+          const SizedBox(height: 8),
+          const Align(alignment: Alignment.centerLeft,
+              child: Text('限价生效方式', style: TextStyle(color: Colors.white70))),
+          const SizedBox(height: 5),
+          SingleChildScrollView(scrollDirection: Axis.horizontal,
+            child: SegmentedButton<TxTimeInForce>(
+              segments: const [
+                ButtonSegment(value: TxTimeInForce.gtc, label: Text('GTC')),
+                ButtonSegment(value: TxTimeInForce.postOnly,
+                    label: Text('Post Only')),
+                ButtonSegment(value: TxTimeInForce.ioc, label: Text('IOC')),
+                ButtonSegment(value: TxTimeInForce.fok, label: Text('FOK')),
+              ],
+              selected: {_timeInForce},
+              onSelectionChanged: !_ready ? null :
+                  (values) => setState(() => _timeInForce = values.first))),
+          const SizedBox(height: 4),
+          Text(
+            switch (_timeInForce) {
+              TxTimeInForce.gtc => '普通限价：成交后剩余挂在订单簿中，直到成交或撤单。',
+              TxTimeInForce.postOnly => '只做 Maker：若会立即吃掉对手盘，则整单拒绝。',
+              TxTimeInForce.ioc => '立即成交或取消：允许部分成交，剩余立即取消。',
+              TxTimeInForce.fok => '全部成交或取消：深度不足时不产生任何成交。',
+            },
+            style: const TextStyle(fontSize: 11, color: Colors.white60)),
+        ],
         if (_limit) Wrap(spacing: 6, children: [
           ActionChip(label: const Text('卖一价'),
             onPressed: ask.isEmpty || !_ready ? null : () =>
@@ -1317,7 +1393,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         children: [for (final order in active) ListTile(
           title: Text('${order.symbol} · ${order.side==TxSide.buy?'买':'卖'} '
               '${order.remaining}/${order.quantity}股'),
-          subtitle: Text('${order.id} · ¥${money(order.limitPriceCents!)}'),
+          subtitle: Text('${order.id} · ${order.timeInForce.label} · '
+              '¥${money(order.limitPriceCents!)}'),
           trailing: IconButton(tooltip: '撤单',
             icon: const Icon(Icons.close),
             onPressed: _ready ? () => _cancel(order.id) : null),
@@ -1585,6 +1662,55 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         ],
       ))),
     ]);
+  }
+
+  Widget _settings(TxStoredSession saved) {
+    final footprint = _storageFootprint;
+    final measuredSpeed = _committedSpeed.sampleCount < 2
+        ? '等待样本'
+        : '${_committedSpeed.achievedMultiplier.toStringAsFixed(1)}×';
+    final storageSummary = footprint == null
+        ? null
+        : 'SQLite ${footprint.databaseMiB.toStringAsFixed(2)} MiB · '
+            '${footprint.snapshotCount} 份快照 · 最近 '
+            '${footprint.latestSnapshotKiB.toStringAsFixed(1)} KiB';
+    return TxSettingsPage(
+      appVersion: appVersion,
+      rustStatus: _rustStatus,
+      ready: _ready,
+      running: _auto,
+      speed: _speed,
+      actualMultiplier: measuredSpeed,
+      pulseSeconds: _flow.pulseSeconds,
+      automaticSaveMinutes: _automaticSaveMinutes,
+      automaticSaveDraft: _automaticSaveDraft,
+      checkpointInterval: _checkpointInterval,
+      checkpointDraft: _checkpointDraft,
+      currentRevision: saved.revision,
+      pendingSave: saved.pending,
+      pendingOperations: saved.pendingOperations,
+      pendingGameMinutes: _trader!.pendingGameMinutes,
+      storageSummary: storageSummary,
+      onToggle: (_auto || _ready) ? _toggle : null,
+      onManualTick: _ready ? () => _tick() : null,
+      onCustomSpeed: _ready ? _showCustomSpeed : null,
+      onSpeedPreset: _ready ? _changeSpeed : null,
+      onSpeedDelta: _ready ? (delta) => _changeSpeed(_speed + delta) : null,
+      onPulsePreset: _ready && !_flow.awaitingCommit
+          ? _changeMarketPulseSeconds : null,
+      onCustomPulse: _ready && !_flow.awaitingCommit
+          ? _showCustomMarketPulse : null,
+      onAutomaticSaveDraftChanged: _ready
+          ? (value) => setState(() => _automaticSaveDraft = value) : null,
+      onSaveAutomaticSave: _ready &&
+              _automaticSaveDraft != _automaticSaveMinutes
+          ? _saveAutomaticSaveMinutes : null,
+      onCheckpointDraftChanged: _ready
+          ? (value) => setState(() => _checkpointDraft = value) : null,
+      onSaveCheckpoint: _ready && _checkpointDraft != _checkpointInterval
+          ? _saveCheckpointInterval : null,
+      onInspectStorage: _ready ? _inspectStorage : null,
+    );
   }
 
   String _participantLabel(String accountId) {
@@ -1876,7 +2002,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           0 => _market(session),
           1 => _trading(session),
           2 => _assets(session, stored),
-          _ => _records(session),
+          3 => _records(session),
+          _ => _settings(stored),
         }),
       ]),
       // The system keyboard takes priority over bottom navigation.
@@ -1888,6 +2015,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           NavigationDestination(icon: Icon(Icons.swap_horiz), label: '交易'),
           NavigationDestination(icon: Icon(Icons.account_balance_wallet), label: '资产'),
           NavigationDestination(icon: Icon(Icons.receipt_long), label: '记录'),
+          NavigationDestination(icon: Icon(Icons.settings_outlined), label: '设置'),
         ]),
     );
   }
