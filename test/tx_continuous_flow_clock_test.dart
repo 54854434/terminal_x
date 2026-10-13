@@ -121,6 +121,21 @@ void main() {
         .needsMinuteCommit, isFalse);
   });
 
+  test('audited storage recovery rebases the provisional clock safely', () {
+    final clock = TxContinuousFlowClock(speed: 600)..resume();
+    expect(clock.advance(const Duration(milliseconds: 100))
+        .needsMinuteCommit, isTrue);
+    clock.storageFailed();
+    expect(() => clock.resume(), throwsStateError);
+    clock.recoverAfterStorageAudit();
+    expect(clock.faulted, isFalse);
+    expect(clock.running, isFalse);
+    expect(clock.second, 0);
+    clock.resume();
+    expect(clock.advance(const Duration(milliseconds: 1)).second,
+        inInclusiveRange(0, 1));
+  });
+
   test('unresolved SQLite minute blocks premature resume and speed change', () {
     final clock = TxContinuousFlowClock(speed: 100)..resume();
     expect(clock.advance(const Duration(milliseconds: 600))
