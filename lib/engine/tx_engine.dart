@@ -18,6 +18,7 @@ class TxAccount {
         _shares = Map<String, int>.from(openingShares);
 
   final String id;
+  int _deltaIndex = -1; // volatile and omitted from exportJson
   final int _openingCashCents;
   final Map<String, int> _openingShares;
   int _cashCents;
@@ -74,6 +75,7 @@ class TxOrder {
   }) : quantity = quantity, _remaining = quantity;
 
   final String id;
+  int _deltaIndex = -1; // volatile and omitted from exportJson
   final String ownerId;
   final String symbol;
   final TxSide side;
@@ -212,15 +214,181 @@ class TxEngine {
 
   final Map<String, TxAccount> _accounts = {};
   final Map<String, TxOrder> _orders = {};
+  // Volatile inverted index: only resting limit orders. Never serialized.
+  // Historical filled/cancelled/rejected orders remain in _orders for audit,
+  // but no longer participate in every new order's price-time search.
+  final Map<String, Map<TxSide, Set<TxOrder>>> _resting = {};
   final List<TxFill> _fills = [];
   final List<TxLedgerEntry> _ledger = [];
   int _nextOrderSequence = 1;
   int _nextFillSequence = 1;
 
+  // Volatile trust stamp: only a SUCCESSFUL full audit of this exact typed
+  // object graph authorizes skipping the redundant persistence-side audit.
+  // Never exported as JSON or treated as a substitute for SQLite checksums.
+  int _economicMutationSerial = 0;
+  int _lastAuditedSerial = -1;
+  int _fullAuditCount = 0;
+  int get fullInvariantAudits => _fullAuditCount;
+
+  void _markEconomicMutation() => _economicMutationSerial++;
+
+  void verifyBeforeCommit() {
+    if (_lastAuditedSerial != _economicMutationSerial) {
+      checkInvariants();
+    }
+  }
+
+  // Performance-only change journal. These hints are never persisted and are
+  // never trusted without a full ledger audit and replay equivalence check.
+  // Begin tracking after importing a committed snapshot; fresh/legacy sessions
+  // without a known base automatically use the old exact-diff fallback.
+  bool _insideMinuteBatch = false;
+
+  /// Internal NPC order ops are a single unpublished candidate until final
+  /// invariant audit; standalone player orders still validate immediately.
+  void runCheckedMinute(void Function() work) {
+    if (_insideMinuteBatch) throw StateError('Nested market minute');
+    _insideMinuteBatch = true;
+    try {
+      work();
+    } finally {
+      _insideMinuteBatch = false;
+    }
+    checkInvariants();
+  }
+
+  void _checkAfterOrderMutation() {
+    if (!_insideMinuteBatch) checkInvariants();
+  }
+
+  int? _baseAccountCount;
+  int? _baseOrderCount;
+  int? _baseFillCount;
+  int? _baseLedgerCount;
+  final Map<int, TxAccount> _dirtyAccounts = {};
+  final Map<int, TxOrder> _dirtyOrders = {};
+  final List<TxAccount> _addedAccounts = [];
+  final List<TxOrder> _addedOrders = [];
+
+  /// Reset volatile differential cursors only after the durable SQL revision
+  /// commits. Does not modify a cent, order, trade or account.
+  void acknowledgeCommittedSnapshot() => _startDeltaJournal();
+
+  void _startDeltaJournal() {
+    _baseAccountCount = _accounts.length;
+    _baseOrderCount = _orders.length;
+    _baseFillCount = _fills.length;
+    _baseLedgerCount = _ledger.length;
+    _dirtyAccounts.clear();
+    _dirtyOrders.clear();
+    _addedAccounts.clear();
+    _addedOrders.clear();
+  }
+
+  void _markAccount(TxAccount account) {
+    _markEconomicMutation();
+    final base = _baseAccountCount;
+    if (base == null) return;
+    final index = account._deltaIndex;
+    if (index < 0) throw StateError('Unindexed account mutation');
+    if (index < base) _dirtyAccounts[index] = account;
+  }
+
+  void _markOrder(TxOrder order) {
+    _markEconomicMutation();
+    final base = _baseOrderCount;
+    if (base == null) return;
+    final index = order._deltaIndex;
+    if (index < 0) throw StateError('Unindexed order mutation');
+    if (index < base) _dirtyOrders[index] = order;
+  }
+
+  /// O(changed records), independent of the number of historical orders and
+  /// ledger entries. A worker still validates the whole candidate and proves
+  /// that replaying this patch reproduces the exact committed snapshot.
+  Map<String, dynamic>? snapshotDeltaLists() {
+    final accountsBase = _baseAccountCount;
+    final ordersBase = _baseOrderCount;
+    final fillsBase = _baseFillCount;
+    final ledgerBase = _baseLedgerCount;
+    if (accountsBase == null || ordersBase == null ||
+        fillsBase == null || ledgerBase == null) return null;
+    if (_accounts.length != accountsBase + _addedAccounts.length ||
+        _orders.length != ordersBase + _addedOrders.length ||
+        _fills.length < fillsBase || _ledger.length < ledgerBase) {
+      throw StateError('Incremental journal count inconsistency');
+    }
+    return <String, dynamic>{
+      'accounts': <String, dynamic>{
+        'oldLength': accountsBase,
+        'updates': _dirtyAccounts.entries.map((e) =>
+            <dynamic>[e.key, e.value.toJson()]).toList(),
+        'append': _addedAccounts.map((e) => e.toJson()).toList(),
+      },
+      'orders': <String, dynamic>{
+        'oldLength': ordersBase,
+        'updates': _dirtyOrders.entries.map((e) =>
+            <dynamic>[e.key, e.value.toJson()]).toList(),
+        'append': _addedOrders.map((e) => e.toJson()).toList(),
+      },
+      'fills': <String, dynamic>{
+        'oldLength': fillsBase,
+        'updates': <dynamic>[],
+        'append': _fills.sublist(fillsBase).map((e) => e.toJson()).toList(),
+      },
+      'ledger': <String, dynamic>{
+        'oldLength': ledgerBase,
+        'updates': <dynamic>[],
+        'append': _ledger.sublist(ledgerBase).map((e) => e.toJson()).toList(),
+      },
+    };
+  }
+
+  Map<String, dynamic> snapshotHeader() => <String, dynamic>{
+    'version': snapshotVersion,
+    'nextOrderSequence': _nextOrderSequence,
+    'nextFillSequence': _nextFillSequence,
+  };
+
   Map<String, TxAccount> get accounts => Map.unmodifiable(_accounts);
   Map<String, TxOrder> get orders => Map.unmodifiable(_orders);
   List<TxFill> get fills => List.unmodifiable(_fills);
+  /// Allocation-free read cursor for already committed fill history.
+  /// Returned fills are immutable; callers must still verify revisions.
+  int get fillCount => _fills.length;
+  TxFill fillAt(int index) => _fills[index];
   List<TxLedgerEntry> get ledger => List.unmodifiable(_ledger);
+
+  /// Unallocated view of current executable limit orders. Treat as read-only.
+  /// The generator allows NPC minute rollovers to avoid scanning old fills.
+  Iterable<TxOrder> get activeOrders sync* {
+    for (final sideBooks in _resting.values) {
+      for (final book in sideBooks.values) {
+        yield* book;
+      }
+    }
+  }
+
+  Set<TxOrder> _restingSide(String symbol, TxSide side) =>
+      _resting.putIfAbsent(symbol, () => <TxSide, Set<TxOrder>>{})
+          .putIfAbsent(side, () => <TxOrder>{});
+
+  void _refreshRestingIndex(TxOrder order) {
+    final active = order.kind == TxKind.limit && order.remaining > 0 &&
+        (order.status == TxStatus.open ||
+         order.status == TxStatus.partiallyFilled);
+    final sideBooks = _resting[order.symbol];
+    final set = sideBooks?[order.side];
+    if (active) {
+      _restingSide(order.symbol, order.side).add(order);
+    } else if (set != null) {
+      set.remove(order);
+      if (set.isEmpty) sideBooks!.remove(order.side);
+      if (sideBooks!.isEmpty) _resting.remove(order.symbol);
+    }
+  }
+
   TxAccount account(String id) => _accounts[id] ?? (throw StateError('Unknown account: $id'));
   TxOrder order(String id) => _orders[id] ?? (throw StateError('Unknown order: $id'));
 
@@ -234,8 +402,12 @@ class TxEngine {
         shares.values.any((q) => q < 0 || q > maxQuantity)) {
       throw ArgumentError('Invalid initial account assets');
     }
-    _accounts[id] = TxAccount._(id, cashCents, shares);
-    checkInvariants();
+    final account = TxAccount._(id, cashCents, shares);
+    account._deltaIndex = _accounts.length;
+    _accounts[id] = account;
+    _markEconomicMutation();
+    if (_baseAccountCount != null) _addedAccounts.add(account);
+    _checkAfterOrderMutation();
   }
 
   TxOrder place({
@@ -268,7 +440,10 @@ class TxEngine {
       limitPriceCents: limitPriceCents,
       sequence: _nextOrderSequence++,
     );
+    incoming._deltaIndex = _orders.length;
     _orders[id] = incoming;
+    _markEconomicMutation();
+    if (_baseOrderCount != null) _addedOrders.add(incoming);
 
     String? invalid;
     if (ownerId.trim().isEmpty || !_accounts.containsKey(ownerId)) {
@@ -313,6 +488,7 @@ class TxEngine {
       }
       if (kind == TxKind.limit) {
         owner._reservedCashCents += requiredCash;
+        _markAccount(owner);
         _ledger.add(TxLedgerEntry(
             accountId: ownerId, symbol: symbol, reason: 'reserve_buy',
             reservedCashDeltaCents: requiredCash));
@@ -323,6 +499,7 @@ class TxEngine {
       }
       if (kind == TxKind.limit) {
         owner._reservedShares[symbol] = owner.reservedSharesOf(symbol) + quantity;
+        _markAccount(owner);
         _ledger.add(TxLedgerEntry(
             accountId: ownerId, symbol: symbol, reason: 'reserve_sell',
             reservedShareDelta: quantity));
@@ -340,14 +517,15 @@ class TxEngine {
     } else {
       _refreshStatus(incoming);
     }
-    checkInvariants();
+    _checkAfterOrderMutation();
     return incoming;
   }
 
   TxOrder _reject(TxOrder order, String reason) {
     order._status = TxStatus.rejected;
     order._rejectReason = reason;
-    checkInvariants();
+    _markOrder(order);
+    _checkAfterOrderMutation();
     return order;
   }
 
@@ -364,28 +542,32 @@ class TxEngine {
     if (o.side == TxSide.buy) {
       final release = o.remaining * o.limitPriceCents!;
       a._reservedCashCents -= release;
+      _markAccount(a);
       _ledger.add(TxLedgerEntry(
           accountId: ownerId, symbol: o.symbol, reason: 'cancel_buy',
           reservedCashDeltaCents: -release));
     } else {
       a._reservedShares[o.symbol] = a.reservedSharesOf(o.symbol) - o.remaining;
+      _markAccount(a);
       _ledger.add(TxLedgerEntry(
           accountId: ownerId, symbol: o.symbol, reason: 'cancel_sell',
           reservedShareDelta: -o.remaining));
     }
     o._status = TxStatus.cancelled;
-    checkInvariants();
+    _markOrder(o);
+    _refreshRestingIndex(o);
+    _checkAfterOrderMutation();
     return o;
   }
 
   List<TxOrder> _counterparties(TxOrder incoming) {
-    final list = _orders.values.where((o) {
-      if (o.id == incoming.id || o.symbol != incoming.symbol ||
-          o.side == incoming.side || o.kind != TxKind.limit ||
-          o.remaining <= 0 ||
-          (o.status != TxStatus.open && o.status != TxStatus.partiallyFilled)) {
-        return false;
-      }
+    // O(active opposing orders), not O(all historical orders). The index
+    // contains only funded, resting limit orders and is reconstructed on load.
+    // Retain original maker-price/FIFO sorting and self-trade preflight.
+    final opposite = incoming.side == TxSide.buy ? TxSide.sell : TxSide.buy;
+    final candidates = _resting[incoming.symbol]?[opposite];
+    if (candidates == null || candidates.isEmpty) return <TxOrder>[];
+    final list = candidates.where((o) {
       if (incoming.kind == TxKind.market) return true;
       return incoming.side == TxSide.buy
           ? o.limitPriceCents! <= incoming.limitPriceCents!
@@ -417,6 +599,8 @@ class TxEngine {
     final sellerRelease = sellerOrder.kind == TxKind.limit ? quantity : 0;
     final fillId = 'F${_nextFillSequence++}';
 
+    _markAccount(buyer);
+    _markAccount(seller);
     buyer._cashCents -= value;
     buyer._reservedCashCents -= buyerRelease;
     buyer._shares[taker.symbol] = buyer.sharesOf(taker.symbol) + quantity;
@@ -444,6 +628,7 @@ class TxEngine {
   }
 
   void _refreshStatus(TxOrder order) {
+    _markOrder(order);
     if (order.remaining == 0) {
       order._status = TxStatus.filled;
     } else if (order.filled > 0) {
@@ -451,18 +636,14 @@ class TxEngine {
     } else {
       order._status = TxStatus.open;
     }
+    _refreshRestingIndex(order);
   }
 
   /// True resting liquidity only: never fabricates or replenishes quotes.
   List<TxBookLevel> depth(String symbol, TxSide side, {int levels = 5}) {
     if (levels < 0) throw ArgumentError('levels must be nonnegative');
     final byPrice = <int, List<int>>{};
-    for (final o in _orders.values) {
-      if (o.symbol != symbol || o.side != side || o.kind != TxKind.limit ||
-          o.remaining <= 0 ||
-          (o.status != TxStatus.open && o.status != TxStatus.partiallyFilled)) {
-        continue;
-      }
+    for (final o in _resting[symbol]?[side] ?? const <TxOrder>{}) {
       final cell = byPrice.putIfAbsent(o.limitPriceCents!, () => [0, 0]);
       cell[0] += o.remaining;
       cell[1] += 1;
@@ -476,9 +657,7 @@ class TxEngine {
   /// Snapshot is an application integration point, not an atomic disk write.
   /// Save it under a NEW key; do not overwrite legacy shared_preferences data.
   String exportJson() => jsonEncode({
-        'version': snapshotVersion,
-        'nextOrderSequence': _nextOrderSequence,
-        'nextFillSequence': _nextFillSequence,
+        ...snapshotHeader(),
         'accounts': _accounts.values.map((e) => e.toJson()).toList(),
         'orders': _orders.values.map((e) => e.toJson()).toList(),
         'fills': _fills.map((e) => e.toJson()).toList(),
@@ -496,18 +675,22 @@ class TxEngine {
     for (final v in data['accounts'] as List) {
       final a = TxAccount.fromJson(Map<String, dynamic>.from(v as Map));
       if (engine._accounts.containsKey(a.id)) throw FormatException('Duplicate account');
+      a._deltaIndex = engine._accounts.length;
       engine._accounts[a.id] = a;
     }
     for (final v in data['orders'] as List) {
       final o = TxOrder.fromJson(Map<String, dynamic>.from(v as Map));
       if (engine._orders.containsKey(o.id)) throw FormatException('Duplicate order');
+      o._deltaIndex = engine._orders.length;
       engine._orders[o.id] = o;
+      engine._refreshRestingIndex(o);
     }
     engine._fills.addAll((data['fills'] as List).map(
         (v) => TxFill.fromJson(Map<String, dynamic>.from(v as Map))));
     engine._ledger.addAll((data['ledger'] as List).map(
         (v) => TxLedgerEntry.fromJson(Map<String, dynamic>.from(v as Map))));
     engine.checkInvariants();
+    engine._startDeltaJournal();
     return engine;
   }
 
@@ -516,6 +699,7 @@ class TxEngine {
     final expectedCashReserve = <String, int>{};
     final expectedShareReserve = <String, Map<String, int>>{};
     var maxOrderSeq = 0;
+    var activeOrderCount = 0;
     final orderSequences = <int>{};
     for (final o in _orders.values) {
       if (o.sequence <= 0 || !orderSequences.add(o.sequence) ||
@@ -536,7 +720,16 @@ class TxEngine {
           (o.status == TxStatus.rejected && o.remaining != o.quantity)) {
         throw StateError('Inconsistent order status');
       }
-      if (!active) continue;
+      if (!active) {
+        if (_resting[o.symbol]?[o.side]?.contains(o) == true) {
+          throw StateError('Inactive order leaked into resting index');
+        }
+        continue;
+      }
+      activeOrderCount++;
+      if (_resting[o.symbol]?[o.side]?.contains(o) != true) {
+        throw StateError('Resting index omitted active order');
+      }
       if (o.side == TxSide.buy) {
         expectedCashReserve[o.ownerId] =
             (expectedCashReserve[o.ownerId] ?? 0) + o.remaining * o.limitPriceCents!;
@@ -545,6 +738,20 @@ class TxEngine {
         bySymbol[o.symbol] = (bySymbol[o.symbol] ?? 0) + o.remaining;
       }
     }
+    var indexedOrderCount = 0;
+    for (final sideBooks in _resting.values) {
+      for (final book in sideBooks.values) {
+        for (final order in book) {
+          if (!identical(_orders[order.id], order)) {
+            throw StateError('Resting index holds an unknown order');
+          }
+          indexedOrderCount++;
+        }
+      }
+    }
+    if (indexedOrderCount != activeOrderCount) {
+      throw StateError('Resting index count does not match the ledger');
+    }
     if (_nextOrderSequence <= maxOrderSeq || _nextFillSequence <= _fills.length) {
       throw StateError('Non-monotonic sequence');
     }
@@ -552,7 +759,18 @@ class TxEngine {
     final dReservedCash = <String, int>{};
     final dShares = <String, Map<String, int>>{};
     final dReservedShares = <String, Map<String, int>>{};
+    // One audited index for all linked fills. Formerly each fill scanned
+    // the entire growing ledger (O(fills * ledger), often quadratic).
+    final fillEntryCount = <String, int>{};
+    final fillCashDelta = <String, int>{};
+    final fillShareDelta = <String, int>{};
     for (final line in _ledger) {
+      final id = line.fillId;
+      if (id != null) {
+        fillEntryCount[id] = (fillEntryCount[id] ?? 0) + 1;
+        fillCashDelta[id] = (fillCashDelta[id] ?? 0) + line.cashDeltaCents;
+        fillShareDelta[id] = (fillShareDelta[id] ?? 0) + line.shareDelta;
+      }
       if (!_accounts.containsKey(line.accountId)) {
         throw StateError('Ledger references unknown account');
       }
@@ -607,14 +825,15 @@ class TxEngine {
           buy.ownerId == sell.ownerId) {
         throw StateError('Fill order mismatch');
       }
-      final linked = _ledger.where((l) => l.fillId == fill.id).toList();
-      if (linked.length != 2 ||
-          linked.fold<int>(0, (v, l) => v + l.cashDeltaCents) != 0 ||
-          linked.fold<int>(0, (v, l) => v + l.shareDelta) != 0) {
+      if (fillEntryCount[fill.id] != 2 ||
+          fillCashDelta[fill.id] != 0 ||
+          fillShareDelta[fill.id] != 0) {
         throw StateError('Fill has unbalanced ledger');
       }
     }
     if (_nextFillSequence <= lastFillSeq) throw StateError('Fill sequence rewind');
+    _lastAuditedSerial = _economicMutationSerial;
+    _fullAuditCount++;
   }
 }
 

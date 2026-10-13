@@ -97,14 +97,40 @@ void main() {
     expect(bars.map((e) => e.step).toList(), [3, 4, 5]);
   });
 
-  test('history refuses tampered past checksum instead of generating fake data', () async {
+  test('history rejects a tampered checksum and delta head fails closed', () async {
     final first = await db.initializeFresh(TxSession.fresh());
     final s = TxSession.importJson(first.session.exportJson())..nextTick();
     await db.saveSession(s, expectedRevision: 1);
+    final row = await db.customSelect(
+      'SELECT payload_json FROM snapshots WHERE revision = 2',
+    ).getSingle();
+    // TXD1 depends on revision 1; TXZ1 is an independent full checkpoint.
+    final isDependentDelta = row.read<String>('payload_json').startsWith('TXD1:');
     await db.customStatement("UPDATE snapshots SET sha256 = 'BAD' WHERE revision = 1");
     await expectLater(db.readHistory(), throwsStateError);
-    // Active session is still independently verified, never silently reset.
-    expect((await db.readCurrent())!.revision, 2);
+    if (isDependentDelta) {
+      // Never reconstruct accounts, balances or K-lines from corrupt ancestry.
+      await expectLater(db.readCurrent(), throwsStateError);
+    } else {
+      // A genuine complete checkpoint is independent of an older bad record.
+      expect((await db.readCurrent())!.revision, 2);
+    }
+  });
+
+  test('a complete checkpoint is independently readable but damaged history is not', () async {
+    final first = await db.initializeFresh(TxSession.fresh());
+    await db.setCheckpointInterval(1);
+    final s = TxSession.importJson(first.session.exportJson())..nextTick();
+    await db.saveSession(s, expectedRevision: 1);
+    final row = await db.customSelect(
+      'SELECT payload_json FROM snapshots WHERE revision = 2',
+    ).getSingle();
+    expect(row.read<String>('payload_json'), startsWith('TXZ1:'));
+    await db.customStatement("UPDATE snapshots SET sha256 = 'BAD' WHERE revision = 1");
+    await expectLater(db.readHistory(), throwsStateError);
+    final restored = await db.readCurrent();
+    expect(restored!.revision, 2);
+    expect(restored.session.exportJson(), s.exportJson());
   });
 
   test('history bounds are rejected, not silently relaxed', () async {

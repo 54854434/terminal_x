@@ -125,17 +125,19 @@ class TxSession {
   }
 
   void nextTick() {
+    // Defer full O(history) checks across this one isolated minute only.
+    engine.runCheckedMinute(() {
     TxNpcMarket.cancelResting(engine);
-    final restingMakerOrders = engine.orders.values.where((o) =>
-        o.ownerId.startsWith('LP_') &&
-        (o.status == TxStatus.open || o.status == TxStatus.partiallyFilled))
-        .map((o) => o.id).toList();
-    for (final id in restingMakerOrders) {
-      final order = engine.order(id);
-      engine.cancel(id, ownerId: order.ownerId);
+    // Reproduce the old global insertion order while inspecting only resting
+    // orders; ledger line order stays byte-for-byte deterministic across upgrades.
+    final restingMakerOrders = engine.activeOrders.where((o) =>
+        o.ownerId.startsWith('LP_')).toList()
+      ..sort((a, b) => a.sequence.compareTo(b.sequence));
+    for (final order in restingMakerOrders) {
+      engine.cancel(order.id, ownerId: order.ownerId);
     }
     step++;
-    _quoteFillStart = engine.fills.length;
+    _quoteFillStart = engine.fillCount;
     final movements = <int>[];
     final activeParticipants = TxNpcMarket.isEnabled(engine);
     for (var i = 0; i < symbols.length; i++) {
@@ -148,7 +150,7 @@ class TxSession {
     _quoteMakers();
     TxNpcMarket.tradeMinute(
         engine, step, symbols, referenceCents, movements);
-    engine.checkInvariants();
+    });
   }
 
   void _quoteMakers() {
@@ -198,8 +200,8 @@ class TxSession {
       engine.cancel(orderId, ownerId: playerId);
 
   int lastPrice(String symbol) {
-    for (var i = engine.fills.length - 1; i >= _quoteFillStart; i--) {
-      final fill = engine.fills[i];
+    for (var i = engine.fillCount - 1; i >= _quoteFillStart; i--) {
+      final fill = engine.fillAt(i);
       if (fill.symbol == symbol) return fill.priceCents;
     }
     return referenceCents[symbols.indexOf(symbol)];
@@ -208,7 +210,8 @@ class TxSession {
   /// Real fills since the start of the most recent simulated minute.
   /// No fake print events and no exposure of historical NPC order payloads.
   List<TxFill> get currentMinuteFills =>
-      engine.fills.sublist(_quoteFillStart);
+      List<TxFill>.generate(engine.fillCount - _quoteFillStart,
+        (i) => engine.fillAt(_quoteFillStart + i), growable: false);
 
   int get totalAssetsCents {
     final player = engine.account(playerId);
@@ -222,11 +225,87 @@ class TxSession {
     return list;
   }
 
-  List<TxFill> get playerFills => engine.fills.reversed.where((f) =>
-      engine.order(f.buyOrderId).ownerId == playerId ||
-      engine.order(f.sellOrderId).ownerId == playerId).toList();
+  /// Newest [limit] player orders, without sorting / allocating the entire
+  /// historical order collection. A min-heap retains the top K sequences.
+  /// Work O(all orders * log(limit)), extra memory O(limit).
+  List<TxOrder> recentPlayerOrders({int limit = 100}) {
+    if (limit < 1) {
+      throw ArgumentError.value(limit, 'limit', 'Must be positive');
+    }
+    final heap = <TxOrder>[];
+    for (final order in engine.orders.values) {
+      if (order.ownerId != playerId) continue;
+      if (heap.length < limit) {
+        heap.add(order);
+        var i = heap.length - 1;
+        while (i > 0) {
+          final parent = (i - 1) ~/ 2;
+          if (heap[parent].sequence <= heap[i].sequence) break;
+          final temp = heap[parent];
+          heap[parent] = heap[i];
+          heap[i] = temp;
+          i = parent;
+        }
+      } else if (order.sequence > heap[0].sequence) {
+        heap[0] = order;
+        var i = 0;
+        while (true) {
+          final left = 2 * i + 1;
+          if (left >= heap.length) break;
+          final right = left + 1;
+          var smallest = left;
+          if (right < heap.length &&
+              heap[right].sequence < heap[left].sequence) {
+            smallest = right;
+          }
+          if (heap[i].sequence <= heap[smallest].sequence) break;
+          final temp = heap[i];
+          heap[i] = heap[smallest];
+          heap[smallest] = temp;
+          i = smallest;
+        }
+      }
+    }
+    heap.sort((a, b) => b.sequence.compareTo(a.sequence));
+    return heap;
+  }
 
-  String exportJson() => jsonEncode({
+  /// Outstanding player orders only; avoid sorting historical filled and
+  /// cancelled orders whenever the trade page rebuilds after a minute.
+  List<TxOrder> get activePlayerOrders {
+    final active = <TxOrder>[];
+    for (final order in engine.activeOrders) {
+      if (order.ownerId == playerId) active.add(order);
+    }
+    active.sort((a, b) => b.sequence.compareTo(a.sequence));
+    return active;
+  }
+
+  // Bounded, newest-first record query. Unlike playerFills, it stops once
+  // [limit] matching REAL fills are found, without collecting the whole past.
+  // Neither the authoritative fill stream nor the on-disk schema is changed.
+  List<TxFill> recentPlayerFills({int limit = 100}) {
+    if (limit < 1) {
+      throw ArgumentError.value(limit, 'limit', 'Must be positive');
+    }
+    final result = <TxFill>[];
+    for (var i = engine.fillCount - 1; i >= 0; i--) {
+      final fill = engine.fillAt(i);
+      if (engine.order(fill.buyOrderId).ownerId == playerId ||
+          engine.order(fill.sellOrderId).ownerId == playerId) {
+        result.add(fill);
+        if (result.length == limit) break;
+      }
+    }
+    return result;
+  }
+
+  // Public historical API remains complete, as before.
+  List<TxFill> get playerFills =>
+      recentPlayerFills(limit: engine.fillCount == 0 ? 1 : engine.fillCount);
+
+  /// Session-only snapshot fields for O(changed-records) delta encoding.
+  Map<String, dynamic> snapshotHeader() => <String, dynamic>{
         'schema': schemaVersion,
         'step': step,
         'referenceCents': referenceCents,
@@ -235,6 +314,33 @@ class TxSession {
         'archivedLegacyOrders': archivedLegacyOrders,
         'archivedLegacyTrades': archivedLegacyTrades,
         'isLegacyUpgrade': isLegacyUpgrade,
+      };
+
+  /// Establish a new delta base AFTER an atomic SQLite commit.
+  /// Kept separate from the economic state and never serialized.
+  void acknowledgeCommittedSnapshot() =>
+      engine.acknowledgeCommittedSnapshot();
+
+  /// R31: validate the already-typed candidate directly, without spending an
+  /// additional full JSON export/import cycle before every SQLite save.
+  /// All invariants remain checked in release mode, not just debug asserts.
+  void checkInvariantsForCommit() {
+    if (step < 0 || referenceCents.length != symbols.length ||
+        referenceCents.any((value) => value <= 0) || nextPlayerOrder < 1 ||
+        _quoteFillStart < 0 || _quoteFillStart > engine.fillCount) {
+      throw StateError('Invalid session metadata before SQLite commit');
+    }
+    for (final id in <String>[playerId, 'LP_A', 'LP_B']) {
+      engine.account(id);
+    }
+    // The market worker already fully audits at the end of every minute;
+    // a standalone player order also audits before returning. Audit again
+    // only if a subsequent economic mutation invalidated the trust stamp.
+    engine.verifyBeforeCommit();
+  }
+
+  String exportJson() => jsonEncode({
+        ...snapshotHeader(),
         'engine': engine.exportJson(),
       });
 
@@ -252,7 +358,7 @@ class TxSession {
     }
     final engine = TxEngine.importJson(data['engine'] as String);
     final quoteFillStart = data['quoteFillStart'] as int;
-    if (quoteFillStart < 0 || quoteFillStart > engine.fills.length) {
+    if (quoteFillStart < 0 || quoteFillStart > engine.fillCount) {
       throw const FormatException('Invalid fill cursor');
     }
     for (final id in [playerId, 'LP_A', 'LP_B']) {

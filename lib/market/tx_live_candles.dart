@@ -31,6 +31,64 @@ class TxLiveCandles {
     return TxLiveCandles._(bySymbol);
   }
 
+  /// Small, non-authoritative read model for fast startup. SQLite binds it
+  /// to the exact verified revision and SHA-256; it cannot create trades.
+  /// Only a bounded recent window is serialized, independent of old history.
+  Map<String, dynamic> toIndexJson({int limit = 96}) => <String, dynamic>{
+    'version': 1,
+    'candles': <String, dynamic>{
+      for (final symbol in TxSession.symbols)
+        symbol: _values[symbol]!.skip(
+          math.max(0, _values[symbol]!.length - limit)).map((c) => <int>[
+            c.step, c.openCents, c.highCents, c.lowCents,
+            c.closeCents, c.volumeShares,
+          ]).toList(),
+    },
+  };
+
+  factory TxLiveCandles.fromIndexJson(Map<String, dynamic> data) {
+    if (data['version'] != 1 || data.length != 2) {
+      throw const FormatException('Unsupported candle read-model version');
+    }
+    final raw = Map<String, dynamic>.from(data['candles'] as Map);
+    if (raw.length != TxSession.symbols.length ||
+        raw.keys.any((symbol) => !TxSession.symbols.contains(symbol))) {
+      throw const FormatException('Invalid candle read-model symbols');
+    }
+    final candles = <String, List<TxCandle>>{};
+    for (final symbol in TxSession.symbols) {
+      final rows = List<dynamic>.from(raw[symbol] as List);
+      if (rows.length > maxCandles) {
+        throw const FormatException('Candle read-model exceeds memory bound');
+      }
+      var previous = -1;
+      candles[symbol] = <TxCandle>[];
+      for (final row in rows) {
+        final data = List<dynamic>.from(row as List);
+        if (data.length != 6 || data.any((value) => value is! int)) {
+          throw const FormatException('Malformed cached candle');
+        }
+        final step = data[0] as int;
+        final open = data[1] as int;
+        final high = data[2] as int;
+        final low = data[3] as int;
+        final close = data[4] as int;
+        final volume = data[5] as int;
+        if (step < 0 || step <= previous || open < 1 || close < 1 ||
+            low < 1 || high < open || high < close ||
+            low > open || low > close || volume < 0) {
+          throw const FormatException('Invalid cached candle OHLCV');
+        }
+        previous = step;
+        candles[symbol]!.add(TxCandle(
+          step: step, openCents: open, highCents: high, lowCents: low,
+          closeCents: close, volumeShares: volume,
+        ));
+      }
+    }
+    return TxLiveCandles._(candles);
+  }
+
   List<TxCandle> forSymbol(String symbol) =>
       _views[symbol] ?? (throw ArgumentError.value(symbol));
 
@@ -45,8 +103,8 @@ class TxLiveCandles {
     if (step != oldStep && step != oldStep + 1) {
       throw StateError('Game clock skipped minutes');
     }
-    final previousFillCount = before.session.engine.fills.length;
-    final nextFillCount = after.session.engine.fills.length;
+    final previousFillCount = before.session.engine.fillCount;
+    final nextFillCount = after.session.engine.fillCount;
     if (nextFillCount < previousFillCount) {
       throw StateError('Verified trade history shrank');
     }

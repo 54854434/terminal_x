@@ -29,10 +29,9 @@ class TxContinuousFlowClock {
 
   static const int gameMicrosPerMinute = 60000000;
   static const int maxSupportedSpeed = 360000;
-  // Initial UI rollout stays conservative; the engine model has no 60x ceiling.
-  // 600x and 3600x need the as-yet-unshipped atomic multi-minute writer.
-  // 120x is safe to expose with single-flight backpressure (it may slow down).
-  static const List<int> uiSpeeds = [1, 2, 5, 10, 15, 30, 60, 100, 120];
+  // Requested target rates only: single-flight SQLite commits determine
+  // ACTUAL achieved speed. Fast targets never skip economic minutes.
+  static const List<int> uiSpeeds = [1, 2, 5, 10, 15, 30, 60, 100, 120, 300, 600, 1200, 3600];
   int _speed = 1;
   int _fractionalGameMicros = 0;
   bool _running = false;
@@ -73,6 +72,15 @@ class TxContinuousFlowClock {
   /// Once an irreversible transaction has begun, the result must still be
   /// reconciled; pause stops scheduling the NEXT minute, not the transaction.
   void pause() => _running = false;
+
+  /// Drop uncommitted visual seconds for an explicit manual minute step.
+  /// This is NOT a ledger rollback; committed state is never touched.
+  void resetProvisional() {
+    if (_running || _awaitingCommit || _faulted) {
+      throw StateError('Cannot rebase running or unresolved game time');
+    }
+    _fractionalGameMicros = 0;
+  }
 
   /// Apply one elapsed UI frame. The caller immediately schedules a single
   /// atomic minute commit when [TxFlowFrame.needsMinuteCommit] is true.

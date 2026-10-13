@@ -56,16 +56,16 @@ class TxCandleHistory {
       }
       final price = session.lastPrice(symbol);
       if (price <= 0) throw StateError('Invalid historical price');
-      final fills = session.engine.fills;
-      if (!first && fills.length < lastFillCount) {
+      final fillCount = session.engine.fillCount;
+      if (!first && fillCount < lastFillCount) {
         throw StateError('Trade history shrank between snapshots');
       }
       var volume = 0;
       var low = price;
       var high = price;
       if (!first) {
-        for (var i = lastFillCount; i < fills.length; i++) {
-          final fill = fills[i];
+        for (var i = lastFillCount; i < fillCount; i++) {
+          final fill = session.engine.fillAt(i);
           if (fill.symbol != symbol) continue;
           volume += fill.quantity;
           low = math.min(low, fill.priceCents);
@@ -97,7 +97,7 @@ class TxCandleHistory {
       }
       lastRevision = stored.revision;
       lastStep = session.step;
-      lastFillCount = fills.length;
+      lastFillCount = fillCount;
       first = false;
     }
     return result;

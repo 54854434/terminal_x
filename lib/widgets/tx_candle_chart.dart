@@ -3,13 +3,16 @@ import 'package:flutter/material.dart';
 import '../market/tx_candle_history.dart';
 import '../market/tx_indicators.dart';
 import '../market/tx_timeframe.dart';
+import '../market/tx_frame_preview.dart';
 
 /// Committed simulated OHLC (real fills plus explicitly marked reference
 /// prices for no-trade periods) with a distinct indicative preview.
 class TxCandleChart extends StatefulWidget {
-  const TxCandleChart({super.key, required this.candles, this.indicativePriceCents});
+  const TxCandleChart({super.key, required this.candles,
+      this.indicativePriceCents, this.indicativeFramePriceCents});
   final List<TxCandle> candles;
   final int? indicativePriceCents;
+  final double? indicativeFramePriceCents;
   @override
   State<TxCandleChart> createState() => _TxCandleChartState();
 }
@@ -26,7 +29,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
   int _maLength = -1, _maFirstStep = -1;
   TxCandle? _maLast;
   List<double?>? _ma5, _ma10, _ma20;
-  int? _previewStep, _previewHigh, _previewLow;
+  int? _previewStep;
+  double? _previewHigh, _previewLow;
   int get _maxOffset => math.max(0, _activeBars.length -
       math.min(_window, _activeBars.length));
 
@@ -53,10 +57,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
     final step = source.last.step;
     if (_previewStep != step) {
       _previewStep = step;
-      _previewHigh = source.last.closeCents;
-      _previewLow = source.last.closeCents;
+      _previewHigh = source.last.closeCents.toDouble();
+      _previewLow = source.last.closeCents.toDouble();
     }
-    final price = widget.indicativePriceCents;
+    final price = widget.indicativeFramePriceCents ??
+        widget.indicativePriceCents?.toDouble();
     if (price != null) {
       _previewHigh = math.max(_previewHigh!, price);
       _previewLow = math.min(_previewLow!, price);
@@ -94,7 +99,17 @@ class _TxCandleChartState extends State<TxCandleChart> {
       if (bar.step == _inspectedStep) { inspected = bar; break; }
     }
     // Preview is a NON-traded reference. Only show it at the far-right edge.
-    final preview = _olderOffset == 0 ? widget.indicativePriceCents : null;
+    final preview = _olderOffset == 0
+        ? (widget.indicativeFramePriceCents ??
+            widget.indicativePriceCents?.toDouble()) : null;
+    final projection = preview == null || _period == TxChartPeriod.timeline
+        ? null : TxFrameCandleProjection.fromLastCommitted(
+            lastAggregated: all.last,
+            nextMinuteStep: widget.candles.last.step + 1,
+            periodMinutes: _period.minutes,
+            framePriceCents: preview,
+            previewHighCents: _previewHigh!,
+            previewLowCents: _previewLow!);
     return Column(children: [
       Row(children: [
         Text(_period == TxChartPeriod.timeline ? '模拟分时 · 已提交分钟价格'
@@ -133,7 +148,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
             onSelected: _period == TxChartPeriod.timeline ? null :
                 (v) => setState(() => _showMA = v)),
         const SizedBox(width: 6),
-        if (preview != null && _period == TxChartPeriod.oneMinute)
+        if (preview != null && _period != TxChartPeriod.timeline)
           const Expanded(child: Text('空心K/虚线：指示价（非成交）',
             maxLines: 1, overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 10, color: Colors.white54))),
@@ -165,9 +180,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 ma5: _showMA ? _ma5!.sublist(start, end) : null,
                 ma10: _showMA ? _ma10!.sublist(start, end) : null,
                 ma20: _showMA ? _ma20!.sublist(start, end) : null,
-                indicativePriceCents: _period == TxChartPeriod.oneMinute ? preview : null,
-                indicativeHighCents: _period == TxChartPeriod.oneMinute ? _previewHigh : null,
-                indicativeLowCents: _period == TxChartPeriod.oneMinute ? _previewLow : null)),
+                indicativePriceCents: projection?.closeCents,
+                indicativeHighCents: projection?.highCents,
+                indicativeLowCents: projection?.lowCents,
+                indicativeOpenCents: projection?.openCents,
+                overlayLastCommitted: projection?.overlaysLastCommitted ?? false)),
         )),
       )),
       if (inspected != null)
@@ -197,10 +214,13 @@ class _TxCandleChartState extends State<TxCandleChart> {
 class _CandlePainter extends CustomPainter {
   _CandlePainter(this.candles, {this.ma5, this.ma10, this.ma20,
     this.indicativePriceCents, this.indicativeHighCents,
-    this.indicativeLowCents});
+    this.indicativeLowCents, this.indicativeOpenCents,
+    this.overlayLastCommitted = false});
   final List<TxCandle> candles;
   final List<double?>? ma5, ma10, ma20;
-  final int? indicativePriceCents, indicativeHighCents, indicativeLowCents;
+  final double? indicativePriceCents, indicativeHighCents,
+      indicativeLowCents, indicativeOpenCents;
+  final bool overlayLastCommitted;
   static const rise = Color(0xFF32D0A1), fall = Color(0xFFFF647C);
   static const grid = Color(0xFF293448),
       shortMA = Color(0xFFF5C54D), mediumMA = Color(0xFF7E9DFF),
@@ -266,9 +286,9 @@ class _CandlePainter extends CustomPainter {
       }
     }
     if (indicativePriceCents!=null) {
-      final x=bar*(candles.length+.5);
-      final open=candles.last.closeCents.toDouble();
-      final mark=indicativePriceCents!.toDouble();
+      final x=bar*(candles.length-(overlayLastCommitted ? .5 : -.5));
+      final open=indicativeOpenCents ?? candles.last.closeCents.toDouble();
+      final mark=indicativePriceCents!;
       final top=y(math.max(open,mark));
       final bottom=y(math.min(open,mark));
       final p=Paint()..color=const Color(0xFF54CEE5)
@@ -310,6 +330,8 @@ class _CandlePainter extends CustomPainter {
       indicativePriceCents!=other.indicativePriceCents ||
       indicativeHighCents!=other.indicativeHighCents ||
       indicativeLowCents!=other.indicativeLowCents ||
+      indicativeOpenCents!=other.indicativeOpenCents ||
+      overlayLastCommitted!=other.overlayLastCommitted ||
       candles.length!=other.candles.length ||
       (ma5==null)!=(other.ma5==null) ||
       (candles.isNotEmpty && (candles.first.step!=other.candles.first.step ||
@@ -322,7 +344,7 @@ class _CandlePainter extends CustomPainter {
 class _TimelinePainter extends CustomPainter {
   _TimelinePainter(this.candles, {this.indicativePriceCents});
   final List<TxCandle> candles;
-  final int? indicativePriceCents;
+  final double? indicativePriceCents;
 
   @override
   void paint(Canvas canvas, Size size) {
