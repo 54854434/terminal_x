@@ -45,7 +45,7 @@ void main() {
     }
   });
 
-  test('candle cache rejects revision gap and simulated time jumps', () async {
+  test('candle cache rejects revision gaps and backwards clock movement', () async {
     final db = TxSqliteStore(NativeDatabase.memory());
     try {
       final trading = TxTradingService(db);
@@ -54,6 +54,8 @@ void main() {
       await trading.nextTick();
       await trading.nextTick();
       expect(() => cache.addCommit(first, trading.current), throwsStateError);
+      expect(() => cache.addObservation(trading.current.session,
+          first.session), throwsStateError);
     } finally {
       await db.close();
     }
@@ -77,6 +79,31 @@ void main() {
       cache.addObservation(pulse.session, minute.session);
       expect(cache.forSymbol('SIM-A01').last.step, 1);
       expect((await db.readCurrent())!.revision, initial.revision);
+    } finally {
+      await trading.close();
+    }
+  });
+
+  test('batched automatic save updates indexed OHLC across pending minutes',
+      () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    final trading = TxTradingService(db, automaticSaveMinutes: 3);
+    try {
+      final initial = await trading.open();
+      final index = TxLiveCandles.fromVerifiedHistory(await db.readHistory());
+      await db.seedCandleIndex(initial, index);
+
+      await trading.nextTick(deferSave: true);
+      await trading.nextTick(deferSave: true);
+      final committed = await trading.nextTick(deferSave: true);
+
+      expect(committed.pending, isFalse);
+      expect(committed.session.marketTimeStep, 3);
+      final restoredIndex = await db.readCandleIndex(committed);
+      expect(restoredIndex, isNotNull);
+      expect(restoredIndex!.forSymbol('SIM-A01').last.step, 3);
+      expect(restoredIndex.forSymbol('SIM-A01').last.closeCents,
+          committed.session.lastPrice('SIM-A01'));
     } finally {
       await trading.close();
     }

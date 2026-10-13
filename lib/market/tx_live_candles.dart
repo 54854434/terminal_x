@@ -109,9 +109,16 @@ class TxLiveCandles {
   void addObservation(TxSession before, TxSession after) {
     final oldStep = before.marketTimeStep;
     final step = after.marketTimeStep;
-    if (step != oldStep && step != oldStep + 1) {
-      throw StateError('Game clock skipped minutes');
+    if (step < oldStep) {
+      throw StateError('Game clock moved backwards');
     }
+    // The live UI normally adds one minute at a time.  A deferred automatic
+    // save is different: SQLite's indexed read model may still be at the
+    // last durable minute while the candidate contains many real minutes.
+    // Keep the final verified OHLC as a forward gap instead of inventing
+    // bars for minutes that were intentionally not snapshotted.  The chart
+    // timeframe layer already marks such gaps; this display cache must never
+    // turn a valid batch commit into a storage/trading fault.
     final previousFillCount = before.engine.fillCount;
     final nextFillCount = after.engine.fillCount;
     if (nextFillCount < previousFillCount) {
@@ -145,10 +152,10 @@ class TxLiveCandles {
           closeCents: incoming.closeCents,
           volumeShares: last.volumeShares + incoming.volumeShares,
         ));
-      } else if (candles.last.step + 1 == incoming.step) {
+      } else if (candles.last.step < incoming.step) {
         candles.add(incoming);
       } else {
-        throw StateError('Candle history is not contiguous');
+        throw StateError('Candle history moved backwards');
       }
       if (candles.length > maxCandles) candles.removeAt(0);
     }

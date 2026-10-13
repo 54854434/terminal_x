@@ -41,11 +41,20 @@ class _TxCandleChartState extends State<TxCandleChart> {
   int get _maxOffset => math.max(0, _activeBars.length -
       math.min(_window, _activeBars.length));
 
+  /// The preview belongs to the currently visible verified minute.  The
+  /// candle list already contains that minute after a commit; adding one
+  /// here would skip a group and make the one-bucket indicative wick memory
+  /// discard the just-finished shadow.
+  int _previewStep(List<TxCandle> source) {
+    final last = source.last.step;
+    final active = widget.activeMinuteStep;
+    return active == null || active < last ? last : active;
+  }
+
   void _refreshCache() {
     final source = widget.candles;
     if (source.isEmpty) return;
-    final currentStep = widget.activeMinuteStep == source.last.step
-        ? source.last.step : source.last.step + 1;
+    final currentStep = _previewStep(source);
     // The live view is a stable List object mutated on committed revisions.
     // Recompute only for a new revision or a requested interval.
     if (_maLength != source.length ||
@@ -123,8 +132,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
     final projection = preview == null || _period == TxChartPeriod.timeline
         ? null : TxFrameCandleProjection.fromLastCommitted(
             lastAggregated: all.last,
-            nextMinuteStep: widget.activeMinuteStep == widget.candles.last.step
-                ? widget.activeMinuteStep! : widget.candles.last.step + 1,
+            nextMinuteStep: _previewStep(widget.candles),
             periodMinutes: _period.minutes,
             framePriceCents: preview,
             previewHighCents: _indicativeWick.highCents!,
