@@ -3,12 +3,9 @@ name: Terminal X - One ZIP Verified ARM64 Release
 on:
   push:
     branches: [main]
-    paths:
-      - 'terminal_x_batch.zip'
+    paths: ['terminal_x_batch.zip']
   workflow_dispatch:
 
-# This installer is only activated by a direct commit of a single ZIP to main.
-# Never use pull_request_target and never run untrusted fork contents with write access.
 permissions:
   contents: write
 
@@ -20,14 +17,14 @@ jobs:
   verify-build-commit:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - name: Checkout the ZIP commit
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Verify ZIP manifest and stage source changes
+      - name: Verify exact SHA-locked ZIP contents and stage sources
         id: batch
         shell: bash
         run: |
@@ -40,198 +37,108 @@ jobs:
           import re
           import stat
           import zipfile
-
           archive = Path('terminal_x_batch.zip')
-          if not archive.is_file():
-              raise SystemExit('Upload terminal_x_batch.zip to repository root first.')
-          if archive.stat().st_size > 20 * 1024 * 1024:
-              raise SystemExit('Batch ZIP must be no more than 20 MiB.')
-
-          def allowed(path):
-              parts = PurePosixPath(path).parts
-              return (bool(parts) and len(parts) >= 2 and
-                      parts[0] in ('lib', 'test', 'assets', 'scripts') or
-                      path in ('docs/TERMINAL_X_HANDOFF.md', 'pubspec.yaml',
-                               'analysis_options.yaml'))
-
-          def check_path(path):
-              if (not isinstance(path, str) or len(path) > 220 or not path or
-                  path.startswith('/') or '\\' in path or ':' in path or
-                  any(x in ('', '.', '..') for x in path.split('/')) or
-                  any(x.startswith('.') for x in path.split('/')) or
-                  not allowed(path)):
-                  raise ValueError('Disallowed batch file path: ' + repr(path))
-              return path
-
-          with zipfile.ZipFile(archive, 'r') as z:
-              entries = z.infolist()
-              if len(entries) < 2 or len(entries) > 101:
-                  raise ValueError('Unexpected ZIP entry count.')
-              names = [info.filename for info in entries]
-              if len(set(names)) != len(names) or 'manifest.json' not in names:
-                  raise ValueError('ZIP contains duplicate names or no manifest.')
-              if any(i.is_dir() or stat.S_ISLNK(i.external_attr >> 16)
-                     or i.flag_bits & 1 for i in entries):
-                  raise ValueError('Directories, symlinks and encrypted ZIP entries are forbidden.')
-              if sum(i.file_size for i in entries) > 30 * 1024 * 1024:
-                  raise ValueError('Uncompressed ZIP contents exceed 30 MiB.')
+          if not archive.is_file() or archive.stat().st_size > 20 * 1024 * 1024:
+              raise SystemExit('Missing or oversized Terminal X batch ZIP.')
+          with zipfile.ZipFile(archive) as z:
+              infos = z.infolist()
+              names = [i.filename for i in infos]
+              if (not 2 <= len(infos) <= 101 or len(names) != len(set(names))
+                  or 'manifest.json' not in names
+                  or any(i.is_dir() or stat.S_ISLNK(i.external_attr >> 16)
+                      or (i.flag_bits & 1) for i in infos)
+                  or sum(i.file_size for i in infos) > 30 * 1024 * 1024):
+                  raise SystemExit('Unsafe ZIP entries.')
               if z.getinfo('manifest.json').file_size > 64 * 1024:
-                  raise ValueError('Manifest is too large.')
-              plan = json.loads(z.read('manifest.json').decode('utf-8'))
-              if plan.get('schema') != 1 or not isinstance(plan.get('files'), list):
-                  raise ValueError('Unsupported manifest schema.')
-              files = plan['files']
-              if not files or len(files) > 100:
-                  raise ValueError('Manifest must declare 1–100 files.')
-              paths = [check_path(entry['path']) for entry in files]
+                  raise SystemExit('Manifest exceeds size limit.')
+              plan = json.loads(z.read('manifest.json'))
+              files = plan.get('files')
+              if plan.get('schema') != 1 or not isinstance(files, list) or not 1 <= len(files) <= 100:
+                  raise SystemExit('Unsupported batch manifest.')
+              paths = []
+              for entry in files:
+                  p = entry['path']
+                  parts = PurePosixPath(p).parts
+                  allowed = (len(parts) >= 2 and parts[0] in
+                             ('lib','test','assets','scripts')) or p in (
+                             'docs/TERMINAL_X_HANDOFF.md','pubspec.yaml','analysis_options.yaml')
+                  if (not isinstance(p, str) or not allowed or len(p) > 220 or
+                      '\\' in p or ':' in p or p.startswith('/') or
+                      any(x in ('','.','..') or x.startswith('.') for x in p.split('/'))):
+                      raise SystemExit('Disallowed batch path: '+repr(p))
+                  paths.append(p)
               if len(set(paths)) != len(paths) or set(names) != set(paths) | {'manifest.json'}:
-                  raise ValueError('ZIP entries differ from the manifest file list.')
-
-              build = plan['build']
-              org = build['org']
-              target = check_path(build['target'])
-              app_id = build['application_id']
-              label = build['display_name']
-              artifact = build['artifact']
-              tests = build['tests']
-              if (not re.fullmatch(r'[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+', org)
-                  or app_id != org + '.terminal_x'
-                  or not target.startswith('lib/') or not target.endswith('.dart')
-                  or not re.fullmatch(r'[A-Za-z0-9 ._-]{1,32}', label)
-                  or not re.fullmatch(r'[A-Za-z0-9_-]{1,70}', artifact)
-                  or not isinstance(tests, list) or not 1 <= len(tests) <= 40
-                  or len(set(tests)) != len(tests)
-                  or any(not isinstance(t, str) or not t.startswith('test/') or
-                         not t.endswith('_test.dart') or '\\' in t or '..' in t
-                         for t in tests)):
-                  raise ValueError('Invalid build configuration or test paths.')
-              # The package ID, label and architecture are stable across releases.
-              if (org != 'com.terminalx.game'
-                  or app_id != 'com.terminalx.game.terminal_x'
-                  or label != 'Terminal X'
-                  or build.get('mode') != 'signed-release-arm64'
-                  or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', build.get('version_name', ''))
-                  or not isinstance(build.get('version_code'), int)
-                  or not 23 <= build['version_code'] < 2000000000):
-                  raise ValueError('Unsigned, wrong-identity or unversioned app build refused.')
-              # Refuse any downgrade or same-code rebuild of the stable app line.
-              previous_pubspec = Path('pubspec.yaml')
-              if previous_pubspec.is_file():
-                  prev_match = re.search(r'^version:\s*\d+\.\d+\.\d+\+(\d+)\s*$',
-                      previous_pubspec.read_text(encoding='utf-8'), re.M)
-                  if prev_match is not None and int(prev_match.group(1)) >= 23:
-                      if build['version_code'] <= int(prev_match.group(1)):
-                          raise ValueError('versionCode must increase after each signed release.')
-
-              # Verify every new file AND its expected old content before replacing anything.
+                  raise SystemExit('Manifest and ZIP entries differ.')
+              cfg = plan['build']
+              version = cfg['version_name']
+              code = cfg['version_code']
+              artifact = cfg['artifact']
+              tests = cfg['tests']
+              if (cfg.get('org') != 'com.terminalx.game' or
+                  cfg.get('application_id') != 'com.terminalx.game.terminal_x' or
+                  cfg.get('display_name') != 'Terminal X' or
+                  cfg.get('mode') != 'signed-release-arm64' or
+                  cfg.get('target') != 'lib/main_terminal.dart' or
+                  cfg.get('native_core') != 'rust-abi2-android-arm64' or
+                  not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',version) or
+                  type(code) is not int or code < 32 or
+                  artifact != 'terminal-x-v'+version.replace('.','')+'-signed-arm64-apk' or
+                  not isinstance(tests,list) or len(set(tests)) != len(tests) or
+                  not 1 <= len(tests) <= 40 or
+                  any(t not in paths and not Path(t).is_file() for t in tests)):
+                  raise SystemExit('Unsafe or incompatible Rust ARM64 build configuration.')
+              old = Path('pubspec.yaml').read_text()
+              m = re.search(r'^version:\s*\d+\.\d+\.\d+\+(\d+)\s*$',old,re.M)
+              if not m or code <= int(m.group(1)):
+                  raise SystemExit('Refusing same-version APK or downgrade.')
+              required = {
+                  'lib/engine/tx_engine.dart',
+                  'lib/engine/tx_session.dart',
+                  'lib/engine/tx_rust_market_gate.dart',
+                  'lib/engine/tx_native_core_ffi.dart',
+                  'lib/storage/tx_persistent_market_worker.dart',
+                  'lib/storage/tx_trading_service.dart',
+                  'scripts/tx_native_core/Cargo.toml',
+                  'scripts/tx_native_core/Cargo.lock',
+                  'scripts/tx_native_core/src/lib.rs',
+                  'scripts/tx_native_core/build_android_arm64.sh',
+                  'scripts/tx_release_notes_zh.md',
+                  'pubspec.yaml',
+              }
+              if not required.issubset(set(paths)):
+                  raise SystemExit('Incomplete Rust takeover package.')
               staged = {}
               for entry in files:
                   p = entry['path']
                   blob = z.read(p)
-                  digest = hashlib.sha256(blob).hexdigest()
-                  if digest != entry['sha256']:
-                      raise ValueError('SHA-256 mismatch: ' + p)
+                  if hashlib.sha256(blob).hexdigest() != entry.get('sha256'):
+                      raise SystemExit('SHA256 mismatch: '+p)
                   dest = Path(p)
                   if dest.is_symlink():
-                      raise ValueError('Refusing symlink destination: ' + p)
-                  expected_old = entry.get('previous_sha256')
+                      raise SystemExit('Symlink destination forbidden: '+p)
+                  previous = entry.get('previous_sha256')
                   if dest.is_file():
-                      actual_old = hashlib.sha256(dest.read_bytes()).hexdigest()
-                      if expected_old != actual_old:
-                          raise ValueError('Repository version conflict: ' + p)
-                  elif expected_old is not None:
-                      raise ValueError('Expected file missing in repository: ' + p)
+                      if hashlib.sha256(dest.read_bytes()).hexdigest() != previous:
+                          raise SystemExit('Repository version conflict: '+p)
+                  elif previous is not None:
+                      raise SystemExit('Expected source missing: '+p)
                   staged[p] = blob
-
-              # Optional SHA-locked cleanup. No globs for code or tests.
-              # Old disabled workflows are cleaned in a separate post-release job.
-              # Exact legacy entrypoints / placeholder paths require SHA-256,
-              # AND only disappear after tests and the new APK build pass.
-              removed = plan.get('remove', [])
-              if not isinstance(removed, list) or len(removed) > 30:
-                  raise ValueError('remove must be a list of at most 30 entries.')
-              def removable(path):
-                  if not isinstance(path, str) or '\\' in path or '..' in path:
-                      return False
-                  # Only previously committed, disposable archives / build drops.
-                  safe_legacy = {
-                      'lib/main_terminal_v02.dart',
-                      'lib/main_terminal_v021.dart',
-                      'lib/main_terminal_v023.dart',
-                      # Historical V0.1 XML commit / pre-SQLite migration tools
-                      # no longer called by the unified Terminal X runtime.
-                      'lib/engine/tx_backup_commit.dart',
-                      'lib/storage/tx_migration_bridge.dart',
-                      # Regression coverage retained by the current storage,
-                      # trading, session and realtime test suites.
-                      'test/tx_backup_commit_test.dart',
-                      'test/tx_migration_bridge_test.dart',
-                      'test/tx_v021_market_test.dart',
-                      'lib/storage_probe_main.dart',
-                      'lib/market/test',
-                      'lib/widgets/test',
-                      'docs/V01B_MOBILE_UPGRADE.md',
-                  }
-                  return (path in safe_legacy
-                      or bool(re.fullmatch(
-                          r'terminal_x_[a-zA-Z0-9_-]+\.(?:zip|apk)', path))
-                      or bool(re.fullmatch(
-                          r'(?:dist|artifacts|out)/(?:tmp|obsolete|preview)/'
-                          r'[a-zA-Z0-9_./-]+\.(?:zip|apk)', path)))
-              remove_paths = set()
-              for entry in removed:
-                  if not isinstance(entry, dict) or set(entry) != {'path', 'sha256'}:
-                      raise ValueError('Each remove entry requires path and sha256.')
-                  p = entry['path']
-                  digest = entry['sha256']
-                  if (not removable(p) or p == 'terminal_x_batch.zip'
-                      or p == target or p in tests
-                      or p in staged or p in remove_paths
-                      or not isinstance(digest, str)
-                      or not re.fullmatch(r'[a-f0-9]{64}', digest)):
-                      raise ValueError('Unsafe cleanup entry: ' + repr(p))
+              if plan.get('remove'):
+                  raise SystemExit('Rust takeover batch does not allow file deletion.')
+              for p,blob in staged.items():
                   dest = Path(p)
-                  if not dest.is_file() or dest.is_symlink():
-                      raise ValueError('Cleanup file missing or unsafe: ' + p)
-                  if hashlib.sha256(dest.read_bytes()).hexdigest() != digest:
-                      raise ValueError('Cleanup checksum conflict: ' + p)
-                  remove_paths.add(p)
-
-          for p, blob in staged.items():
-              dest = Path(p)
-              dest.parent.mkdir(parents=True, exist_ok=True)
-              dest.write_bytes(blob)
-          if not Path(target).is_file() or any(not Path(t).is_file() for t in tests):
-              raise ValueError('Build target or one or more tests not present after import.')
-          # All *active* Terminal X regression files must run. Removal is
-          # allowed only for explicitly allowlisted, SHA-locked obsolete tests.
-          active_tests = {p.as_posix() for p in Path('test').glob('tx_*_test.dart')}
-          active_tests -= remove_paths
-          if set(tests) != active_tests:
-              raise ValueError('Regression suite must cover every active tx_* test: '
-                               + repr(sorted(active_tests ^ set(tests))))
-          removed_realpaths = {(Path.cwd() / p).resolve() for p in remove_paths}
-          # Verify there are no remaining direct imports of removed Dart sources.
-          for source in list(Path('lib').rglob('*.dart')) + list(Path('test').glob('*.dart')):
-              if source.as_posix() in remove_paths:
-                  continue
-              contents = source.read_text(encoding='utf-8')
-              for m in re.finditer(r"^\s*(?:import|export|part)\s+['\"]([^'\"]+)['\"]", contents, re.M):
-                  relative = m.group(1)
-                  if ':' in relative:  # package: imports are resolved by Flutter.
-                      continue
-                  imported = (source.parent / relative).resolve()
-                  if imported in removed_realpaths:
-                      raise ValueError('Active Dart source imports deleted file: '
-                                       + source.as_posix() + ' -> ' + relative)
-          version_text = Path('pubspec.yaml').read_text(encoding='utf-8')
-          expected_version = f"version: {build['version_name']}+{build['version_code']}"
-          if expected_version not in version_text.splitlines():
-              raise ValueError('pubspec version must match release manifest.')
-          Path('.tx_batch_plan.json').write_text(json.dumps(plan), encoding='utf-8')
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
-              out.write('artifact=' + artifact + '\n')
-          print(f'Validated {len(staged)} files, batch={plan.get("batch")!r}.')
+                  dest.parent.mkdir(parents=True,exist_ok=True)
+                  dest.write_bytes(blob)
+              expected = 'version: '+version+'+'+str(code)
+              if expected not in Path('pubspec.yaml').read_text().splitlines():
+                  raise SystemExit('Wrong app version in pubspec.')
+              source_tests = {p.as_posix() for p in Path('test').glob('tx_*_test.dart')}
+              if set(tests) != source_tests:
+                  raise SystemExit('Existing Flutter regression coverage must be retained.')
+              Path('.tx_batch_plan.json').write_text(json.dumps(plan))
+              with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+                  output.write('artifact='+artifact+'\n')
+              print('Verified',len(staged),'sources for Rust',version)
           PY
 
       - name: Set up Java 17
@@ -245,103 +152,111 @@ jobs:
         with:
           channel: stable
 
-      - name: Prepare isolated Android application
+      - name: Create Android app and retain stable release signing
         shell: bash
         run: |
           set -euo pipefail
+          flutter create --org com.terminalx.game --project-name terminal_x --platforms=android .
           python3 - <<'PY'
           import json
-          import subprocess
           from pathlib import Path
-          plan = json.loads(Path('.tx_batch_plan.json').read_text())['build']
-          subprocess.run(['flutter', 'create', '--org', plan['org'],
-                          '--project-name', 'terminal_x', '--platforms=android', '.'],
-                         check=True)
-          gradle_file = Path('android/app/build.gradle.kts')
-          gradle = gradle_file.read_text()
-          if ('applicationId = "' + plan['application_id'] + '"' not in gradle or
-              'namespace = "' + plan['application_id'] + '"' not in gradle):
-              raise SystemExit('The generated Android application ID does not match the manifest.')
-          if ('    buildTypes {' not in gradle or
-              'signingConfig = signingConfigs.getByName("debug")' not in gradle):
-              raise SystemExit('Unexpected Flutter Android signing template; refusing unsafe fallback.')
-          # Gradle reads the private key ONLY from ephemeral runner env/files.
-          # No key material is ever committed to the public repository.
-          key_config = '''    signingConfigs {
-                  create("terminalRelease") {
-                      storeFile = file(System.getenv("TX_KEYSTORE_FILE"))
-                      storePassword = System.getenv("TX_STORE_PASSWORD")
-                      keyAlias = System.getenv("TX_KEY_ALIAS")
-                      keyPassword = System.getenv("TX_KEY_PASSWORD")
+          cfg=json.loads(Path('.tx_batch_plan.json').read_text())['build']
+          target=Path('android/app/build.gradle.kts')
+          source=target.read_text()
+          expected='applicationId = "'+cfg['application_id']+'"'
+          if (expected not in source or
+              'namespace = "'+cfg['application_id']+'"' not in source or
+              '    buildTypes {' not in source or
+              'signingConfig = signingConfigs.getByName("debug")' not in source):
+              raise SystemExit('Unexpected Android Gradle template; refusing to re-sign.')
+          key='''    signingConfigs {
+                      create("terminalRelease") {
+                          storeFile = file(System.getenv("TX_KEYSTORE_FILE"))
+                          storePassword = System.getenv("TX_STORE_PASSWORD")
+                          keyAlias = System.getenv("TX_KEY_ALIAS")
+                          keyPassword = System.getenv("TX_KEY_PASSWORD")
+                      }
                   }
-              }
           '''
-          gradle = gradle.replace('    buildTypes {', key_config + '    buildTypes {', 1)
-          gradle = gradle.replace('signingConfig = signingConfigs.getByName("debug")',
-                                  'signingConfig = signingConfigs.getByName("terminalRelease")', 1)
-          gradle_file.write_text(gradle)
-          manifest = Path('android/app/src/main/AndroidManifest.xml')
-          text = manifest.read_text()
+          source=source.replace('    buildTypes {',key+'    buildTypes {',1)
+          source=source.replace('signingConfig = signingConfigs.getByName("debug")',
+              'signingConfig = signingConfigs.getByName("terminalRelease")',1)
+          target.write_text(source)
+          android_manifest=Path('android/app/src/main/AndroidManifest.xml')
+          text=android_manifest.read_text()
           if 'android:label="terminal_x"' not in text:
-              raise SystemExit('Unexpected Android label template; stop, do not overwrite.')
-          manifest.write_text(text.replace('android:label="terminal_x"',
-                                           'android:label="' + plan['display_name'] + '"'))
-          # Launcher resources are stored in the verified ZIP, not downloaded
-          # from an untrusted URL or generated by a third-party build plugin.
-          # Missing icons fail closed instead of silently restoring Flutter's default.
-          for density in ('mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi'):
-              source = Path('assets/launcher/android') / density / 'ic_launcher.png'
-              dest = Path('android/app/src/main/res') / ('mipmap-' + density) / 'ic_launcher.png'
+              raise SystemExit('Unexpected app label.')
+          android_manifest.write_text(text.replace('android:label="terminal_x"',
+              'android:label="Terminal X"'))
+          for density in ('mdpi','hdpi','xhdpi','xxhdpi','xxxhdpi'):
+              source=Path('assets/launcher/android')/density/'ic_launcher.png'
+              dest=Path('android/app/src/main/res')/('mipmap-'+density)/'ic_launcher.png'
               if not source.is_file() or not dest.is_file():
-                  raise SystemExit('Terminal X launcher icon missing: ' + str(source))
+                  raise SystemExit('Verified app launcher icon missing: '+str(source))
               dest.write_bytes(source.read_bytes())
           PY
 
-      - name: Prepare stable private release signing key
-        shell: bash
+      - name: Load the original private release keystore
         env:
           TX_RELEASE_KEYSTORE_B64: ${{ secrets.TX_RELEASE_KEYSTORE_B64 }}
           TX_STORE_PASSWORD: ${{ secrets.TX_STORE_PASSWORD }}
           TX_KEY_PASSWORD: ${{ secrets.TX_KEY_PASSWORD }}
           TX_KEY_ALIAS: ${{ secrets.TX_KEY_ALIAS }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, os
-          from pathlib import Path
-          names = ['TX_RELEASE_KEYSTORE_B64', 'TX_STORE_PASSWORD',
-                   'TX_KEY_PASSWORD', 'TX_KEY_ALIAS']
-          if any(not os.environ.get(n) for n in names):
-              raise SystemExit('Stable signing secrets missing: configure 4 Actions secrets first.')
-          data = base64.b64decode(os.environ['TX_RELEASE_KEYSTORE_B64'], validate=True)
-          if not 100 <= len(data) < 48_000:
-              raise SystemExit('Invalid release keystore size.')
-          path = Path('/tmp/terminal_x_release.jks')
-          path.write_bytes(data)
-          path.chmod(0o600)
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as out:
-              out.write('TX_KEYSTORE_FILE=' + str(path) + '\n')
-          print('Signing key loaded privately (no contents printed).')
-          PY
-          keytool -list -keystore /tmp/terminal_x_release.jks \
-            -storepass "$TX_STORE_PASSWORD" -alias "$TX_KEY_ALIAS" >/dev/null
-
-      - name: Install Flutter packages
-        run: flutter pub get
-
-      - name: Run batch regression suite once
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json
-          import subprocess
+          import base64,os
           from pathlib import Path
-          tests = json.loads(Path('.tx_batch_plan.json').read_text())['build']['tests']
-          subprocess.run(['flutter', 'test', *tests], check=True)
+          envs=('TX_RELEASE_KEYSTORE_B64','TX_STORE_PASSWORD','TX_KEY_PASSWORD','TX_KEY_ALIAS')
+          if any(not os.getenv(k) for k in envs):
+              raise SystemExit('Original signing secrets missing.')
+          key=base64.b64decode(os.environ['TX_RELEASE_KEYSTORE_B64'],validate=True)
+          if not 100 <= len(key) < 48000:
+              raise SystemExit('Invalid signing keystore size.')
+          p=Path('/tmp/terminal_x_release.jks')
+          p.write_bytes(key)
+          p.chmod(0o600)
+          with open(os.environ['GITHUB_ENV'],'a') as output:
+              output.write('TX_KEYSTORE_FILE='+str(p)+'\n')
+          PY
+          keytool -list -keystore /tmp/terminal_x_release.jks \
+            -storepass "$TX_STORE_PASSWORD" -alias "$TX_KEY_ALIAS" >/dev/null
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Compile real ARM64 Rust matching library
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup override set 1.88.0
+          rustup target add aarch64-linux-android
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$SDK"
+          MANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$MANAGER" ]]; then
+            MANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager | sort | head -1)"
+          fi
+          test -x "$MANAGER"
+          "$MANAGER" --install 'ndk;26.3.11579264'
+          export ANDROID_NDK_HOME="$SDK/ndk/26.3.11579264"
+          test -d "$ANDROID_NDK_HOME"
+          TX_RUST_NATIVE_ENABLED=1 bash scripts/tx_native_core/build_android_arm64.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          p=Path('android/app/src/main/jniLibs/arm64-v8a/libterminal_x_core.so')
+          content=p.read_bytes()
+          if (len(content)<64 or content[:4]!=b'\x7fELF' or
+              content[4]!=2 or content[5]!=1 or
+              struct.unpack_from('<H',content,18)[0]!=183):
+              raise SystemExit('Rust .so is not an ELF64 AArch64 library.')
+          print('Rust ARM64 native core verified:',len(content),'bytes')
           PY
 
-      - name: Build signed, optimized ARM64 Release APK
+      - name: Build signed Android ARM64 APK
         shell: bash
         env:
           TX_STORE_PASSWORD: ${{ secrets.TX_STORE_PASSWORD }}
@@ -350,23 +265,25 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json
-          import os
-          import subprocess
+          import json,subprocess,struct,zipfile
           from pathlib import Path
-          config = json.loads(Path('.tx_batch_plan.json').read_text())['build']
-          subprocess.run(['flutter', 'build', 'apk', '--release', '--split-per-abi',
-              '--target-platform', 'android-arm64', '--target', config['target'],
-              '--build-name', config['version_name'],
-              '--build-number', str(config['version_code']),
-              '--dart-define', 'TX_APP_VERSION=' + config['version_name']],
-              check=True)
-          apk = Path('build/app/outputs/flutter-apk/app-arm64-v8a-release.apk')
-          if not apk.is_file():
-              raise SystemExit('ARM64 release APK missing; do not commit source changes.')
-          print('Verified output exists; ARM64 APK bytes:', apk.stat().st_size)
+          cfg=json.load(open('.tx_batch_plan.json'))['build']
+          subprocess.run(['flutter','build','apk','--release','--split-per-abi',
+              '--target-platform','android-arm64','--target',cfg['target'],
+              '--build-name',cfg['version_name'],'--build-number',str(cfg['version_code']),
+              '--dart-define','TX_APP_VERSION='+cfg['version_name']],check=True)
+          apk=Path('build/app/outputs/flutter-apk/app-arm64-v8a-release.apk')
+          with zipfile.ZipFile(apk) as z:
+              name='lib/arm64-v8a/libterminal_x_core.so'
+              if name not in z.namelist():
+                  raise SystemExit('APK missing Rust ARM64 core; refusing to publish.')
+              binary=z.read(name)
+              if (len(binary)<64 or binary[:4]!=b'\x7fELF' or
+                  binary[4]!=2 or binary[5]!=1 or
+                  struct.unpack_from('<H',binary,18)[0]!=183):
+                  raise SystemExit('APK contains wrong-architecture Rust core.')
+          print('Verified signed APK includes Rust ARM64:',apk.stat().st_size)
           PY
-          # Verify the output's v2/v3 Android signature before publishing.
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
           SIGNER="$(find "$SDK/build-tools" -type f -name apksigner | sort -V | tail -1)"
           test -x "$SIGNER"
@@ -381,148 +298,22 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Commit all verified files as one change and remove uploaded ZIP
+      - name: Commit verified sources and remove the one uploaded ZIP
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json
-          import subprocess
+          import json,subprocess
           from pathlib import Path
-          manifest = json.loads(Path('.tx_batch_plan.json').read_text())
-          paths = [f['path'] for f in manifest['files']]
-          # All removal entries were checked before tests/build. Verify again at
-          # commit time to prevent accidentally removing modified files.
-          for entry in manifest.get('remove', []):
-              p = entry['path']
-              file = Path(p)
-              if (not file.is_file() or file.is_symlink()
-                  or __import__('hashlib').sha256(file.read_bytes()).hexdigest()
-                      != entry['sha256']):
-                  raise SystemExit('Cleanup target changed; abort: ' + p)
-              subprocess.run(['git', 'rm', '--', p], check=True)
+          plan=json.load(open('.tx_batch_plan.json'))
+          files=[e['path'] for e in plan['files']]
           Path('terminal_x_batch.zip').unlink()
-          subprocess.run(['git', 'add', '--', *paths], check=True)
-          subprocess.run(['git', 'add', '-A', '--', 'terminal_x_batch.zip'], check=True)
+          subprocess.run(['git','add','--',*files],check=True)
+          subprocess.run(['git','add','-A','--','terminal_x_batch.zip'],check=True)
           PY
-          if git diff --cached --quiet; then
-            echo 'No source changes staged; batch was already present.'
-          else
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'Verified Terminal X signed release batch and safe cleanup'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --cached --quiet; then
+            git commit -m 'Ship signed Terminal X Rust-native ARM64 game'
             git push origin HEAD:main
           fi
-          echo '### Terminal X batch import' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Regression and APK build passed; source files committed together.' >> "$GITHUB_STEP_SUMMARY"
-
-  prune-obsolete-debug-artifacts:
-    name: Prune old disposable debug APK artifacts
-    needs: verify-build-commit
-    if: needs.verify-build-commit.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - name: Retain recent APKs, remove old disposable artifacts
-        uses: actions/github-script@v7
-        continue-on-error: true
-        with:
-          script: |
-            const {owner, repo} = context.repo;
-            const artifacts = await github.paginate(
-              github.rest.actions.listArtifactsForRepo,
-              {owner, repo, per_page: 100}
-            );
-            const eligible = new Map();
-            for (const a of artifacts) {
-              // Only generated preview APK artifacts from V0.2 onwards.
-              // Protect V0.1*, backups, signed builds and release artifacts.
-              if (!/^terminal-x-v(?:0[2-9]|[1-9][0-9]+)[a-z0-9-]*-apk$/.test(a.name)) continue;
-              if (/backup|signed|release|stable/i.test(a.name)) continue;
-              if (!eligible.has(a.name)) eligible.set(a.name, []);
-              eligible.get(a.name).push(a);
-            }
-            const cutoff = Date.now() - 14 * 86400000;
-            let removed = 0;
-            for (const [name, group] of eligible) {
-              group.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-              for (const a of group.slice(3)) {  // Always retain the latest 3 per version.
-                if (new Date(a.created_at).getTime() >= cutoff) continue;
-                if (removed >= 10) break;         // Cap deletions per batch.
-                await github.rest.actions.deleteArtifact({owner, repo, artifact_id: a.id});
-                core.info(`Removed old debug artifact ${name}, id=${a.id}`);
-                removed++;
-              }
-            }
-            await core.summary.addHeading('Preview artifact retention')
-              .addRaw(`Only debug APK artifacts: retained latest 3 per artifact name, removed ${removed} older than 14 days (max 10 per run).`)
-              .write();
-
-
-  cleanup-obsolete-workflow-files:
-    name: Remove disabled old workflow YAML files (best effort)
-    needs: verify-build-commit
-    if: needs.verify-build-commit.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-      actions: write
-    steps:
-      - name: Check out latest committed main
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          persist-credentials: true
-
-      - name: SHA-locked deletion of five disabled workflow files
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib
-          import subprocess
-          from pathlib import Path
-          expected = {'.github/workflows/build-apk.yml': '490734d4ad0b28c4466331fc9119d010b667f710e5ff07372b477e3ccaf2d87e', '.github/workflows/build-storage-probe.yml': '0a33030bc33e88d83e8297656957e6a8ad98d3de6954b5950c4377e983bfff30', '.github/workflows/build-v02-terminal.yml': '47f9cbaf956faaaf3f16a5f7381a058ed83c5b7469c87dc73c5c4f12374eb659', '.github/workflows/v01b-engine-validation.yml': '846b49782a92916499c38096a40842b2ca2384bfa8832fefaa0a853c87376f7f', '.github/workflows/v01c-signature-audit.yml': '6c02be3ed6db9f6ed8044f36cfdb3ccbe80789c9ec7e9c02f78f6b0bd17c833d'}
-          changed = []
-          for name, sha in expected.items():
-              path = Path(name)
-              if not path.exists():
-                  continue  # Idempotent: already removed in a prior commit.
-              if not path.is_file() or path.is_symlink():
-                  raise SystemExit('Refusing unsafe workflow cleanup: ' + name)
-              if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
-                  raise SystemExit('Workflow content changed; refusing cleanup: ' + name)
-              changed.append(name)
-          if not changed:
-              print('No legacy workflow files remain; cleanup complete.')
-          else:
-              # Never stage or modify the current batch workflow itself.
-              subprocess.run(['git', 'rm', '--', *changed], check=True)
-              subprocess.run(['git','config','user.name','github-actions[bot]'],check=True)
-              subprocess.run(['git','config','user.email',
-                  '41898282+github-actions[bot]@users.noreply.github.com'],check=True)
-              subprocess.run(['git','commit','-m',
-                  'Remove five disabled legacy Terminal X workflows'],check=True)
-              # Token may lack Workflows:write even when contents:write is set.
-              # Never roll back the already tested and released source/APK.
-              outcome = subprocess.run(['git','push','origin','HEAD:main'],capture_output=True,text=True)
-              if outcome.returncode:
-                  print('WARNING: GitHub rejected workflow-file deletion; '
-                        'the signed APK and tested source are already committed.')
-                  print('To finish cleanup, delete only these five known '
-                        'disabled YAML files with the GitHub web UI.')
-                  print('Paths:', ', '.join(changed))
-                  with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:
-                      f.write('⚠️ Automatic workflow-file deletion was denied by '
-                              'GitHub permissions. Signed APK/source unaffected; '
-                              'delete the five disabled YAML files in Code via '
-                              'the GitHub website.\n')
-              else:
-                  print('Removed exactly', len(changed), 'old workflows.')
-                  with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:
-                      f.write('✅ Deleted exactly %d old disabled workflow files.\n' % len(changed))
-          PY
