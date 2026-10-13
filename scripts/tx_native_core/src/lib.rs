@@ -1,9 +1,9 @@
 //! Terminal X native-core prototype, deterministic and offline.
 //!
-//! R36 adds a deterministic command journal + replay test seam. The Android ZIP
-//! importer does not yet compile and package this crate. The existing Dart
-//! engine and SQLite schema stay authoritative until golden parity and
-//! cold-restore tests establish byte-for-byte economic compatibility.
+//! The Android release workflow compiles and packages this crate for ARM64.
+//! Dart remains the persisted UI projection; Rust owns executable Android-
+//! worker matching and must pass the parity/audit gate before commit.
+//! R36 adds a deterministic command journal + replay test seam.
 //!
 //! Integer cents and quantities only. No hidden liquidity, guessed fills,
 //! floating-point financial math, wall-clock scheduling or global mutable data.

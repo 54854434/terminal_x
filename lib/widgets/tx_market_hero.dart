@@ -11,7 +11,7 @@ class TxMarketHero extends StatelessWidget {
   const TxMarketHero({super.key, required this.symbol,
     required this.committedPriceCents, required this.step,
     required this.seconds, required this.indicativeCents,
-    required this.onBuy, required this.onSell});
+    required this.onBuy, required this.onSell, this.pending = false});
 
   final String symbol;
   final int committedPriceCents;
@@ -20,6 +20,7 @@ class TxMarketHero extends StatelessWidget {
   final double Function(double seconds) indicativeCents;
   final VoidCallback onBuy;
   final VoidCallback onSell;
+  final bool pending;
 
   String _yuan(int cents) => (cents / 100).toStringAsFixed(2);
 
@@ -60,7 +61,9 @@ class TxMarketHero extends StatelessWidget {
           ]);
         }),
       const SizedBox(height: 6),
-      Text('指示走势逐帧演示 · 非真实成交 | 已提交收盘 ¥${_yuan(committedPriceCents)}',
+      Text(pending
+          ? '当前盘口为待保存候选 · SQLite 恢复收盘 ¥${_yuan(committedPriceCents)}'
+          : '指示走势逐帧演示 · 非真实成交 | 已提交收盘 ¥${_yuan(committedPriceCents)}',
         style: const TextStyle(
           color: TxTerminalColors.secondaryText, fontSize: 11)),
       const SizedBox(height: 12),

@@ -5,9 +5,10 @@ import '../engine/tx_session.dart';
 import '../storage/tx_sqlite_store.dart';
 import 'tx_candle_history.dart';
 
-/// A bounded in-memory read-only minute series. Only committed SQLite
-/// revisions extend it. It is intentionally not an authoritative persistence
-/// layer: reopening still reconstructs from recently verified snapshots.
+/// A bounded in-memory read-only minute series. Committed SQLite revisions and
+/// explicitly marked automatic-playback observations extend it. The latter
+/// are display-only until SQLite flushes; reopening still reconstructs only
+/// from recently verified snapshots.
 class TxLiveCandles {
   TxLiveCandles._(this._values) {
     for (final entry in _values.entries) {
@@ -98,13 +99,21 @@ class TxLiveCandles {
     if (after.revision != before.revision + 1) {
       throw StateError('Missing committed SQLite revision');
     }
-    final oldStep = before.session.marketTimeStep;
-    final step = after.session.marketTimeStep;
+    addObservation(before.session, after.session);
+  }
+
+  /// Extend the in-memory chart from a real simulation candidate.
+  /// This deliberately does not change SQLite, revision numbers, or the
+  /// indexed candle cache. It lets automatic saves be batched without hiding
+  /// real Rust fills from the live chart.
+  void addObservation(TxSession before, TxSession after) {
+    final oldStep = before.marketTimeStep;
+    final step = after.marketTimeStep;
     if (step != oldStep && step != oldStep + 1) {
       throw StateError('Game clock skipped minutes');
     }
-    final previousFillCount = before.session.engine.fillCount;
-    final nextFillCount = after.session.engine.fillCount;
+    final previousFillCount = before.engine.fillCount;
+    final nextFillCount = after.engine.fillCount;
     if (nextFillCount < previousFillCount) {
       throw StateError('Verified trade history shrank');
     }
@@ -115,11 +124,14 @@ class TxLiveCandles {
       // fills or forcing a chart rebuild for this account-only transaction.
       // New game minutes NEVER take this shortcut, even with zero volume.
       if (step == oldStep && previousFillCount == nextFillCount &&
-          before.session.lastPrice(symbol) == after.session.lastPrice(symbol)) {
+          before.lastPrice(symbol) == after.lastPrice(symbol)) {
         continue;
       }
       final candles = _values[symbol]!;
-      final pair = TxCandleHistory.fromSnapshots([before, after], symbol);
+      final pair = TxCandleHistory.fromSnapshots([
+        TxStoredSession(session: before, revision: 1, sha256: 'memory'),
+        TxStoredSession(session: after, revision: 2, sha256: 'memory'),
+      ], symbol);
       final incoming = pair.last;
       if (candles.isEmpty) {
         candles.add(incoming);

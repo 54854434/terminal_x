@@ -11,6 +11,14 @@ void main() {
   setUp(() => db = TxSqliteStore(NativeDatabase.memory()));
   tearDown(() async => db.close());
 
+  test('flat committed candle has a neutral direction', () {
+    const flat = TxCandle(step: 0, openCents: 1000, highCents: 1000,
+        lowCents: 1000, closeCents: 1000, volumeShares: 0);
+    expect(flat.rising, isFalse);
+    expect(flat.falling, isFalse);
+    expect(flat.flat, isTrue);
+  });
+
   test('empty committed history creates zero candles', () async {
     expect(await db.readHistory(), isEmpty);
     expect(TxCandleHistory.fromSnapshots([], 'SIM-A01'), isEmpty);

@@ -5,18 +5,21 @@ import '../market/tx_indicators.dart';
 import '../market/tx_timeframe.dart';
 import '../market/tx_frame_preview.dart';
 
-/// Committed simulated OHLC (real fills plus explicitly marked reference
-/// prices for no-trade periods) with a distinct indicative preview.
+/// Simulated OHLC (real fills plus explicitly marked reference prices for
+/// no-trade periods) with a distinct indicative preview. The live chart can
+/// also contain real, explicitly labelled pending observations before SQLite
+/// flushes them.
 class TxCandleChart extends StatefulWidget {
   const TxCandleChart({super.key, required this.candles,
       this.indicativePriceCents, this.indicativeFramePriceCents,
-      this.previewSeconds, this.activeMinuteStep});
+      this.previewSeconds, this.activeMinuteStep, this.pending = false});
   final List<TxCandle> candles;
-  /// A SQLite-verified intraminute candle is already present in [candles].
+  /// A live intraminute candle is already present in [candles].
   final int? activeMinuteStep;
   final int? indicativePriceCents;
   final double? indicativeFramePriceCents;
   final double? previewSeconds;
+  final bool pending;
   @override
   State<TxCandleChart> createState() => _TxCandleChartState();
 }
@@ -128,9 +131,15 @@ class _TxCandleChartState extends State<TxCandleChart> {
             previewLowCents: _indicativeWick.lowCents!);
     return Column(children: [
       Row(children: [
-        Text(_period == TxChartPeriod.timeline ? '模拟分时 · 已提交分钟价格'
+        Text(_period == TxChartPeriod.timeline
+            ? "模拟分时 · ${widget.pending ? '已保存/待保存' : '已提交'}分钟价格"
             : '模拟 K 线 · ${_period.label}',
             style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        if (widget.pending) ...[
+          const SizedBox(width: 6),
+          const Text('待保存', style: TextStyle(
+              fontSize: 10, color: Colors.amberAccent)),
+        ],
         const Spacer(),
         Text('步 ${visible.first.step}–${visible.last.step}',
             style: const TextStyle(fontSize: 12, color: Colors.white70)),
@@ -166,7 +175,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 (v) => setState(() => _showMA = v)),
         const SizedBox(width: 6),
         if (preview != null && _period != TxChartPeriod.timeline)
-          const Expanded(child: Text('绿涨红跌半透明K：指示价（非成交）',
+          const Expanded(child: Text('绿涨红跌灰平半透明K：指示价（非成交）',
             maxLines: 1, overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 10, color: Colors.white54))),
       ]),
@@ -232,7 +241,9 @@ class _TxCandleChartState extends State<TxCandleChart> {
           }))),
         Text('$_window', style: const TextStyle(fontSize: 12)),
       ]),
-      const Text('实心 K：已提交；半透明 K／青色短虚线影线：仅指示价，不进成交与存档',
+      Text(widget.pending
+          ? '实心 K：真实撮合（含待保存候选）；半透明 K／青色短虚线影线：仅指示价，不进成交与存档'
+          : '实心 K：已提交；半透明 K／青色短虚线影线：仅指示价，不进成交与存档',
           style: TextStyle(color: Colors.white54, fontSize: 10)),
     ]);
   }
@@ -255,7 +266,8 @@ class _CandlePainter extends CustomPainter {
   final bool preferCommittedBody;
   final int? previousIndicativeStep;
   final double? previousIndicativeHighCents, previousIndicativeLowCents;
-  static const rise = Color(0xFF32D0A1), fall = Color(0xFFFF647C);
+  static const rise = Color(0xFF32D0A1), fall = Color(0xFFFF647C),
+      flat = Color(0xFF9BA7BB);
   static const grid = Color(0xFF293448),
       shortMA = Color(0xFFF5C54D), mediumMA = Color(0xFF7E9DFF),
       longMA = Color(0xFFE38FE8);
@@ -313,7 +325,7 @@ class _CandlePainter extends CustomPainter {
     final body = math.max(2.0,math.min(bar*.62,14.0));
     for (var i=0; i<candles.length; i++) {
       final c=candles[i], x=bar*(i+.5);
-      final color=c.rising ? rise : fall;
+      final color=_directionColor(c.openCents, c.closeCents);
       final paint=Paint()..color=color..strokeWidth=1.5;
       // The *one* aggregated active candle is painted in cyan below. Do
       // not draw the last committed body underneath it as a fake 1m ghost.
@@ -358,7 +370,7 @@ class _CandlePainter extends CustomPainter {
       final mark=indicativePriceCents!;
       final top=y(math.max(open,mark));
       final bottom=y(math.min(open,mark));
-      final color = mark >= open ? rise : fall;
+      final color = _directionColor(open, mark);
       final p=Paint()..color=color.withAlpha(175)..strokeWidth=1.6;
       if (showIndicativeWick &&
           !(overlayLastCommitted && preferCommittedBody)) {
@@ -398,6 +410,12 @@ class _CandlePainter extends CustomPainter {
     _label(canvas,'第 ${candles.last.step} 步',
         Offset(math.max(2.0,right-68),size.height-18));
     _label(canvas,'量',Offset(right+8,size.height-32));
+  }
+
+  Color _directionColor(num open, num close) {
+    if (close > open) return rise;
+    if (close < open) return fall;
+    return flat;
   }
 
   @override

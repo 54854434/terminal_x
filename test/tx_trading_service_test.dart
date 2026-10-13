@@ -118,6 +118,40 @@ void main() {
         service.current.session.exportJson());
   });
 
+  test('automatic saves batch simulation while manual action flushes safely',
+      () async {
+    service = TxTradingService(db, automaticSaveMinutes: 2);
+    final first = await service.open();
+    final pulse = await service.marketPulse(15, deferSave: true);
+    expect(pulse.pending, isTrue);
+    expect(pulse.revision, first.revision);
+    expect(service.durableCurrent.session.marketTimeStep, 0);
+    expect((await db.readCurrent())!.session.marketTimeStep, 0);
+
+    final minuteOne = await service.nextTick(deferSave: true);
+    expect(minuteOne.pending, isTrue);
+    expect(minuteOne.session.step, 1);
+    expect(service.durableCurrent.session.step, 0);
+    expect((await db.readCurrent())!.session.step, 0);
+
+    final minuteTwo = await service.nextTick(deferSave: true);
+    expect(minuteTwo.pending, isFalse);
+    expect(minuteTwo.revision, first.revision + 1);
+    expect(minuteTwo.session.step, 2);
+    expect(service.durableCurrent.session.step, 2);
+    expect((await db.readCurrent())!.session.step, 2);
+
+    final pending = await service.nextTick(deferSave: true);
+    expect(pending.pending, isTrue);
+    final order = await service.place(
+      symbol: TxSession.symbols[0], side: TxSide.buy,
+      kind: TxKind.market, quantity: 1);
+    expect(order.status, TxStatus.filled);
+    expect(service.current.pending, isFalse);
+    expect((await db.readCurrent())!.session.step, 3);
+    expect((await db.readCurrent())!.session.playerFills, isNotEmpty);
+  });
+
   test('ticks persist and new service instance reads same account', () async {
     await service.open();
     await service.nextTick();

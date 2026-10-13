@@ -43,7 +43,9 @@ class TxFrameCandleProjection {
 
   /// Direction is based on the provisional bucket's open, NOT the
   /// previous frame's close. A visual cue, never an executed trade.
-  bool get rising => closeCents >= openCents;
+  bool get rising => closeCents > openCents;
+  bool get falling => closeCents < openCents;
+  bool get flat => closeCents == openCents;
 
   static TxFrameCandleProjection fromLastCommitted({
     required TxCandle lastAggregated,

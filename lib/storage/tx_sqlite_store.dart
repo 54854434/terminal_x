@@ -167,10 +167,19 @@ class TxStoredSession {
     required this.session,
     required this.revision,
     required this.sha256,
+    this.pending = false,
+    this.pendingOperations = 0,
   });
   final TxSession session;
+  /// Current session projection. The trading service exposes a separate
+  /// durable mirror when this object represents an in-memory candidate.
+  /// Last SQLite revision. The in-memory trading service may temporarily show
+  /// a newer candidate while automatic saving is deferred; in that case this
+  /// value intentionally remains the durable revision.
   final int revision;
   final String sha256;
+  final bool pending;
+  final int pendingOperations;
 }
 
 class TxSqliteStore extends GeneratedDatabase {
@@ -181,6 +190,11 @@ class TxSqliteStore extends GeneratedDatabase {
   static const String migrationSource = 'v01c_shared_preferences';
   static const String _checkpointPolicyKey = 'checkpoint_interval';
   static const String _marketPulseSecondsKey = 'market_pulse_seconds_v1';
+  static const String _automaticSaveMinutesKey =
+      'automatic_save_minutes_v1';
+  static const int defaultAutomaticSaveMinutes = 5;
+  static const int minAutomaticSaveMinutes = 1;
+  static const int maxAutomaticSaveMinutes = 60;
   static const String _candleIndexKey = 'candle_index_v1';
   TxLiveCandles? _indexedCandles;
   int? _indexedRevision;
@@ -284,7 +298,8 @@ class TxSqliteStore extends GeneratedDatabase {
   }
 
   /// User-selected *economic* market cadence. This is intentionally separate
-  /// from the SQLite checkpoint policy: every real trade remains durable.
+  /// from the SQLite checkpoint and automatic-save policies. Player actions
+  /// remain durable immediately; automatic simulation may be pending.
   Future<int> readMarketPulseSeconds() async {
     final row = await customSelect('''
       SELECT value FROM storage_metadata WHERE key = ?
@@ -307,6 +322,44 @@ class TxSqliteStore extends GeneratedDatabase {
         INSERT INTO storage_metadata(key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       ''', <Object?>[_marketPulseSecondsKey, seconds.toString()]);
+    });
+  }
+
+  /// Automatic simulation persistence cadence, measured in game minutes.
+  /// This controls only background simulation writes. Player actions and
+  /// lifecycle flushes remain immediate and durable.
+  Future<int> readAutomaticSaveMinutes() async {
+    final row = await customSelect('''
+      SELECT value FROM storage_metadata WHERE key = ?
+    ''', variables: [Variable.withString(_automaticSaveMinutesKey)])
+        .getSingleOrNull();
+    if (row == null) return defaultAutomaticSaveMinutes;
+    final minutes = int.tryParse(row.read<String>('value'));
+    if (minutes == null ||
+        minutes < minAutomaticSaveMinutes ||
+        minutes > maxAutomaticSaveMinutes) {
+      throw StateError('Invalid automatic SQLite save cadence');
+    }
+    return minutes;
+  }
+
+  Future<void> setAutomaticSaveMinutes(int minutes) async {
+    if (minutes < minAutomaticSaveMinutes ||
+        minutes > maxAutomaticSaveMinutes) {
+      throw ArgumentError.value(minutes, 'automaticSaveMinutes');
+    }
+    await transaction(() async {
+      final head = await customSelect('''
+        SELECT revision FROM sessions WHERE session_id = ?
+      ''', variables: [Variable.withString(primarySessionId)])
+          .getSingleOrNull();
+      if (head == null) {
+        throw StateError('SQLite session must be initialized before setting cadence');
+      }
+      await customStatement('''
+        INSERT INTO storage_metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      ''', <Object?>[_automaticSaveMinutesKey, minutes.toString()]);
     });
   }
 

@@ -1,4 +1,6 @@
-/// Verified OHLC/volume derived only from committed engine snapshots.
+/// OHLC/volume derived from real engine snapshots. Durable history uses only
+/// committed snapshots; the live UI may pass an explicitly labelled candidate
+/// before its SQLite revision is flushed.
 ///
 /// Background participants may match multiple times *inside* one simulated
 /// minute, so scanning the real new fill prices is necessary to preserve
@@ -25,7 +27,9 @@ class TxCandle {
   final int closeCents;
   final int volumeShares;
 
-  bool get rising => closeCents >= openCents;
+  bool get rising => closeCents > openCents;
+  bool get falling => closeCents < openCents;
+  bool get flat => closeCents == openCents;
 }
 
 class TxCandleHistory {

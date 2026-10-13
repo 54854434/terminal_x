@@ -1,5 +1,7 @@
 /// Fail-closed trading service. Private market calculations are isolated from
-/// the UI; only SQLite-committed revisions become visible or actionable.
+/// the UI; automatic playback may expose an explicitly labelled in-memory
+/// candidate while SQLite persistence is deferred. Player actions and
+/// lifecycle boundaries always require a durable revision first.
 import 'dart:isolate';
 
 import '../engine/tx_engine.dart';
@@ -75,8 +77,10 @@ class TxTickTimings {
 class TxTradingService {
   TxTradingService(this.database, {TxSession Function()? initialSessionFactory,
       this.persistentMarketWorker = false,
-      this.nativeMarketWorker = false})
-      : _initialSessionFactory = initialSessionFactory ?? TxSession.fresh;
+      this.nativeMarketWorker = false,
+      int? automaticSaveMinutes})
+      : _initialSessionFactory = initialSessionFactory ?? TxSession.fresh,
+        _requestedAutomaticSaveMinutes = automaticSaveMinutes;
 
   final TxSqliteStore database;
   final TxSession Function() _initialSessionFactory;
@@ -85,19 +89,40 @@ class TxTradingService {
   final bool persistentMarketWorker;
   /// Production Android Rust-first matching; no Dart-only fallback.
   final bool nativeMarketWorker;
+  final int? _requestedAutomaticSaveMinutes;
   TxPersistentMarketWorker? _worker;
   TxStoredSession? _current;
+  TxStoredSession? _durableCurrent;
   bool _busy = false;
   bool _storageFault = false;
   TxTickTimings? _lastTickTimings;
+  int _automaticSaveMinutes = TxSqliteStore.defaultAutomaticSaveMinutes;
+  int _pendingAutomaticOperations = 0;
+  int _pendingGameMinutes = 0;
+
 
   /// Null until the first complete, durably committed and acknowledged tick.
   /// On failure the previous sample is cleared rather than reported as new.
   TxTickTimings? get lastTickTimings => _lastTickTimings;
 
+  int get automaticSaveMinutes => _automaticSaveMinutes;
+  bool get hasPendingPersistence => _current?.pending ?? false;
+  int get pendingAutomaticOperations => _pendingAutomaticOperations;
+  int get pendingGameMinutes => _pendingGameMinutes;
+
   TxStoredSession get current {
     if (_current == null) throw StateError('SQLite session not initialized');
     return _current!;
+  }
+
+  /// The last complete SQLite snapshot. During deferred automatic playback,
+  /// [current] may be a newer in-memory candidate while this remains the
+  /// exact recovery boundary shown as "已提交" in the UI.
+  TxStoredSession get durableCurrent {
+    if (_durableCurrent == null) {
+      throw StateError('SQLite session not initialized');
+    }
+    return _durableCurrent!;
   }
 
   bool get blocked => _storageFault;
@@ -109,11 +134,19 @@ class TxTradingService {
     try {
       final loaded = await database.readCurrent() ??
           await database.initializeFresh(_initialSessionFactory());
+      final configured = _requestedAutomaticSaveMinutes ??
+          await database.readAutomaticSaveMinutes();
+      if (configured < TxSqliteStore.minAutomaticSaveMinutes ||
+          configured > TxSqliteStore.maxAutomaticSaveMinutes) {
+        throw StateError('Invalid automatic SQLite save cadence');
+      }
+      _automaticSaveMinutes = configured;
       if (persistentMarketWorker) {
         _worker = await TxPersistentMarketWorker.start(loaded.session,
             useNative: nativeMarketWorker);
       }
       _current = loaded;
+      _durableCurrent = loaded;
       return loaded;
     } catch (_) {
       _storageFault = true;
@@ -187,9 +220,13 @@ class TxTradingService {
     return TxMinuteEventTape.fromCommits(before, after);
   }
 
-  /// Real Rust market pulse in the ongoing game minute. As with nextTick,
-  /// nothing becomes visible until SQLite has committed and acknowledged it.
-  Future<TxStoredSession> marketPulse(int second) async {
+  /// Real Rust market pulse in the ongoing game minute.
+  ///
+  /// Automatic playback may defer SQLite persistence. The candidate is still
+  /// produced by the isolated Rust/Dart worker and becomes the only in-memory
+  /// runtime state; player actions and lifecycle flushes force a durable save.
+  Future<TxStoredSession> marketPulse(int second,
+      {bool deferSave = false}) async {
     _ensureReady();
     if (second < 5 || second >= 60) {
       throw ArgumentError.value(second, 'second');
@@ -200,8 +237,12 @@ class TxTradingService {
       final candidate = _worker != null
           ? (await _worker!.pulse(second)).session
           : await _pulseDetached(current.session, second);
-      await _commit(candidate);
-      await _ackWorkerCommit();
+      if (deferSave) {
+        _publishPending(candidate);
+      } else {
+        await _commit(candidate);
+        await _ackWorkerCommit();
+      }
       return current;
     } catch (_) {
       if (_worker != null) {
@@ -215,7 +256,7 @@ class TxTradingService {
     }
   }
 
-  Future<TxStoredSession> nextTick() async {
+  Future<TxStoredSession> nextTick({bool deferSave = false}) async {
     _ensureReady();
     _busy = true;
     _lastTickTimings = null;
@@ -225,15 +266,22 @@ class TxTradingService {
           ? (await _worker!.tick()).session
           : await _tickDetached(current.session);
       final marketMicros = clock.elapsedMicroseconds;
-      await _commit(candidate);
+      if (deferSave) _publishPending(candidate, minute: true);
+      final shouldFlush = !deferSave ||
+          _pendingGameMinutes >= _automaticSaveMinutes;
+      if (shouldFlush) {
+        await _commit(candidate);
+      }
       final sqliteMicros = clock.elapsedMicroseconds - marketMicros;
-      await _ackWorkerCommit();
+      if (shouldFlush) await _ackWorkerCommit();
       final ackMicros = clock.elapsedMicroseconds - marketMicros - sqliteMicros;
-      _lastTickTimings = TxTickTimings(
-        market: Duration(microseconds: marketMicros),
-        sqlite: Duration(microseconds: sqliteMicros),
-        acknowledgement: Duration(microseconds: ackMicros),
-      );
+      if (shouldFlush) {
+        _lastTickTimings = TxTickTimings(
+          market: Duration(microseconds: marketMicros),
+          sqlite: Duration(microseconds: sqliteMicros),
+          acknowledgement: Duration(microseconds: ackMicros),
+        );
+      }
       return current;
     } catch (_) {
       if (_worker != null) {
@@ -245,6 +293,45 @@ class TxTradingService {
     } finally {
       _busy = false;
     }
+  }
+
+  void _publishPending(TxSession candidate, {bool minute = false}) {
+    if (minute) _pendingGameMinutes++;
+    _pendingAutomaticOperations++;
+    final durable = durableCurrent;
+    _current = TxStoredSession(
+      session: candidate,
+      revision: durable.revision,
+      sha256: durable.sha256,
+      pending: true,
+      pendingOperations: _pendingAutomaticOperations,
+    );
+  }
+
+  /// Persist the current automatic candidate. This is the only path used by
+  /// lifecycle/exit safety and by changing the automatic save cadence.
+  Future<TxStoredSession> flushPending() async {
+    _ensureReady();
+    if (!hasPendingPersistence) return current;
+    _busy = true;
+    try {
+      final candidate = current.session;
+      await _commit(candidate);
+      await _ackWorkerCommit();
+      return current;
+    } finally {
+      _busy = false;
+    }
+  }
+
+  Future<void> setAutomaticSaveMinutes(int minutes) async {
+    if (minutes < TxSqliteStore.minAutomaticSaveMinutes ||
+        minutes > TxSqliteStore.maxAutomaticSaveMinutes) {
+      throw ArgumentError.value(minutes, 'automaticSaveMinutes');
+    }
+    await flushPending();
+    await database.setAutomaticSaveMinutes(minutes);
+    _automaticSaveMinutes = minutes;
   }
 
   Future<void> _ackWorkerCommit() async {
@@ -296,15 +383,24 @@ class TxTradingService {
         candidate, expectedRevision: current.revision,
       );
       _current = saved;
+      _durableCurrent = saved;
     } catch (_) {
       _storageFault = true;
       rethrow;
     }
+    _pendingAutomaticOperations = 0;
+    _pendingGameMinutes = 0;
   }
 
   Future<void> close() async {
-    _worker?.close();
-    _worker = null;
-    await database.close();
+    try {
+      if (!_storageFault && hasPendingPersistence && !_busy) {
+        await flushPending();
+      }
+    } finally {
+      _worker?.close();
+      _worker = null;
+      await database.close();
+    }
   }
 }

@@ -1,7 +1,8 @@
 /// Frame-driven game clock used only for *provisional* intraminute display.
 ///
-/// A real NPC pulse or complete minute becomes authoritative only AFTER its
-/// own SQLite revision commits. At most one request may be in flight.
+/// A real NPC pulse or complete minute becomes a playback candidate after its
+/// isolated worker finishes; it becomes the recovery authority only AFTER its
+/// SQLite revision commits. At most one request may be in flight.
 /// Slow storage lowers achieved speed; the clock never skips ledger minutes,
 /// fabricates fills, or creates an unbounded transaction queue.
 ///
@@ -128,9 +129,9 @@ class TxContinuousFlowClock {
     return _frame(false);
   }
 
-  /// Call this ONLY after a verified SQLite transaction has committed.
-  /// If the user pressed pause during the write, remain paused at second 0
-  /// of the now-authoritative next minute; never start the next timer.
+  /// Call this after the isolated minute candidate has been accepted. When
+  /// automatic persistence is deferred, the candidate remains explicitly
+  /// pending in SQLite and lifecycle/player actions must flush it.
   void completeMinuteCommit() {
     if (!_awaitingCommit || _faulted) {
       throw StateError('No outstanding safe minute boundary');
@@ -139,8 +140,8 @@ class TxContinuousFlowClock {
     _awaitingCommit = false;
   }
 
-  /// A real intraminute Rust order-book revision has been durably committed.
-  /// Unlike a finished minute, preserve the clock position for the next pulse.
+  /// A real intraminute Rust order-book candidate has been accepted. Unlike a
+  /// finished minute, preserve the clock position for the next pulse.
   void completePulseCommit() {
     if (!_awaitingCommit || _faulted ||
         _fractionalGameMicros <= 0 ||
@@ -165,6 +166,28 @@ class TxContinuousFlowClock {
     needsPulseCommit: pulse,
     isWaitingForStorage: _awaitingCommit,
   );
+}
+
+/// Display-only motion used while an already-reached boundary is being
+/// verified and written. It never advances [TxContinuousFlowClock], changes a
+/// price, or authorizes another market operation. Keeping this calculation
+/// independent lets the UI show that safe settlement is active without
+/// presenting uncommitted game time as durable state.
+class TxSettlementMotion {
+  const TxSettlementMotion._();
+
+  static const Duration cycle = Duration(milliseconds: 720);
+
+  static double phase(Duration elapsed) {
+    if (elapsed.isNegative) {
+      throw ArgumentError.value(elapsed, 'elapsed');
+    }
+    final cycleMicros = cycle.inMicroseconds;
+    if (cycleMicros <= 0) {
+      throw StateError('Invalid settlement animation cycle');
+    }
+    return (elapsed.inMicroseconds % cycleMicros) / cycleMicros;
+  }
 }
 
 /// Bounded operational telemetry for one minute's worker+SQLite round-trip.

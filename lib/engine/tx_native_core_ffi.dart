@@ -1,8 +1,8 @@
-/// R36: opt-in ABI bridge for the future Rust matching backend.
+/// ABI v2 bridge for the Android Rust matching backend.
 ///
-/// No import or automatic initialization is performed by the production
-/// trading service. An unavailable native library MUST NOT alter accounts,
-/// commits, clock, or current Dart engine behavior.
+/// The production market worker opens this only on Android. An unavailable
+/// native library MUST fail closed; it must not silently switch to a Dart-only
+/// execution path for the Android game.
 ///
 /// The exported C ABI uses integer cents, quantities and stable numeric ids.
 /// The real app's STRING account/order identifiers must be mapped by a
@@ -70,9 +70,9 @@ class TxNativeCoreFfi {
   final ffi.DynamicLibrary _library;
   ffi.Pointer<ffi.Void> _engine;
 
-  /// Dynamically loads an already-built library. This does not build or
-  /// extract an Android .so; the current ZIP importer has no Rust NDK step.
-  /// The production trading service intentionally does not call this method.
+  /// Dynamically loads an already-built library. The release workflow builds
+  /// and packages the ARM64 .so; this method only validates its ABI and owns
+  /// the per-isolate native handle.
   static TxNativeCoreFfi open(ffi.DynamicLibrary library) {
     final version = library.lookupFunction<ffi.Uint32 Function(),
         int Function()>('tx_core_abi_version')();

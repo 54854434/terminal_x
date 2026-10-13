@@ -1,4 +1,4 @@
-/// Terminal X 0.3.0 unified trading interface and position analytics.
+/// Terminal X 0.3.4 unified trading interface and position analytics.
 /// Existing V0.2 + V0.1 apps and backups are never accessed.
 import 'dart:async';
 import 'dart:io';
@@ -68,7 +68,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const green = TxTerminalColors.buy;
   static const red = TxTerminalColors.sell;
-  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.1');
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.4');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
@@ -95,6 +95,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   int _symbol = 0;
   int _speed = 1;
   final ValueNotifier<double> _seconds = ValueNotifier<double>(0.0);
+  final ValueNotifier<bool> _settling = ValueNotifier<bool>(false);
+  final ValueNotifier<double> _settlementPhase = ValueNotifier<double>(0.0);
   bool _auto = false;
   bool _busy = false;
   bool _loading = true;
@@ -102,6 +104,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   TxSide _ticketSide = TxSide.buy;
   int _recordMode = 0;
   int _marketTapeRequested = TxMarketTapeWindow.pageSize;
+  int _automaticSaveMinutes = TxSqliteStore.defaultAutomaticSaveMinutes;
+  int _automaticSaveDraft = TxSqliteStore.defaultAutomaticSaveMinutes;
   String _notice = '正在检查 SQLite';
   String? _fault;
   String _rustStatus = '等待 Rust 核心';
@@ -129,7 +133,36 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) _pause();
+    if (state != AppLifecycleState.resumed) {
+      _pause();
+      unawaited(_flushPendingOnBackground());
+    }
+  }
+
+  Future<void> _flushPendingOnBackground() async {
+    final service = _trader;
+    if (service == null) return;
+    final operation = _operation;
+    if (_busy && operation != null) {
+      try {
+        await operation;
+      } catch (_) {
+        return;
+      }
+    }
+    if (!service.hasPendingPersistence) return;
+    try {
+      final saved = await service.flushPending();
+      if (mounted) {
+        setState(() => _notice =
+            '后台切换前已安全保存 SQLite r${saved.revision}');
+      }
+    } catch (error) {
+      if (mounted) {
+        _pause();
+        setState(() => _fault = '后台安全保存失败，已停止运行：$error');
+      }
+    }
   }
 
   // A pause is never gated by _busy. An in-flight atomic SQLite write is
@@ -146,7 +179,18 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   // Vsync advances ONLY provisional time. The chart's cyan preview never
   // adds a fill, cash transaction or committed OHLCV observation.
   void _onPlaybackFrame(Duration elapsed) {
-    if (!mounted || !_auto || _fault != null) return;
+    if (!mounted || _fault != null) return;
+    if (_flow.awaitingCommit) {
+      // Keep only a small status-strip animation alive while the already
+      // reached boundary is being audited and committed. Do not advance
+      // [_seconds] or any market state until SQLite has acknowledged it.
+      _previousFrame = elapsed;
+      if (_settling.value) {
+        _settlementPhase.value = TxSettlementMotion.phase(elapsed);
+      }
+      return;
+    }
+    if (!_auto) return;
     final previous = _previousFrame;
     // Keep the Ticker alive during SQLite I/O, but drop elapsed wall time
     // while the one-and-only minute commit is unresolved. Never catch up
@@ -208,6 +252,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       final initial = await service.open();
       final checkpointInterval = await service.database.readCheckpointInterval();
       final pulseSeconds = await service.database.readMarketPulseSeconds();
+      final automaticSaveMinutes = service.automaticSaveMinutes;
       _flow.setPulseSeconds(pulseSeconds);
       // Once, not on every committed tick. 64 recent revisions are enough to
       // reconstruct recent candles without loading the entire database.
@@ -226,6 +271,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         _candles = candles;
         _checkpointInterval = checkpointInterval;
         _checkpointDraft = checkpointInterval;
+        _automaticSaveMinutes = automaticSaveMinutes;
+        _automaticSaveDraft = automaticSaveMinutes;
         _price.text = money(initial.session.lastPrice(_symbolName));
         _notice = 'Rust 交易核心已启动，独立测试账户；行情默认暂停';
         _rustStatus = 'ARM64 ABI v2 已绑定';
@@ -254,6 +301,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     } else {
       // Automatic minute commits stay single-flight, but do not flash a
       // global loading indicator or rebuild the entire UI before each save.
+      _settling.value = true;
+      _settlementPhase.value = 0.0;
       _busy = true;
     }
     _operation = _perform(work, automated: automated, pulse: pulse);
@@ -266,17 +315,25 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       final before = trader.current;
       final notice = await work(trader);
       final after = trader.current;
-      // This operation uses only the previous and current verified states;
-      // no readHistory(160) for each game minute.
-      if (before.revision != after.revision) {
+      // Use the latest authoritative in-memory candidate for the live chart.
+      // Automatic persistence may keep the same SQLite revision for several
+      // game minutes, so revision changes alone are no longer a sufficient
+      // repaint signal.
+      final changed = before.revision != after.revision ||
+          before.session.step != after.session.step ||
+          before.session.marketTimeStep != after.session.marketTimeStep ||
+          before.session.engine.fillCount != after.session.engine.fillCount;
+      if (changed) {
         for (final symbol in TxSession.symbols) {
           _previousBookQty[symbol] =
               _currentDepthQuantities(before.session, symbol);
         }
-        _candles!.addCommit(before, after);
+        _candles!.addObservation(before.session, after.session);
       }
       if (automated) {
-        // Transaction finished: only NOW may the minute boundary appear.
+        // The isolated candidate finished computing. If the save cadence is
+        // greater than one minute, SQLite remains explicitly marked pending;
+        // the status strip exposes that durable boundary to the player.
         if (pulse) {
           _flow.completePulseCommit();
           if (mounted) _seconds.value = _flow.minuteProgress * 60.0;
@@ -284,17 +341,22 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           _flow.completeMinuteCommit();
           if (mounted) _seconds.value = 0;
         }
-        if (_auto && !pulse) {
+        if (mounted) {
+          _settling.value = false;
+          _settlementPhase.value = 0.0;
+        }
+        if (_auto && !pulse && !after.pending) {
           _committedSpeed.record(
             elapsedMilliseconds: _speedStopwatch.elapsedMilliseconds,
             minute: after.session.step,
           );
         }
-        // No arbitrary 60-minute playback cut-off. The database checkpoint
-        // interval independently bounds recovery work; every minute still
-        // finishes a verified atomic commit before the next minute begins.
+        // No arbitrary 60-minute playback cut-off. Checkpoint cadence bounds
+        // recovery work; automatic save cadence bounds intentional loss after
+        // a crash. Player actions and lifecycle transitions force a flush.
       }
-      // finally performs the single build for this committed minute.
+      // Finally performs the single state build for this operation. The
+      // status strip also exposes deferred SQLite work to the player.
       // Avoid a second full-page build while displaying the new revision.
       if (mounted) _notice = notice;
     } catch (e) {
@@ -302,6 +364,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       // stop instead of risking another order against stale state.
       _pause();
       _flow.storageFailed();
+      if (mounted) {
+        _settling.value = false;
+        _settlementPhase.value = 0.0;
+      }
       if (mounted) setState(() =>
           _fault = '交易或历史检查异常；已暂停并保留数据：$e');
     } finally {
@@ -321,11 +387,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   void _pulse(int second) {
     _operate((service) async {
       final latency = Stopwatch()..start();
-      final next = await service.marketPulse(second);
+      final next = await service.marketPulse(second, deferSave: true);
       latency.stop();
       _pulseLatency.add(latency.elapsed);
       return 'Rust 真实盘口第 ${next.session.marketTimeStep} 分钟 ${second}s'
-          ' · SQLite r${next.revision}';
+          '${next.pending ? ' · 待保存 ${next.pendingOperations} 项' :
+          ' · SQLite r${next.revision}'}';
     }, automated: true, pulse: true);
   }
 
@@ -337,18 +404,19 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     }
     _operate((service) async {
     final latency = Stopwatch()..start();
-    final next = await service.nextTick();
+    final next = await service.nextTick(deferSave: automatic);
     latency.stop();
-    // Record only successful, durable minute commits, never failed attempts.
-    _commitLatency.add(latency.elapsed);
     final timings = service.lastTickTimings;
     if (timings != null) {
+      // Only a completed SQLite flush is a commit-latency sample.
+      _commitLatency.add(latency.elapsed);
       _marketLatency.add(timings.market);
       _sqliteLatency.add(timings.sqlite);
     }
     return '模拟第 ${TxSimulationClock.gameDay(next.session.step)} 天 '
         '${TxSimulationClock.hhmm(next.session.step)} · '
-        'SQLite r${next.revision}';
+        '${next.pending ? '待保存 ${service.pendingGameMinutes} 个游戏分钟' :
+        'SQLite r${next.revision}'}';
     }, automated: automatic);
   }
 
@@ -418,9 +486,20 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   void _saveCheckpointInterval() {
     final selected = _checkpointDraft;
     _operate((service) async {
+      await service.flushPending();
       await service.database.setCheckpointInterval(selected);
       if (mounted) setState(() => _checkpointInterval = selected);
-      return '完整检查点间隔已设为每 $selected 次成功提交；每笔交易和每个游戏分钟仍会安全保存';
+      return '完整检查点间隔已设为每 $selected 次成功保存；不改变自动保存周期';
+    });
+  }
+
+  void _saveAutomaticSaveMinutes() {
+    final selected = _automaticSaveDraft;
+    _operate((service) async {
+      await service.setAutomaticSaveMinutes(selected);
+      if (mounted) setState(() => _automaticSaveMinutes = selected);
+      return '自动 SQLite 保存周期已设为每 $selected 个游戏分钟；'
+          '玩家操作、切后台和退出仍立即保存';
     });
   }
 
@@ -496,10 +575,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     if (!_ready || _flow.awaitingCommit || _flow.faulted ||
         seconds < 5 || seconds > 60 || seconds == _flow.pulseSeconds) return;
     _operate((service) async {
+      await service.flushPending();
       await service.database.setMarketPulseSeconds(seconds);
       if (mounted) setState(() => _flow.setPulseSeconds(seconds));
       return '真实 Rust 盘口间隔已保存：每 $seconds 游戏秒；'
-          '每次交易仍经 SQLite 原子提交';
+          '玩家操作仍经 SQLite 原子提交，自动行情按保存周期落盘';
     });
   }
 
@@ -638,6 +718,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         .where((f) => f.symbol == _symbolName).toList();
     final minuteVolume = minuteFills.fold<int>(0, (sum, f) => sum + f.quantity);
     final price = session.lastPrice(_symbolName);
+    final durablePrice = _trader!.durableCurrent.session.lastPrice(_symbolName);
     final candles = _candles!.forSymbol(_symbolName);
     return ListView(padding: const EdgeInsets.all(14), children: [
       TxMarketRadar(quotes: [
@@ -649,9 +730,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           _symbol=i;
           _price.text=money(session.lastPrice(_symbolName));
         })),
-      TxMarketHero(symbol: _symbolName, committedPriceCents: price,
+      TxMarketHero(symbol: _symbolName, committedPriceCents: durablePrice,
         step: session.step, seconds: _seconds,
         indicativeCents: (seconds) => _indication(session, seconds),
+        pending: _trader!.current.pending,
         onBuy: () => _openTradeTicket(TxSide.buy),
         onSell: () => _openTradeTicket(TxSide.sell)),
       RepaintBoundary(child: Card(child: Padding(
@@ -660,6 +742,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           valueListenable: _seconds,
           builder: (context, seconds, child) => TxCandleChart(
             candles: candles,
+            pending: _trader!.current.pending,
             activeMinuteStep: session.lastPulseSecond > 0
                 ? session.marketTimeStep : null,
             // At exactly 0 seconds of an automatically running minute,
@@ -722,7 +805,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                 ? _showCustomMarketPulse : null,
               child: const Text('自定义', style: TextStyle(fontSize: 10))),
           ])),
-          const Text('间隔越短盘口越实时，但 Rust 撮合与 SQLite 提交次数越多；'
+          const Text('间隔越短盘口越实时，但 Rust 盘口计算次数越多；SQLite 自动保存由上方周期单独控制。'
               '60s 为原有分钟结算模式。',
               style: TextStyle(color: Colors.white54, fontSize: 10)),
           const SizedBox(height: 8),
@@ -745,12 +828,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
               '目标倍速不等于实际达成倍速；SQLite 慢时自动背压，不补跳。',
               style: TextStyle(color: Colors.white60, fontSize: 11)),
           const SizedBox(height: 4),
-          Text('目标 ${_speed}× · 实际已提交 ${_committedSpeed.achievedMultiplier.toStringAsFixed(1)}×'
-              ' · 每分钟安全提交',
+          Text('目标 ${_speed}× · 实际已落盘 ${_committedSpeed.achievedMultiplier.toStringAsFixed(1)}×'
+              ' · 以完整 SQLite 保存为准',
               style: const TextStyle(color: Colors.white60, fontSize: 11)),
           if (_pulseLatency.count > 0)
-            Text('实时盘口最近 ${_pulseLatency.count} 次提交 p95 '
-                '${_pulseLatency.p95Milliseconds} ms（Rust + SQLite）',
+            Text('实时盘口最近 ${_pulseLatency.count} 次候选 p95 '
+                '${_pulseLatency.p95Milliseconds} ms（Rust worker，不含 SQLite 落盘）',
                 style: const TextStyle(color: Colors.white60, fontSize: 11)),
           if (_commitLatency.count > 0) ...[
             Text('最近 ${_commitLatency.count} 次有效分钟提交耗时 p95 '
@@ -783,8 +866,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         ]),
       )),
       const SizedBox(height: 8),
-      const Text('分时右端青色连续线及各周期青色空心蜡烛为未结算指示报价；真实 OHLC、均线与成交量均取自已提交记录。'
-          '成交量仅统计真实撮合，不把秒级报价变动伪造成交易。',
+      const Text('分时右端青色连续线及各周期青色空心蜡烛为未结算指示报价；真实 OHLC、均线与成交量均取自真实撮合。'
+          '自动保存周期内的实时图可包含已标注的待保存候选，重启只恢复 SQLite 已落盘记录；成交量不把秒级报价变动伪造成交易。',
           style: TextStyle(color: Colors.white54, fontSize: 11)),
     ]);
   }
@@ -824,8 +907,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       setState(() => _notice = '请先输入有效的市价委托股数');
       return;
     }
-    // This is a synchronous read-only preflight against the last durable
-    // revision. Trigger only on request, never on a frame or each keystroke.
+    // This is a synchronous read-only preflight against the latest real
+    // in-memory book. Trigger only on request, never on a frame or each
+    // keystroke; a pending candidate remains explicitly labelled below.
     final saved = _trader!.current;
     final symbol = _symbolName;
     TxExecutionEstimate estimate;
@@ -847,7 +931,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('已提交存档 r${saved.revision} 的盘口快照',
+          Text(saved.pending
+              ? '当前内存盘口候选 · SQLite 恢复边界 r${saved.revision}'
+              : '已提交存档 r${saved.revision} 的盘口快照',
             style: const TextStyle(color: Colors.white70, fontSize: 12)),
           const SizedBox(height: 8),
           Text('申请 $quantity 股 · 预计可成交 ${estimate.executableShares} 股'),
@@ -1178,7 +1264,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Widget _assets(TxSession session, TxStoredSession saved) {
     final account = session.engine.account(TxSession.playerId);
     final holdings = _positionsForRevision(session, saved.revision);
-    final risk = TxPortfolioRisk.compute(session);
+    // Concentration/liquidity diagnostics are intentionally anchored to the
+    // last durable account snapshot; live mark-to-market remains below.
+    final risk = TxPortfolioRisk.compute(_trader!.durableCurrent.session);
     final reliable = holdings.values.every((p) => p.costKnown);
     final unrealized = holdings.values.fold<int>(0,
         (total, p) => total + p.unrealizedPnlCents);
@@ -1203,7 +1291,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
               if (reliable) pnlValue('累计已实现盈亏', realized),
           ])));
         }),
-      _title('仓位风险仪表盘', sub: '仅分析已提交资产；参考阈值用于模拟游戏，不发出交易指令'),
+      _title('仓位风险仪表盘', sub: saved.pending
+          ? '按 SQLite 已落盘资产分析；当前行情候选只影响下方实时估值'
+          : '仅分析已提交资产；参考阈值用于模拟游戏，不发出交易指令'),
       Card(child: Padding(padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('股票市值 ¥${money(risk.investedCents)} · '
@@ -1329,13 +1419,45 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           const Text('建议 32 次（默认）。较短间隔恢复更快，但完整存档更多；'
             '较长间隔可能节省空间，恢复时需要回放更多增量。'
             '为保证安全，每 64 次提交仍强制生成完整检查点。'
-            '本设置不是每隔若干分钟才存钱，所有真实交易均立即原子提交。',
+            '检查点只是恢复加速；自动保存周期另行设置。玩家交易仍立即原子提交。',
+            style: TextStyle(fontSize: 11, color: Colors.white60)),
+        ]))),
+      _title('自动保存周期', sub: '降低连续行情的 SQLite 写入频率；显示中的待保存状态不会伪装成已落盘'),
+      Card(child: Padding(padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('当前：每 $_automaticSaveMinutes 个游戏分钟自动保存',
+            style: const TextStyle(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 5),
+          Text('选择：每 $_automaticSaveDraft 个游戏分钟',
+            style: const TextStyle(color: TxTerminalColors.secondaryText)),
+          Wrap(spacing: 6, runSpacing: 4, children: [
+            for (final minutes in const [1, 5, 15, 30, 60])
+              ChoiceChip(label: Text('$minutes 分钟'),
+                selected: _automaticSaveDraft == minutes,
+                onSelected: _ready
+                  ? (_) => setState(() => _automaticSaveDraft = minutes)
+                  : null),
+          ]),
+          const SizedBox(height: 9),
+          FilledButton.icon(onPressed: _ready &&
+              _automaticSaveDraft != _automaticSaveMinutes
+                ? _saveAutomaticSaveMinutes : null,
+            icon: const Icon(Icons.save_outlined, size: 18),
+            label: const Text('保存自动保存周期')),
+          const SizedBox(height: 6),
+          const Text('自动行情最多保留到最近一次保存的状态；崩溃时可能丢失未保存的模拟分钟，'
+            '但不会破坏已保存的 SQLite 链。玩家下单、切后台和退出前会强制保存。',
             style: TextStyle(fontSize: 11, color: Colors.white60)),
         ]))),
       _title('存档状态'),
       Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(
         crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('修订 ${saved.revision} · 模拟步数 ${session.step}'),
+          if (saved.pending)
+            Text('当前内存状态待保存 ${saved.pendingOperations} 项、'
+                '${_trader!.pendingGameMinutes}/$_automaticSaveMinutes 个游戏分钟 · '
+                'SQLite 仍为 r${saved.revision}',
+              style: const TextStyle(color: TxTerminalColors.primary)),
           ValueListenableBuilder<double>(valueListenable: _seconds,
             builder: (context, second, child) => Text(
               '第 ${TxRealtimeClock.gameDay(session.step, second.floor())} 天 '
@@ -1522,7 +1644,32 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       ),
     );
     if (leave == true && mounted && !_busy) {
+      final trader = _trader;
+      if (trader != null && trader.hasPendingPersistence) {
+        try {
+          final saved = await trader.flushPending();
+          if (mounted) {
+            setState(() => _notice = '退出前已安全保存 SQLite r${saved.revision}');
+          }
+        } catch (error) {
+          if (mounted) {
+            setState(() => _fault = '退出前保存失败，应用未退出：$error');
+          }
+          return;
+        }
+      }
       await SystemNavigator.pop();
+    }
+  }
+
+  Future<void> _closeTrader() async {
+    final trader = _trader;
+    if (trader == null) return;
+    try {
+      await trader.close();
+    } catch (_) {
+      // The widget is already being torn down; a failed flush is still
+      // fail-closed in TxTradingService and is not replaced with a fake save.
     }
   }
 
@@ -1531,13 +1678,15 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     WidgetsBinding.instance.removeObserver(this);
     _playbackTicker.dispose();
     _seconds.dispose();
+    _settling.dispose();
+    _settlementPhase.dispose();
     _qty.dispose();
     _price.dispose();
     final work = _operation;
     if (work == null) {
-      _trader?.close();
+      unawaited(_closeTrader());
     } else {
-      work.whenComplete(() async => _trader?.close());
+      work.whenComplete(() => _closeTrader());
     }
     super.dispose();
   }
@@ -1581,7 +1730,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       body: Column(children: [
         TxTerminalStatus(seconds: _seconds, step: session.step,
           revision: stored.revision, running: _auto,
-          speed: _speed, busy: _busy),
+          speed: _speed, busy: _busy, settling: _settling,
+          settlementPhase: _settlementPhase,
+          pendingSave: stored.pending,
+          pendingOperations: stored.pendingOperations,
+          pendingGameMinutes: _trader!.pendingGameMinutes,
+          automaticSaveMinutes: _automaticSaveMinutes),
         if (_busy) const LinearProgressIndicator(minHeight: 2),
         if (_fault != null) Padding(padding: const EdgeInsets.all(10),
             child: SelectableText(_fault!, style: const TextStyle(color: red))),

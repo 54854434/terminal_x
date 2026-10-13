@@ -196,4 +196,13 @@ void main() {
     expect(() => TxContinuousFlowClock().advance(
         const Duration(milliseconds: -1)), throwsArgumentError);
   });
+
+  test('settlement motion is bounded display-only and wraps', () {
+    expect(TxSettlementMotion.phase(Duration.zero), 0);
+    expect(TxSettlementMotion.phase(TxSettlementMotion.cycle), 0);
+    expect(TxSettlementMotion.phase(
+        const Duration(milliseconds: 360)), closeTo(.5, 0.000001));
+    expect(() => TxSettlementMotion.phase(
+        const Duration(milliseconds: -1)), throwsArgumentError);
+  });
 }

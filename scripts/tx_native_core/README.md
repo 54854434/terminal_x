@@ -1,8 +1,8 @@
 # Terminal X Native Core — Phase 2 (Rust ABI v2)
 
-This is a **source-level, dependency-free Rust prototype**, **NOT** an active
-Android runtime dependency. The signed Terminal X APK still uses the fully
-verified Dart `TxEngine` with its existing SQLite schema-1 snapshots.
+This is a **dependency-free Rust runtime used by the Android market worker**.
+The signed Terminal X ARM64 APK packages the verified `.so`; Dart keeps the
+existing SQLite schema-1 projection and UI snapshot format.
 
 ## Why split now?
 
@@ -22,7 +22,7 @@ verified Dart `TxEngine` with its existing SQLite schema-1 snapshots.
   limits, limit reservations, cancel, market IOC, fill records, conservation
   audit, stable numeric API.
 - `terminal_x_core.h`: independently compilable C ABI v2 contract.
-- `lib/engine/tx_native_core_ffi.dart` (repo root): explicit, opt-in Dart bridge.
+- `lib/engine/tx_native_core_ffi.dart` (repo root): explicit per-isolate Dart bridge.
 
 ## Local native commands (only with Rust installed)
 
@@ -32,11 +32,10 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-**This repository's phone ZIP importer currently DOES NOT run `cargo`.** The
-Rust sources are intentionally under `scripts/` because native `rust/`,
-`android/`, and `.github/workflows/` paths are not accepted by that importer.
-The native library is not loaded automatically. The Dart production engine
-is unchanged until its replacements pass all of:
+The phone ZIP importer runs the pinned Rust ARM64 build inside GitHub Actions
+and stages the `.so` into the generated Android app. The Android production
+worker loads it explicitly and fails closed if it is unavailable. Required
+release gates remain:
 
 1. The same funded, seeded order sequences on Dart and Rust: identical
    per-order status, remaining, fills, cash, share reserves, FIFO ordering.
@@ -47,14 +46,15 @@ is unchanged until its replacements pass all of:
 4. On-device p50/p95 and long-history memory tests. Use a decision gate
    based on full-minute throughput, not isolated native benchmark numbers.
 
-## ABI limits / planned migration
+## ABI limits
 
-ABI v2 uses numeric account IDs (u64), order IDs (u64), two initially funded symbols (0/1), plus extensible u32 symbol IDs,
-integer cents (i64) and quantities (i64). Current Dart game IDs are strings.
-The future adapter must provide a stable lossless mapping, persisted alongside
-snapshots. This prototype **does not support production import/export,
-additional complex asset types, all rejected-order semantics or transactional rollback
-on panic**, and must not replace the Dart engine until those gaps are closed.
+ABI v2 uses numeric account IDs (u64), order IDs (u64), two funded game
+symbols (0/1), plus extensible u32 symbol IDs, integer cents (i64) and
+quantities (i64). The Dart worker adapter persists the lossless string-to-
+numeric mapping as the native event journal. The current runtime does not
+support arbitrary complex asset types or transactional rollback on a native
+panic; a native failure therefore blocks the worker and never falls back to
+Dart execution on Android.
 
 A native crash must never advance the public game clock or acknowledge a
 SQLite commit. Existing full ledger validation must remain authoritative.
@@ -65,15 +65,18 @@ SQLite commit. Existing full ledger validation must remain authoritative.
   placement and successful cancellation is appended as a fixed-layout
   `TxCoreEvent`. Idempotent retries and invalid inputs do not duplicate events.
 - ABI v2 exposes an immediately copied event view and native cold reconstruction
-  (`tx_core_rebuild_from_events`), with every event's result checked. This is
-  replay infrastructure, **not yet SQLite event persistence**.
+  (`tx_core_rebuild_from_events`), with every event's result checked. The Dart
+  adapter carries the same journal through the existing SQLite snapshot/delta
+  format.
 - Native Rust unit tests compare the entire internal engine after replay;
   the optional Dart parity runner compares cash, reserves, holdings, live order
   states and actual fills on the same funded order sequence.
 - Execute `bash scripts/tx_native_core/ci_native.sh` on a development runner
   with rustc, cargo, clang and optionally Dart; Android NDK is needed for the
-  ARM64 target check. **No Rust compiler is present in this packaging
-  environment**, so these tests are not claimed as executed.
-- There is still no embedded `.so` in the signed Flutter APK. Before enabling
-  native gameplay, finish native CI, packaging, deterministic equivalence,
-  worker ownership, SQLite event commit and robust FFI failure handling.
+  ARM64 target check. This handoff run directly compiled Rust 1.88.0 and ran
+  its 13 native tests, but Cargo/Flutter/Dart parity and the Android linker
+  gates still require a normal CI or development runner.
+- The signed Android ARM64 APK now embeds the `.so` and the persistent market
+  worker owns the native handle. Before calling a build production-ready,
+  still require native CI, deterministic equivalence, cold restore, and
+  on-device long-history performance evidence.

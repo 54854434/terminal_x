@@ -55,6 +55,47 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('settlement state is visible without changing committed labels',
+      (tester) async {
+    final seconds = ValueNotifier<double>(59.999);
+    final settling = ValueNotifier<bool>(false);
+    final phase = ValueNotifier<double>(0.0);
+    addTearDown(seconds.dispose);
+    addTearDown(settling.dispose);
+    addTearDown(phase.dispose);
+    Widget app() => MaterialApp(theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxTerminalStatus(seconds: seconds,
+        step: 21, revision: 42, running: true, speed: 100, busy: false,
+        settling: settling, settlementPhase: phase)));
+    await tester.pumpWidget(app());
+    expect(find.text('正在处理当前结算，未确认时间不会前进'), findsNothing);
+    expect(find.text('游戏分钟 21  ·  SQLite r42'), findsOneWidget);
+    settling.value = true;
+    phase.value = .5;
+    await tester.pump();
+    expect(find.text('正在处理当前结算，未确认时间不会前进'), findsOneWidget);
+    expect(find.text('游戏分钟 21  ·  SQLite r42'), findsOneWidget);
+    settling.value = false;
+    await tester.pump();
+    expect(find.text('正在处理当前结算，未确认时间不会前进'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('pending automatic save is visible without faking SQLite revision',
+      (tester) async {
+    final seconds = ValueNotifier<double>(0.0);
+    addTearDown(seconds.dispose);
+    await tester.pumpWidget(MaterialApp(theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxTerminalStatus(seconds: seconds,
+        step: 4, revision: 12, running: true, speed: 5, busy: false,
+        pendingSave: true, pendingOperations: 3,
+        pendingGameMinutes: 3, automaticSaveMinutes: 5))));
+    expect(find.text('游戏分钟 4  ·  SQLite r12'), findsOneWidget);
+    expect(find.text('待保存 3 项 · 每 5 个游戏分钟自动保存'), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('UI is usable at narrow phone width without overflow',
       (tester) async {
     tester.view.physicalSize = const Size(320, 640);

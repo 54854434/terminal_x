@@ -58,4 +58,27 @@ void main() {
       await db.close();
     }
   });
+
+  test('deferred automatic candidates remain visible without a SQLite revision',
+      () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    final trading = TxTradingService(db,
+        initialSessionFactory: TxSession.freshWithAgents,
+        automaticSaveMinutes: 5);
+    try {
+      final initial = await trading.open();
+      final cache = TxLiveCandles.fromVerifiedHistory(await db.readHistory());
+      final pulse = await trading.marketPulse(15, deferSave: true);
+      expect(pulse.pending, isTrue);
+      expect(pulse.revision, initial.revision);
+      cache.addObservation(initial.session, pulse.session);
+      expect(cache.forSymbol('SIM-A01').last.step, 1);
+      final minute = await trading.nextTick(deferSave: true);
+      cache.addObservation(pulse.session, minute.session);
+      expect(cache.forSymbol('SIM-A01').last.step, 1);
+      expect((await db.readCurrent())!.revision, initial.revision);
+    } finally {
+      await trading.close();
+    }
+  });
 }

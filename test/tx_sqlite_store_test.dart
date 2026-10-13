@@ -30,6 +30,25 @@ void main() {
     }
   });
 
+  test('automatic save cadence is independent and fail-closed', () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    try {
+      final first = await db.initializeFresh(TxSession.fresh());
+      expect(await db.readAutomaticSaveMinutes(),
+          TxSqliteStore.defaultAutomaticSaveMinutes);
+      await db.setAutomaticSaveMinutes(15);
+      expect(await db.readAutomaticSaveMinutes(), 15);
+      expect((await db.readCurrent())!.revision, first.revision);
+      await expectLater(db.setAutomaticSaveMinutes(0), throwsArgumentError);
+      await db.customStatement(
+          "UPDATE storage_metadata SET value='INVALID' "
+          "WHERE key='automatic_save_minutes_v1'");
+      await expectLater(db.readAutomaticSaveMinutes(), throwsStateError);
+    } finally {
+      await db.close();
+    }
+  });
+
   late TxSqliteStore store;
 
   setUp(() => store = TxSqliteStore(NativeDatabase.memory()));

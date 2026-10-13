@@ -82,4 +82,29 @@ void main() {
       expect(service.current.revision, 2);
     } finally { await db.close(); }
   });
+
+  test('long-lived worker acknowledges only the batched durable revision',
+      () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    final service = TxTradingService(db,
+        initialSessionFactory: TxSession.freshWithAgents,
+        persistentMarketWorker: true,
+        automaticSaveMinutes: 2);
+    try {
+      final first = await service.open();
+      final pulse = await service.marketPulse(15, deferSave: true);
+      expect(pulse.pending, isTrue);
+      expect((await db.readCurrent())!.revision, first.revision);
+      await service.nextTick(deferSave: true);
+      expect(service.current.pending, isTrue);
+      final flushed = await service.nextTick(deferSave: true);
+      expect(flushed.pending, isFalse);
+      expect(flushed.revision, first.revision + 1);
+      final disk = (await db.readCurrent())!;
+      expect(disk.session.exportJson(), flushed.session.exportJson());
+      disk.session.engine.checkInvariants();
+    } finally {
+      await service.close();
+    }
+  });
 }
