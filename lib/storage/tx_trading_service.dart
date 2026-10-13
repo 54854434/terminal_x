@@ -55,7 +55,8 @@ Future<TxSession> _tickDetached(TxSession source) {
 
 class TxTradingService {
   TxTradingService(this.database, {TxSession Function()? initialSessionFactory,
-      this.persistentMarketWorker = false})
+      this.persistentMarketWorker = false,
+      this.nativeMarketWorker = false})
       : _initialSessionFactory = initialSessionFactory ?? TxSession.fresh;
 
   final TxSqliteStore database;
@@ -63,6 +64,8 @@ class TxTradingService {
   /// Opt-in to a single long-lived isolate. Default retains original service
   /// semantics for older tests, embedders and in-memory database fixtures.
   final bool persistentMarketWorker;
+  /// Production Android Rust-first matching; no Dart-only fallback.
+  final bool nativeMarketWorker;
   TxPersistentMarketWorker? _worker;
   TxStoredSession? _current;
   bool _busy = false;
@@ -83,7 +86,8 @@ class TxTradingService {
       final loaded = await database.readCurrent() ??
           await database.initializeFresh(_initialSessionFactory());
       if (persistentMarketWorker) {
-        _worker = await TxPersistentMarketWorker.start(loaded.session);
+        _worker = await TxPersistentMarketWorker.start(loaded.session,
+            useNative: nativeMarketWorker);
       }
       _current = loaded;
       return loaded;
@@ -192,7 +196,8 @@ class TxTradingService {
       worker.close();
       _worker = null;
       try {
-        _worker = await TxPersistentMarketWorker.start(current.session);
+        _worker = await TxPersistentMarketWorker.start(current.session,
+            useNative: nativeMarketWorker);
       } catch (_) {
         _storageFault = true;
         rethrow;
@@ -207,7 +212,8 @@ class TxTradingService {
     _worker = null;
     if (_storageFault) return;
     try {
-      _worker = await TxPersistentMarketWorker.start(current.session);
+      _worker = await TxPersistentMarketWorker.start(current.session,
+            useNative: nativeMarketWorker);
     } catch (_) {
       _storageFault = true;
       rethrow;

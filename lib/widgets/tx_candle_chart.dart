@@ -162,7 +162,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
         const SizedBox(width: 6),
         if (preview != null && _period != TxChartPeriod.timeline)
           Expanded(child: Text(_period.minutes == 1
-              ? '虚线：指示价（非成交） · 影线只显示已提交 OHLC'
+              ? '青色空心K/虚线：指示价（非成交）'
               : '青色空心K/虚线：指示价（非成交）',
             maxLines: 1, overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 10, color: Colors.white54))),
@@ -190,7 +190,9 @@ class _TxCandleChartState extends State<TxCandleChart> {
           width: double.infinity,
           child: CustomPaint(painter: _period == TxChartPeriod.timeline
             ? _TimelinePainter(visible, indicativePriceCents: preview,
-                trace: _timelineTrace.points)
+                trace: _timelineTrace.sampledForMinuteWidth(
+                    math.max(1.0, constraints.maxWidth - 55) /
+                    (visible.length + 1)))
             : _CandlePainter(visible,
                 ma5: _showMA ? _ma5!.sublist(start, end) : null,
                 ma10: _showMA ? _ma10!.sublist(start, end) : null,
@@ -200,10 +202,9 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 indicativeLowCents: projection?.lowCents,
                 indicativeOpenCents: projection?.openCents,
                 overlayLastCommitted: projection?.overlaysLastCommitted ?? false,
-                // At 100× or faster, a 1m indicative wick expires every
-                // 600ms or less. Do not paint that ephemeral shape as though
-                // it were the persistent traded OHLC wick.
-                showIndicativeWick: _period.minutes > 1)),
+                // One provisional candle per selected bucket, including 1m.
+                // Its cyan OHLC is never written into committed volume/fills.
+                showIndicativeWick: true)),
         )),
       )),
       if (inspected != null)
@@ -266,8 +267,6 @@ class _CandlePainter extends CustomPainter {
       maxVolume = math.max(maxVolume, c.volumeShares);
     }
     if (indicativePriceCents != null) {
-      // For a one-minute preview only the moving cyan price marker is real
-      // UI state; its uncommitted wick is intentionally not drawn or scaled.
       high = math.max(high, showIndicativeWick
           ? indicativeHighCents!.toDouble() : indicativePriceCents!);
       low = math.min(low, showIndicativeWick
@@ -322,8 +321,12 @@ class _CandlePainter extends CustomPainter {
       final p=Paint()..color=const Color(0xFF54CEE5)
           ..style=PaintingStyle.stroke..strokeWidth=1.6;
       if (showIndicativeWick) {
-        canvas.drawLine(Offset(x,y(indicativeHighCents!.toDouble())),
-            Offset(x,y(indicativeLowCents!.toDouble())),p);
+        // Draw the wick OUTSIDE the candle body. Drawing it straight through
+        // the hollow body was producing an apparent second overlapping bar.
+        final hi = y(indicativeHighCents!);
+        final lo = y(indicativeLowCents!);
+        if (hi < top) canvas.drawLine(Offset(x, hi), Offset(x, top), p);
+        if (lo > bottom) canvas.drawLine(Offset(x, bottom), Offset(x, lo), p);
         canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
             math.max(2.0,bottom-top)),p);
       } else {
@@ -440,9 +443,18 @@ class _TimelinePainter extends CustomPainter {
       final prevX = width * (candles.length - .5);
       final segment = Path()..moveTo(prevX,
           y(candles.last.closeCents.toDouble()));
+      var fromX = prevX;
+      var fromY = y(candles.last.closeCents.toDouble());
       for (final sample in trace) {
         final px = prevX + width * (sample.seconds / 60.0);
-        segment.lineTo(px, y(sample.priceCents));
+        final py = y(sample.priceCents);
+        if (px <= fromX) continue;
+        final dx = px - fromX;
+        // Smooth connected line; no pixel-sized zigzags at high speed.
+        segment.cubicTo(fromX + dx * .35, fromY,
+            fromX + dx * .65, py, px, py);
+        fromX = px;
+        fromY = py;
       }
       canvas.drawPath(segment, Paint()
         ..color = const Color(0xFF54CEE5)

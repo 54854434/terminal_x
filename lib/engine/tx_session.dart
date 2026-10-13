@@ -28,6 +28,10 @@ class TxSession {
   final List<Map<String, dynamic>> archivedLegacyOrders;
   final List<String> archivedLegacyTrades;
   final bool isLegacyUpgrade;
+  /// Rust primary matching command log; persists only in the dedicated Rust
+  /// game database. Values use integer cents, signed quantities and string IDs.
+  /// Never contains pointers or runtime-specific handles.
+  final List<List<Object?>> nativeEvents = <List<Object?>>[];
   int _quoteFillStart = 0;
 
   static TxSession fresh() {
@@ -335,6 +339,7 @@ class TxSession {
         'archivedLegacyOrders': archivedLegacyOrders,
         'archivedLegacyTrades': archivedLegacyTrades,
         'isLegacyUpgrade': isLegacyUpgrade,
+        'nativeEvents': nativeEvents,
       };
 
   /// Establish a new delta base AFTER an atomic SQLite commit.
@@ -389,9 +394,19 @@ class TxSession {
         .map((v) => Map<String, dynamic>.from(v as Map)).toList();
     final archivedTrades = (data['archivedLegacyTrades'] as List)
         .map((v) => v as String).toList();
-    return TxSession._(engine, step, references, counter,
+    final session = TxSession._(engine, step, references, counter,
         archivedOrders, archivedTrades, data['isLegacyUpgrade'] as bool)
       .._quoteFillStart = quoteFillStart;
+    final rawEvents = data['nativeEvents'];
+    if (rawEvents is List) {
+      for (final event in rawEvents) {
+        if (event is! List || event.isEmpty || event.length > 9) {
+          throw const FormatException('Invalid Rust journal row');
+        }
+        session.nativeEvents.add(List<Object?>.from(event));
+      }
+    }
+    return session;
   }
 }
 

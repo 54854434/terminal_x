@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:isolate';
 
 import '../engine/tx_engine.dart';
+import '../engine/tx_rust_market_gate.dart';
 import '../engine/tx_session.dart';
 
 class TxMarketProposal {
@@ -21,18 +22,19 @@ class TxPersistentMarketWorker {
   final SendPort _commands;
   bool _closed = false;
 
-  static Future<TxPersistentMarketWorker> start(TxSession committed) async {
+  static Future<TxPersistentMarketWorker> start(TxSession committed,
+      {bool useNative = false}) async {
     final ready = ReceivePort();
     Isolate? isolate;
     try {
       isolate = await Isolate.spawn<List<dynamic>>(
-        _runMarketWorker, <dynamic>[ready.sendPort, committed],
+        _runMarketWorker, <dynamic>[ready.sendPort, committed, useNative],
         errorsAreFatal: true,
         debugName: 'terminal_x_market_engine',
       );
       final port = await ready.first.timeout(const Duration(seconds: 15));
       if (port is! SendPort) {
-        throw StateError('Market worker failed to start');
+        throw StateError('Market worker failed to start: $port');
       }
       return TxPersistentMarketWorker._(isolate, port);
     } catch (_) {
@@ -111,6 +113,14 @@ class TxPersistentMarketWorker {
 void _runMarketWorker(List<dynamic> launch) {
   final ready = launch[0] as SendPort;
   var working = launch[1] as TxSession;
+  final useNative = launch[2] as bool;
+  TxRustMarketGate? nativeGate;
+  try {
+    if (useNative) nativeGate = TxRustMarketGate.open(working);
+  } catch (error) {
+    ready.send('Rust native init failed: $error');
+    return;
+  }
   final commands = ReceivePort();
   ready.send(commands.sendPort);
   commands.listen((dynamic request) {
@@ -152,6 +162,7 @@ void _runMarketWorker(List<dynamic> launch) {
       ]);
       // A partial mutation must NEVER become the next candidate.
       commands.close();
+      nativeGate?.close();
     }
   });
 }

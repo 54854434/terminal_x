@@ -59,7 +59,7 @@ class TxNativeCoreFfi {
   static const int sell = 1;
   static const int limit = 0;
   static const int market = 1;
-  static const int open = 0;
+  static const int openStatus = 0;
   static const int partial = 1;
   static const int filled = 2;
   static const int cancelled = 3;
@@ -177,6 +177,8 @@ class TxNativeCoreFfi {
 
   int fillPrice(int index) => _readOne('tx_core_fill_price', index);
   int fillQuantity(int index) => _readOne('tx_core_fill_quantity', index);
+  int fillBuyOrder(int index) => _readOne('tx_core_fill_buy_order', index);
+  int fillSellOrder(int index) => _readOne('tx_core_fill_sell_order', index);
 
   int get eventCount {
     _ensureOpen();

@@ -8,8 +8,22 @@ import '../lib/market/tx_quote_preview.dart';
 import '../lib/market/tx_timeframe.dart';
 import '../lib/market/tx_continuous_flow_clock.dart';
 import '../lib/widgets/tx_candle_chart.dart';
+import '../lib/widgets/tx_back_exit_guard.dart';
 
 void main() {
+  testWidgets('R37 Android Back is intercepted instead of dismissing game',
+      (tester) async {
+    var backRequests = 0;
+    await tester.pumpWidget(MaterialApp(home: TxBackExitGuard(
+      onBack: () async { backRequests++; },
+      child: const Scaffold(body: Center(child: Text('game stays open'))),
+    )));
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    expect(backRequests, 1);
+    expect(find.text('game stays open'), findsOneWidget);
+  });
+
   TxCandle c(int step, int price) => TxCandle(step: step,
       openCents: price, highCents: price+3, lowCents: price-2,
       closeCents: price+1, volumeShares: 7);
@@ -234,6 +248,45 @@ void main() {
         committedCloseCents: 1002, framePriceCents: 1004);
     expect(trace.points.length, 2);
     expect(trace.points.first.priceCents, 1002);
+  });
+
+  test('R37 chart samples fit minute pixel width without 300x scribbles', () {
+    final trace = TxTimelinePreviewTrace();
+    for (var i = 0; i < 480; i++) {
+      trace.observe(nextMinuteStep: 8, seconds: i / 10.0,
+          committedCloseCents: 1000,
+          framePriceCents: 1000 + (i % 17) * 1.0);
+    }
+    final display = trace.sampledForMinuteWidth(18);
+    expect(trace.points.length, greaterThan(display.length));
+    expect(display.length, lessThanOrEqualTo(8));
+    expect(display.first.seconds, 0);
+    expect(display.last.seconds, 47.9);
+    for (var i = 1; i < display.length; i++) {
+      expect(display[i].seconds, greaterThan(display[i - 1].seconds));
+    }
+    expect(() => trace.sampledForMinuteWidth(0), throwsArgumentError);
+  });
+
+  test('R37 one-minute cyan candle includes intraminute high and low', () {
+    final committed = c(80, 1000);
+    final wick = TxIndicativeWickMemory();
+    wick.observe(nextMinuteStep: 81, periodMinutes: 1,
+        committedCloseCents: committed.closeCents.toDouble(),
+        framePriceCents: 1007);
+    wick.observe(nextMinuteStep: 81, periodMinutes: 1,
+        committedCloseCents: committed.closeCents.toDouble(),
+        framePriceCents: 995);
+    final preview = TxFrameCandleProjection.fromLastCommitted(
+        lastAggregated: committed, nextMinuteStep: 81,
+        periodMinutes: 1, framePriceCents: 995,
+        previewHighCents: wick.highCents!,
+        previewLowCents: wick.lowCents!);
+    expect(preview.overlaysLastCommitted, false);
+    expect(preview.openCents, committed.closeCents);
+    expect(preview.highCents, 1007);
+    expect(preview.lowCents, 995);
+    expect(committed.volumeShares, 7);
   });
 
   test('R33 funded NPC book revises genuine resting LP quotes each minute', () {

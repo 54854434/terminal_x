@@ -6,6 +6,7 @@ import 'dart:io';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'engine/tx_engine.dart';
@@ -38,6 +39,7 @@ import 'widgets/tx_terminal_theme.dart';
 import 'widgets/tx_market_hero.dart';
 import 'widgets/tx_terminal_status.dart';
 import 'widgets/tx_market_radar.dart';
+import 'widgets/tx_back_exit_guard.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -99,6 +101,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   int _marketTapeRequested = TxMarketTapeWindow.pageSize;
   String _notice = '正在检查 SQLite';
   String? _fault;
+  String _rustStatus = '等待 Rust 核心';
 
   bool get _ready => !_loading && !_busy && _fault == null &&
       _trader != null && !_trader!.blocked;
@@ -190,11 +193,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     TxTradingService? service;
     try {
       final dir = await getApplicationSupportDirectory();
-      final sqlite = File('${dir.path}/terminal_x_game.sqlite');
+      final sqlite = File('${dir.path}/terminal_x_rust_v1.sqlite');
       service = TxTradingService(TxSqliteStore(
         NativeDatabase.createInBackground(sqlite)),
         initialSessionFactory: TxSession.freshWithAgents,
-        persistentMarketWorker: true);
+        persistentMarketWorker: true,
+        nativeMarketWorker: Platform.isAndroid);
       final initial = await service.open();
       final checkpointInterval = await service.database.readCheckpointInterval();
       // Once, not on every committed tick. 64 recent revisions are enough to
@@ -215,7 +219,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         _checkpointInterval = checkpointInterval;
         _checkpointDraft = checkpointInterval;
         _price.text = money(initial.session.lastPrice(_symbolName));
-        _notice = '已校验 SQLite 修订 ${initial.revision}，行情默认暂停';
+        _notice = 'Rust 交易核心已启动，独立测试账户；行情默认暂停';
+        _rustStatus = 'ARM64 ABI v2 已绑定';
         _loading = false;
       });
     } catch (e) {
@@ -606,6 +611,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
               style: TextStyle(color: Colors.white70, fontSize: 12)),
           const SizedBox(height: 6),
           Text('当前市场环境：${_regimeName(session.step, _symbol)}'),
+          if (Platform.isAndroid) Text('交易：Rust 原生撮合 · Dart 界面镜像 · $_rustStatus',
+              style: const TextStyle(fontSize: 11, color: Colors.white60)),
           Text('本游戏分钟：${minuteFills.length} 笔真实撮合 · '
               '$minuteVolume 股成交量'),
           const Text('所有成交均在真实订单簿按价格与时间撮合；'
@@ -1390,6 +1397,41 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ]);
   }
 
+  /// Android system Back: return to the market tab, then request explicit
+  /// confirmation before exiting. If an atomic trade is in flight, refusing
+  /// the exit preserves the single-writer transaction boundary.
+  Future<void> _onSystemBack() async {
+    if (!mounted || _loading) return;
+    if (_page != 0) {
+      setState(() => _page = 0);
+      return;
+    }
+    if (_auto) _pause();
+    if (_busy || (_trader != null && _trader!.blocked)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('交易正在提交或存储异常，请等待完成后再退出'),
+      ));
+      return;
+    }
+    final leave = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => AlertDialog(
+        title: const Text('退出 Terminal X？'),
+        content: const Text('游戏已暂停。确认退出应用吗？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('继续游戏')),
+          FilledButton(onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('退出游戏')),
+        ],
+      ),
+    );
+    if (leave == true && mounted && !_busy) {
+      await SystemNavigator.pop();
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -1407,7 +1449,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => TxBackExitGuard(
+    onBack: _onSystemBack,
+    child: _buildScreen(context),
+  );
+
+  Widget _buildScreen(BuildContext context) {
     if (_loading) return const Scaffold(body: SafeArea(child: Center(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           Text('TERMINAL X', style: TextStyle(

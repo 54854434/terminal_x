@@ -206,7 +206,35 @@ class TxBookLevel {
   final int orderCount;
 }
 
+/// A Rust core implementation may be bound only to one TxEngine instance in
+/// its dedicated market isolate. Never serialize native FFI pointers with a
+/// candidate or share one native pointer with the UI SQLite isolate.
+abstract class TxEngineNativeGate {
+  void place(String id, String ownerId, String symbol, TxSide side,
+      TxKind kind, int quantity, int? limitPriceCents);
+  void cancel(String id, String ownerId);
+  void verify(TxEngine engine);
+}
+
 class TxEngine {
+  static TxEngine? _nativeTarget;
+  static TxEngineNativeGate? _nativeGate;
+
+  /// Call ONLY in an isolated market worker; other isolates remain unbound.
+  static void bindNativeGate(TxEngine engine, TxEngineNativeGate gate) {
+    if (_nativeGate != null) throw StateError('Native gate already bound');
+    _nativeTarget = engine;
+    _nativeGate = gate;
+  }
+
+  static void unbindNativeGate() {
+    _nativeTarget = null;
+    _nativeGate = null;
+  }
+
+  TxEngineNativeGate? get _native =>
+      identical(this, _nativeTarget) ? _nativeGate : null;
+
   static const int snapshotVersion = 1;
   static const int maxNotionalCents = 9000000000000000;
   static const int maxQuantity = 100000000;
@@ -419,6 +447,9 @@ class TxEngine {
     required int quantity,
     int? limitPriceCents,
   }) {
+    // Rust processes the actual executable command FIRST. Dart only mirrors
+    // the result into its existing read-only UI / JSON persistence projection.
+    _native?.place(id, ownerId, symbol, side, kind, quantity, limitPriceCents);
     if (id.trim().isEmpty) throw ArgumentError('Order ID is required');
     final existing = _orders[id];
     if (existing != null) {
@@ -538,6 +569,7 @@ class TxEngine {
       throw StateError('Order is not open');
     }
     if (o.kind != TxKind.limit) throw StateError('Market order cannot rest');
+    _native?.cancel(id, ownerId);
     final a = account(ownerId);
     if (o.side == TxSide.buy) {
       final release = o.remaining * o.limitPriceCents!;
@@ -832,6 +864,8 @@ class TxEngine {
       }
     }
     if (_nextFillSequence <= lastFillSeq) throw StateError('Fill sequence rewind');
+    // Preserve fail-closed accounting even when extra NPC behaviours arrive.
+    _native?.verify(this);
     _lastAuditedSerial = _economicMutationSerial;
     _fullAuditCount++;
   }

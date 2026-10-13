@@ -149,6 +149,38 @@ class TxTimelinePreviewTrace {
     _points.clear();
   }
 
+  /// The entire 60-second trace usually spans only one ~15-25px chart slot.
+  /// Rendering hundreds of price samples within that slot creates a dense
+  /// backtracking scribble. Limit the DRAWING samples to the available pixels
+  /// while always retaining the true first point and most recent tick.
+  /// The authoritative preview buffer remains unchanged.
+  List<TxTimelineTracePoint> sampledForMinuteWidth(double pixelWidth,
+      {double minimumSpacingPixels = 3.5}) {
+    if (!pixelWidth.isFinite || pixelWidth <= 0 ||
+        !minimumSpacingPixels.isFinite || minimumSpacingPixels <= 0) {
+      throw ArgumentError('Invalid timeline sampling width');
+    }
+    if (_points.length <= 2) {
+      return List<TxTimelineTracePoint>.unmodifiable(_points);
+    }
+    final minSeconds = 60.0 * minimumSpacingPixels / pixelWidth;
+    final sampled = <TxTimelineTracePoint>[_points.first];
+    for (var i = 1; i < _points.length - 1; i++) {
+      final point = _points[i];
+      if (point.seconds - sampled.last.seconds >= minSeconds) {
+        sampled.add(point);
+      }
+    }
+    final last = _points.last;
+    // Do not append two almost-vertical points at the moving tip.
+    if (sampled.length > 1 &&
+        last.seconds - sampled.last.seconds < minSeconds * .6) {
+      sampled.removeLast();
+    }
+    if (sampled.last.seconds != last.seconds) sampled.add(last);
+    return List<TxTimelineTracePoint>.unmodifiable(sampled);
+  }
+
   void observe({required int nextMinuteStep,
       required double seconds, required double committedCloseCents,
       required double framePriceCents}) {

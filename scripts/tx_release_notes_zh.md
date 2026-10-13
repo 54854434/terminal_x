@@ -1,4 +1,4 @@
-# Terminal X v0.3.1
+# Terminal X v0.3.2
 
 ## R33 分时连续线和真实动态盘口
 
@@ -45,3 +45,57 @@
 - 恢复 1 分钟 K 线的“指示价（非成交）”显式标签；未提交价格仍不能进入真实 OHLC、成交或账本。
 - 已有 `tx_frame_preview_test.dart`、`tx_multi_timeframe_widget_test.dart` 和 `tx_market_ui_perf_test.dart` 覆盖这三项 CI 故障；未移除、跳过、放宽任何测试。
 - Rust ABI v2、事件日志、旧 GitHub 基线与 v0.3.1+31 版本不变。Rust 原生 Android 编译仍未启用。
+
+
+## R37 0.3.2 图表绘制修复
+- 分时图每分钟只向绘制器提供符合实际像素宽度的连续采样点，保留真实最新秒级报价，修正高倍速右端密集折返。原始指示价记录及历史已提交数据不变。
+- 1 分钟图恢复空心青色实时预览蜡烛（最高/最低/开/当前指示价）；预览仍不可成交、不进入 OHLCV 或 SQLite。
+- 5 分及更大周期仅保留选中周期的单根聚合预览；空心柱影线只绘制在柱身外面，消除双线套叠错觉。
+- 现有真正订单簿仍每分钟更新。秒级真实挂单、撤单与玩家可成交订单状态同步需要交易调度重构，未以虚假盘口数字冒充完成。
+- 每分钟暂停是撮合/SQLite 提交背压，与 60 游戏分钟的人为强制暂停不同；该安全等待在本版仍可能可见。
+
+- Android 返回键不再立即退出：交易、资产、记录页面返回行情；行情页面暂停并询问是否退出。数据库提交进行中不可直接退出。
+- 启动画面仍可先绘制，历史恢复仍进行完整校验；深层次冷启动耗时属于后续专项基准优化，未声称已消除。
+
+
+## R37 Rust ARM64 原生验证阶段
+- GitHub CI 需先完成 Rust 单元测试、Dart/Rust 对照、NDK ARM64 编译。
+- APK 必须包含 `lib/arm64-v8a/libterminal_x_core.so`，并检查 ELF AArch64 类型。
+- Android 启动后进行一次独立 Rust 成交与命令重放自检，在行情页显示结果。
+- **玩家真实订单、NPC 分钟撮合和 SQLite 仍由 Dart 执行。** 此阶段仅验证原生运行链路，绝不冒称生产引擎已经迁移。
+
+
+## R37 Rust ARM64 原生验证阶段
+- GitHub CI 需先完成 Rust 单元测试、Dart/Rust 对照、NDK ARM64 编译。
+- APK 必须包含 `lib/arm64-v8a/libterminal_x_core.so`，并检查 ELF AArch64 类型。
+- Android 启动后进行一次独立 Rust 成交与命令重放自检，在行情页显示结果。
+- **玩家真实订单、NPC 分钟撮合和 SQLite 仍由 Dart 执行。** 此阶段仅验证原生运行链路，绝不冒称生产引擎已经迁移。
+
+
+## R37 Rust ARM64 原生验证阶段
+- GitHub CI 需先完成 Rust 单元测试、Dart/Rust 对照、NDK ARM64 编译。
+- APK 必须包含 `lib/arm64-v8a/libterminal_x_core.so`，并检查 ELF AArch64 类型。
+- Android 启动后进行一次独立 Rust 成交与命令重放自检，在行情页显示结果。
+- **玩家真实订单、NPC 分钟撮合和 SQLite 仍由 Dart 执行。** 此阶段仅验证原生运行链路，绝不冒称生产引擎已经迁移。
+
+
+## R37 Rust ARM64 原生验证阶段
+- GitHub CI 需先完成 Rust 单元测试、Dart/Rust 对照、NDK ARM64 编译。
+- APK 必须包含 `lib/arm64-v8a/libterminal_x_core.so`，并检查 ELF AArch64 类型。
+- Android 启动后进行一次独立 Rust 成交与命令重放自检，在行情页显示结果。
+- **玩家真实订单、NPC 分钟撮合和 SQLite 仍由 Dart 执行。** 此阶段仅验证原生运行链路，绝不冒称生产引擎已经迁移。
+
+
+## R38 Rust-first 交易内核直接启用
+- **Android 正式游戏市场线程启用 Rust ABI v2**：Rust 先处理每笔真实委托、撤单、NPC 挂单及撮合，Dart 仅生成用于现有 UI/SQLite 的投影。
+- 游戏改用独立的 `terminal_x_rust_v1.sqlite`，原有测试存档不导入、不删除。
+- Native command journal 进入原子 SQLite 修订，重启时重放并验证资金、冻结股数与真实成交。
+- 严格模式：Rust 载入失败、账本结果不一致即禁止继续交易，绝不静默退回 Dart。
+- **NPC 当前仍采用原来的每游戏分钟决策周期**；尚未实现秒级真实盘口。
+- 当前 CI 原生编译链必须更新，且本包未在本机完成 Flutter 或 Rust 运行测试。
+
+
+### R38 首次构建修正
+- 修正 Flutter 入口文件重复定义 `_rustStatus` 与 `_probeNativeRuntime` 造成的 Android release 编译失败。
+- Rust 真正初始化完成后，在同一次 UI 状态更新中显示 ABI 绑定状态；未成功创建交易服务不显示成功。
+- 保持 Rust 原生引擎、ABI、市场撮合、NPC 逻辑、存档路径及 APK 签名机制不变。
