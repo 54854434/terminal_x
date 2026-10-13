@@ -100,6 +100,21 @@ class TxRustMarketGate implements TxEngineNativeGate {
         side, kind, quantity, price]);
   }
 
+  int _nativeKind(TxKind kind, TxTimeInForce timeInForce) {
+    if (kind == TxKind.market) {
+      if (timeInForce != TxTimeInForce.gtc) {
+        throw ArgumentError('Market orders only support GTC semantics');
+      }
+      return TxNativeCoreFfi.market;
+    }
+    return switch (timeInForce) {
+      TxTimeInForce.gtc => TxNativeCoreFfi.limit,
+      TxTimeInForce.postOnly => TxNativeCoreFfi.postOnly,
+      TxTimeInForce.ioc => TxNativeCoreFfi.ioc,
+      TxTimeInForce.fok => TxNativeCoreFfi.fok,
+    };
+  }
+
   void _cancelRaw(int order, int owner, {bool record = true}) {
     final code = native.cancel(orderId: order, ownerId: owner);
     if (code < 0) throw StateError('Rust cancel failed: $code');
@@ -120,7 +135,8 @@ class TxRustMarketGate implements TxEngineNativeGate {
       ..sort((a, b) => a.sequence.compareTo(b.sequence));
     for (final order in seeded) {
       _placeRaw(order.id, ++_nextOrderId, _accountIds[order.ownerId]!,
-          _symbolId(order.symbol), order.side.index, order.kind.index,
+          _symbolId(order.symbol), order.side.index,
+          _nativeKind(order.kind, order.timeInForce),
           order.quantity, order.limitPriceCents ?? 0);
     }
   }
@@ -149,20 +165,23 @@ class TxRustMarketGate implements TxEngineNativeGate {
 
   @override
   void place(String id, String ownerId, String symbol, TxSide side,
-      TxKind kind, int quantity, int? limitPriceCents) {
+      TxKind kind, int quantity, int? limitPriceCents,
+      {TxTimeInForce timeInForce = TxTimeInForce.gtc}) {
     final owner = _accountIds[ownerId];
     if (owner == null) throw StateError('Rust account not found: $ownerId');
     final existing = _orderIds[id];
     if (existing != null) {
       // Native duplicate ID handling is immutable and idempotent.
       final result = native.place(orderId: existing, ownerId: owner,
-          symbol: _symbolId(symbol), side: side.index, kind: kind.index,
+          symbol: _symbolId(symbol), side: side.index,
+          kind: _nativeKind(kind, timeInForce),
           quantity: quantity, priceCents: limitPriceCents ?? 0);
       if (result < 0) throw StateError('Conflicting native retry: $id');
       return;
     }
     _placeRaw(id, _nextOrderId + 1, owner, _symbolId(symbol),
-        side.index, kind.index, quantity, limitPriceCents ?? 0);
+        side.index, _nativeKind(kind, timeInForce), quantity,
+        limitPriceCents ?? 0);
   }
 
   @override

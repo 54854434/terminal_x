@@ -59,6 +59,9 @@ class TxNativeCoreFfi {
   static const int sell = 1;
   static const int limit = 0;
   static const int market = 1;
+  static const int postOnly = 2;
+  static const int ioc = 3;
+  static const int fok = 4;
   static const int openStatus = 0;
   static const int partial = 1;
   static const int filled = 2;

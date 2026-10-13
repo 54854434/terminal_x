@@ -263,6 +263,7 @@ class TxSession {
     required TxKind kind,
     required int quantity,
     int? limitPriceCents,
+    TxTimeInForce timeInForce = TxTimeInForce.gtc,
   }) {
     if (!symbols.contains(symbol)) throw ArgumentError('Unsupported symbol');
     return engine.place(
@@ -273,6 +274,7 @@ class TxSession {
       kind: kind,
       quantity: quantity,
       limitPriceCents: limitPriceCents,
+      timeInForce: timeInForce,
     );
   }
 

@@ -8,7 +8,24 @@ import 'dart:math' as math;
 
 enum TxSide { buy, sell }
 enum TxKind { limit, market }
+/// Limit-order execution policy.  [gtc] keeps the existing resting behaviour;
+/// the other policies are intentionally explicit because they change whether
+/// an order may add liquidity or leave an unmatched remainder on the book.
+enum TxTimeInForce { gtc, postOnly, ioc, fok }
 enum TxStatus { open, partiallyFilled, filled, cancelled, rejected }
+
+extension TxTimeInForceX on TxTimeInForce {
+  bool get canRest => this == TxTimeInForce.gtc ||
+      this == TxTimeInForce.postOnly;
+  bool get isImmediate => this == TxTimeInForce.ioc ||
+      this == TxTimeInForce.fok;
+  String get label => switch (this) {
+    TxTimeInForce.gtc => 'GTC',
+    TxTimeInForce.postOnly => 'Post Only',
+    TxTimeInForce.ioc => 'IOC',
+    TxTimeInForce.fok => 'FOK',
+  };
+}
 
 class TxAccount {
   TxAccount._(this.id, int openingCashCents, Map<String, int> openingShares)
@@ -69,6 +86,7 @@ class TxOrder {
     required this.symbol,
     required this.side,
     required this.kind,
+    required this.timeInForce,
     required int quantity,
     required this.limitPriceCents,
     required this.sequence,
@@ -80,6 +98,7 @@ class TxOrder {
   final String symbol;
   final TxSide side;
   final TxKind kind;
+  final TxTimeInForce timeInForce;
   final int quantity;
   final int? limitPriceCents;
   final int sequence;
@@ -97,6 +116,7 @@ class TxOrder {
         'symbol': symbol,
         'side': side.name,
         'kind': kind.name,
+        'timeInForce': timeInForce.name,
         'quantity': quantity,
         'limitPriceCents': limitPriceCents,
         'sequence': sequence,
@@ -112,6 +132,9 @@ class TxOrder {
       symbol: data['symbol'] as String,
       side: TxSide.values.byName(data['side'] as String),
       kind: TxKind.values.byName(data['kind'] as String),
+      timeInForce: data['timeInForce'] == null
+          ? TxTimeInForce.gtc
+          : TxTimeInForce.values.byName(data['timeInForce'] as String),
       quantity: data['quantity'] as int,
       limitPriceCents: data['limitPriceCents'] as int?,
       sequence: data['sequence'] as int,
@@ -211,7 +234,8 @@ class TxBookLevel {
 /// candidate or share one native pointer with the UI SQLite isolate.
 abstract class TxEngineNativeGate {
   void place(String id, String ownerId, String symbol, TxSide side,
-      TxKind kind, int quantity, int? limitPriceCents);
+      TxKind kind, int quantity, int? limitPriceCents,
+      {TxTimeInForce timeInForce = TxTimeInForce.gtc});
   void cancel(String id, String ownerId);
   void verify(TxEngine engine);
 }
@@ -403,7 +427,8 @@ class TxEngine {
           .putIfAbsent(side, () => <TxOrder>{});
 
   void _refreshRestingIndex(TxOrder order) {
-    final active = order.kind == TxKind.limit && order.remaining > 0 &&
+    final active = order.kind == TxKind.limit && order.timeInForce.canRest &&
+        order.remaining > 0 &&
         (order.status == TxStatus.open ||
          order.status == TxStatus.partiallyFilled);
     final sideBooks = _resting[order.symbol];
@@ -446,15 +471,18 @@ class TxEngine {
     required TxKind kind,
     required int quantity,
     int? limitPriceCents,
+    TxTimeInForce timeInForce = TxTimeInForce.gtc,
   }) {
     // Rust processes the actual executable command FIRST. Dart only mirrors
     // the result into its existing read-only UI / JSON persistence projection.
-    _native?.place(id, ownerId, symbol, side, kind, quantity, limitPriceCents);
+    _native?.place(id, ownerId, symbol, side, kind, quantity, limitPriceCents,
+        timeInForce: timeInForce);
     if (id.trim().isEmpty) throw ArgumentError('Order ID is required');
     final existing = _orders[id];
     if (existing != null) {
       if (existing.ownerId == ownerId && existing.symbol == symbol &&
           existing.side == side && existing.kind == kind &&
+          existing.timeInForce == timeInForce &&
           existing.quantity == quantity &&
           existing.limitPriceCents == limitPriceCents) {
         return existing; // At-least-once delivery: do not re-execute a repeat.
@@ -467,6 +495,7 @@ class TxEngine {
       symbol: symbol,
       side: side,
       kind: kind,
+      timeInForce: timeInForce,
       quantity: quantity,
       limitPriceCents: limitPriceCents,
       sequence: _nextOrderSequence++,
@@ -484,7 +513,8 @@ class TxEngine {
     } else if ((kind == TxKind.limit &&
             (limitPriceCents == null || limitPriceCents <= 0 ||
              limitPriceCents > maxPriceCents)) ||
-        (kind == TxKind.market && limitPriceCents != null)) {
+        (kind == TxKind.market &&
+            (limitPriceCents != null || timeInForce != TxTimeInForce.gtc))) {
       invalid = 'Invalid order price/type';
     } else if (kind == TxKind.limit &&
         limitPriceCents! * quantity > maxNotionalCents) {
@@ -494,6 +524,10 @@ class TxEngine {
 
     final owner = _accounts[ownerId]!;
     final matches = _counterparties(incoming);
+    if (kind == TxKind.limit && timeInForce == TxTimeInForce.postOnly &&
+        matches.isNotEmpty) {
+      return _reject(incoming, 'Post-only order would take liquidity');
+    }
     var wanted = quantity;
     var marketBuyCost = 0;
     for (final maker in matches) {
@@ -509,6 +543,10 @@ class TxEngine {
         }
       }
       wanted -= take;
+    }
+    if (kind == TxKind.limit && timeInForce == TxTimeInForce.fok &&
+        wanted > 0) {
+      return _reject(incoming, 'FOK order lacks complete executable depth');
     }
     if (side == TxSide.buy) {
       final requiredCash = kind == TxKind.limit
@@ -543,8 +581,12 @@ class TxEngine {
       if (take == 0) continue;
       _execute(incoming, maker, take);
     }
-    if (incoming.remaining > 0 && kind == TxKind.market) {
-      incoming._status = TxStatus.cancelled; // IOC remainder is never left on book.
+    if (incoming.remaining > 0 &&
+        (kind == TxKind.market || timeInForce == TxTimeInForce.ioc)) {
+      _releaseUnfilledReservation(incoming);
+      incoming._status = TxStatus.cancelled;
+    } else if (timeInForce == TxTimeInForce.fok && incoming.remaining > 0) {
+      throw StateError('FOK order left an unfilled remainder');
     } else {
       _refreshStatus(incoming);
     }
@@ -560,6 +602,27 @@ class TxEngine {
     return order;
   }
 
+  void _releaseUnfilledReservation(TxOrder order) {
+    if (order.kind != TxKind.limit || order.remaining <= 0) return;
+    final owner = account(order.ownerId);
+    if (order.side == TxSide.buy) {
+      final release = order.remaining * order.limitPriceCents!;
+      owner._reservedCashCents -= release;
+      _markAccount(owner);
+      _ledger.add(TxLedgerEntry(
+          accountId: order.ownerId, symbol: order.symbol,
+          reason: 'expire_ioc_buy', reservedCashDeltaCents: -release));
+    } else {
+      owner._reservedShares[order.symbol] =
+          owner.reservedSharesOf(order.symbol) - order.remaining;
+      _markAccount(owner);
+      _ledger.add(TxLedgerEntry(
+          accountId: order.ownerId, symbol: order.symbol,
+          reason: 'expire_ioc_sell',
+          reservedShareDelta: -order.remaining));
+    }
+  }
+
   /// Cancel an open limit order; an already-cancelled order is idempotent.
   TxOrder cancel(String id, {required String ownerId}) {
     final o = order(id);
@@ -568,7 +631,9 @@ class TxEngine {
     if (o.status != TxStatus.open && o.status != TxStatus.partiallyFilled) {
       throw StateError('Order is not open');
     }
-    if (o.kind != TxKind.limit) throw StateError('Market order cannot rest');
+    if (o.kind != TxKind.limit || !o.timeInForce.canRest) {
+      throw StateError('Immediate order cannot rest');
+    }
     _native?.cancel(id, ownerId);
     final a = account(ownerId);
     if (o.side == TxSide.buy) {
@@ -743,8 +808,18 @@ class TxEngine {
                o.remaining < 0 || o.remaining > o.quantity))) {
         throw StateError('Invalid order quantity or sequence');
       }
+      if (o.status != TxStatus.rejected &&
+          ((o.kind == TxKind.limit &&
+                (o.limitPriceCents == null || o.limitPriceCents! <= 0 ||
+                 o.limitPriceCents! > maxPriceCents)) ||
+           (o.kind == TxKind.market &&
+                (o.limitPriceCents != null ||
+                 o.timeInForce != TxTimeInForce.gtc)))) {
+        throw StateError('Invalid active order type');
+      }
       final active = o.status == TxStatus.open || o.status == TxStatus.partiallyFilled;
       if (active && (o.remaining == 0 || o.kind != TxKind.limit ||
+          !o.timeInForce.canRest ||
           !_accounts.containsKey(o.ownerId))) {
         throw StateError('Invalid active order');
       }
