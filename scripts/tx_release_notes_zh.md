@@ -1,14 +1,14 @@
-# Terminal X v0.3.5（开发候选，未发布）
+# Terminal X v0.3.5 · 安卓正式版
 
-## 本轮开发线说明
-- 当前仅进入本地 v0.3.5 开发线，版本号为 `0.3.5+37`；按要求不上传 `terminal_x_batch.zip`，也不创建或覆盖 GitHub Release。
-- v0.3.4 已有 GitHub Release；本地 v0.3.5 代码不等同于公开 APK，必须先通过 Flutter/Rust/ARM64 CI 与真机交易验收，再决定是否形成正式公开版本。
+## 本轮发布状态
+- v0.3.5+38 已通过 GitHub Actions 的 ZIP SHA 校验、Flutter 回归、Rust ARM64 编译、签名 APK 构建和 APK 内原生库校验，并已发布 GitHub Release。
+- 本轮已完成 CI 构建门禁；Android 真机交易、冷启动、高倍率长时间运行仍需在实际设备上继续验收，不能把 CI 通过等同于真机验收完成。
 
-## R48：保护性 IOC 博弈与专业交易面板（本地候选）
+## R48：保护性 IOC 博弈与专业交易面板
 - 限价委托加入 GTC、Post Only、IOC、FOK；后 3 种策略已经贯通 Dart 引擎、Rust 核心、工作 isolate、SQLite JSON 快照和下单确认页。
 - NPC 主动交易改为有资金／库存约束的保护性 IOC 限价单：趋势、价值、流量策略使用不同的保护价，支持真实部分成交、滑点边界和剩余撤销。
 - 交易页新增真实 BBO、价差、可见买卖盘比例和深度量条；点击买盘预填卖出，点击卖盘预填买入，盘口仍只读取已验证的 resting order。
-- 本地已补 Dart/Rust 回归用例；Flutter/Dart、Cargo/Rust、Android 构建和真机门禁仍需实际 CI/设备运行，未运行前不宣称通过。
+- 已补 Dart/Rust 回归用例；本轮 Flutter/Rust/Android CI 已实际通过，真机门禁仍待设备验收。
 
 ---
 
