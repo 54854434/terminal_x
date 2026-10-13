@@ -98,8 +98,8 @@ class TxLiveCandles {
     if (after.revision != before.revision + 1) {
       throw StateError('Missing committed SQLite revision');
     }
-    final oldStep = before.session.step;
-    final step = after.session.step;
+    final oldStep = before.session.marketTimeStep;
+    final step = after.session.marketTimeStep;
     if (step != oldStep && step != oldStep + 1) {
       throw StateError('Game clock skipped minutes');
     }

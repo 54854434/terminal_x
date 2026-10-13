@@ -1,9 +1,47 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 
 // Relative import avoids assuming the current project's pubspec package name.
 import '../lib/engine/tx_engine.dart';
+import '../lib/engine/tx_rust_market_gate.dart';
 
 void main() {
+  test('Rust live-book audit rejects order drift without historical scans', () {
+    final engine = TxEngine()
+      ..registerAccount('buyer', cashCents: 10000)
+      ..registerAccount('seller', cashCents: 0, shares: {'LOW': 10});
+    engine.place(id: 'ask', ownerId: 'seller', symbol: 'LOW',
+        side: TxSide.sell, kind: TxKind.limit,
+        quantity: 5, limitPriceCents: 900);
+    engine.place(id: 'bid', ownerId: 'buyer', symbol: 'LOW',
+        side: TxSide.buy, kind: TxKind.limit,
+        quantity: 3, limitPriceCents: 800);
+    final ids = <String, int>{'ask': 11, 'bid': 12};
+    final remaining = <int, int>{11: 5, 12: 3};
+    final statuses = <int, int>{
+      11: TxStatus.open.index, 12: TxStatus.open.index,
+    };
+    void audit({int reportedCount = 2}) => TxRustMarketGate.verifyRestingParity(
+        engine, nativeActiveCount: reportedCount,
+        mapOrderId: (id) => ids[id],
+        remaining: (id) => remaining[id] ?? -1,
+        status: (id) => statuses[id] ?? -1);
+
+    expect(audit, returnsNormally);
+    remaining[11] = 4;
+    expect(audit, throwsStateError);
+    remaining[11] = 5;
+    statuses[12] = TxStatus.cancelled.index;
+    expect(audit, throwsStateError);
+    statuses[12] = TxStatus.open.index;
+    ids.remove('bid');
+    expect(audit, throwsStateError);
+    ids['bid'] = 12;
+    expect(() => audit(reportedCount: 1), throwsStateError);
+    expect(audit, returnsNormally);
+  });
+
   group('V0.1b price-time matching and finite depth', () {
     test('price priority, then FIFO, and multi-level market slippage', () {
       final e = TxEngine()
@@ -148,6 +186,36 @@ void main() {
       expect(e.account('self').reservedCashCents, 0);
       e.checkInvariants();
     });
+  });
+
+  test('R43 long-history sequence audit stays append-only and detects corruption', () {
+    final engine = TxEngine()
+      ..registerAccount('buyer', cashCents: 100000);
+    engine.runCheckedMinute(() {
+      for (var i = 0; i < 512; i++) {
+        final order = engine.place(
+          id: 'ioc-$i', ownerId: 'buyer', symbol: 'SIM-A01',
+          side: TxSide.buy, kind: TxKind.market, quantity: 1);
+        expect(order.status, TxStatus.cancelled);
+      }
+    });
+    expect(engine.order('ioc-511').sequence, 512);
+    expect(engine.fills, isEmpty);
+    final canonical = engine.exportJson();
+    final restored = TxEngine.importJson(canonical);
+    expect(restored.exportJson(), canonical);
+    final poisoned = jsonDecode(canonical) as Map<String, dynamic>;
+    final orders = poisoned['orders'] as List<dynamic>;
+    (orders[101] as Map<String, dynamic>)['sequence'] = 101;
+    expect(() => TxEngine.importJson(jsonEncode(poisoned)), throwsStateError);
+    (orders[101] as Map<String, dynamic>)['sequence'] = 102;
+    (orders[101] as Map<String, dynamic>)['sequence'] = 103;
+    (orders[102] as Map<String, dynamic>)['sequence'] = 102;
+    expect(() => TxEngine.importJson(jsonEncode(poisoned)), throwsStateError);
+    (orders[101] as Map<String, dynamic>)['sequence'] = 102;
+    (orders[102] as Map<String, dynamic>)['sequence'] = 103;
+    poisoned['nextOrderSequence'] = 514;
+    expect(() => TxEngine.importJson(jsonEncode(poisoned)), throwsStateError);
   });
 
   group('V0.1b snapshot round trip', () {

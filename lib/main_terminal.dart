@@ -75,10 +75,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   TxLiveCandles? _candles;
   late final Ticker _playbackTicker;
   Duration? _previousFrame;
-  final TxContinuousFlowClock _flow = TxContinuousFlowClock();
+  final TxContinuousFlowClock _flow = TxContinuousFlowClock(pulseSeconds: 15);
   final TxCommittedSpeedWindow _committedSpeed = TxCommittedSpeedWindow();
   final Stopwatch _speedStopwatch = Stopwatch();
   final TxCommitLatencyWindow _commitLatency = TxCommitLatencyWindow();
+  final TxCommitLatencyWindow _pulseLatency = TxCommitLatencyWindow();
+  final TxCommitLatencyWindow _marketLatency = TxCommitLatencyWindow();
+  final TxCommitLatencyWindow _sqliteLatency = TxCommitLatencyWindow();
   final TxFrameRenderGate _frameRenderGate = TxFrameRenderGate();
   TxStorageFootprint? _storageFootprint;
   int _checkpointInterval = TxDeltaCodec.checkpointInterval;
@@ -158,10 +161,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final frameSeconds = frame.fractionOfMinute * 60.0;
     // Time advances on every vsync; only cyan preview repaint is limited.
     if (_frameRenderGate.shouldPaint(elapsed,
-        force: frame.needsMinuteCommit) && frameSeconds != _seconds.value) {
+        force: frame.needsMinuteCommit || frame.needsPulseCommit) &&
+        frameSeconds != _seconds.value) {
       _seconds.value = frameSeconds;
     }
-    if (frame.needsMinuteCommit) {
+    if (frame.needsPulseCommit) {
+      _pulse(frame.second);
+    } else if (frame.needsMinuteCommit) {
       // Do not stop/restart the vsync ticker every single SQLite minute.
       // The next frames are ignored until this durable commit completes.
       // Backpressure lowers achieved speed without inventing transactions.
@@ -201,6 +207,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         nativeMarketWorker: Platform.isAndroid);
       final initial = await service.open();
       final checkpointInterval = await service.database.readCheckpointInterval();
+      final pulseSeconds = await service.database.readMarketPulseSeconds();
+      _flow.setPulseSeconds(pulseSeconds);
       // Once, not on every committed tick. 64 recent revisions are enough to
       // reconstruct recent candles without loading the entire database.
       var candles = await service.database.readCandleIndex(initial);
@@ -234,7 +242,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   void _operate(Future<String> Function(TxTradingService) work,
-      {bool automated = false}) {
+      {bool automated = false, bool pulse = false}) {
     if (!_ready) return;
     // User-initiated operations suspend visual playback before any write.
     if (!automated && _auto) _pause();
@@ -248,11 +256,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       // global loading indicator or rebuild the entire UI before each save.
       _busy = true;
     }
-    _operation = _perform(work, automated: automated);
+    _operation = _perform(work, automated: automated, pulse: pulse);
   }
 
   Future<void> _perform(Future<String> Function(TxTradingService) work,
-      {required bool automated}) async {
+      {required bool automated, required bool pulse}) async {
     try {
       final trader = _trader!;
       final before = trader.current;
@@ -269,9 +277,14 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       }
       if (automated) {
         // Transaction finished: only NOW may the minute boundary appear.
-        _flow.completeMinuteCommit();
-        if (mounted) _seconds.value = 0;
-        if (_auto) {
+        if (pulse) {
+          _flow.completePulseCommit();
+          if (mounted) _seconds.value = _flow.minuteProgress * 60.0;
+        } else {
+          _flow.completeMinuteCommit();
+          if (mounted) _seconds.value = 0;
+        }
+        if (_auto && !pulse) {
           _committedSpeed.record(
             elapsedMilliseconds: _speedStopwatch.elapsedMilliseconds,
             minute: after.session.step,
@@ -305,6 +318,17 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     }
   }
 
+  void _pulse(int second) {
+    _operate((service) async {
+      final latency = Stopwatch()..start();
+      final next = await service.marketPulse(second);
+      latency.stop();
+      _pulseLatency.add(latency.elapsed);
+      return 'Rust 真实盘口第 ${next.session.marketTimeStep} 分钟 ${second}s'
+          ' · SQLite r${next.revision}';
+    }, automated: true, pulse: true);
+  }
+
   void _tick({bool automatic = false}) {
     if (!automatic && _flow.running) _pause();
     if (!automatic && !_flow.awaitingCommit) {
@@ -317,6 +341,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     latency.stop();
     // Record only successful, durable minute commits, never failed attempts.
     _commitLatency.add(latency.elapsed);
+    final timings = service.lastTickTimings;
+    if (timings != null) {
+      _marketLatency.add(timings.market);
+      _sqliteLatency.add(timings.sqlite);
+    }
     return '模拟第 ${TxSimulationClock.gameDay(next.session.step)} 天 '
         '${TxSimulationClock.hhmm(next.session.step)} · '
         'SQLite r${next.revision}';
@@ -463,6 +492,39 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _changeSpeed(choice);
   }
 
+  void _changeMarketPulseSeconds(int seconds) {
+    if (!_ready || _flow.awaitingCommit || _flow.faulted ||
+        seconds < 5 || seconds > 60 || seconds == _flow.pulseSeconds) return;
+    _operate((service) async {
+      await service.database.setMarketPulseSeconds(seconds);
+      if (mounted) setState(() => _flow.setPulseSeconds(seconds));
+      return '真实 Rust 盘口间隔已保存：每 $seconds 游戏秒；'
+          '每次交易仍经 SQLite 原子提交';
+    });
+  }
+
+  Future<void> _showCustomMarketPulse() async {
+    if (!_ready || _flow.awaitingCommit || _flow.faulted) return;
+    final controller = TextEditingController(text: '${_flow.pulseSeconds}');
+    final choice = await showDialog<int>(context: context, builder: (context) =>
+      AlertDialog(title: const Text('自定义真实盘口结算周期'), content: TextField(
+        controller: controller, autofocus: true,
+        keyboardType: TextInputType.number,
+        decoration: const InputDecoration(
+            labelText: '5～60 游戏秒', suffixText: '秒')),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(
+              int.tryParse(controller.text.trim())),
+              child: const Text('应用')),
+        ]));
+    controller.dispose();
+    if (!mounted || choice == null || choice < 5 || choice > 60 ||
+        !_ready || _flow.awaitingCommit || _flow.faulted) return;
+    _changeMarketPulseSeconds(choice);
+  }
+
   // Previous committed book for real post-commit deltas, not simulated orders.
   final Map<String, Map<String, int>> _previousBookQty = {};
 
@@ -519,7 +581,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Text('真实五档盘口 · 已提交委托',
             style: TextStyle(fontWeight: FontWeight.bold)),
-        const Text('做市商逐分钟真实挂撤单 · 新挂 / + / − 标出提交后变化',
+        Text('Rust 真实委托：每 ${_flow.pulseSeconds} 游戏秒更新'
+            ' · 新挂 / + / − 为提交后变化',
             style: TextStyle(fontSize: 10, color: Colors.white54)),
         const SizedBox(height: 6),
         Text(insight.spreadCents == null
@@ -597,6 +660,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           valueListenable: _seconds,
           builder: (context, seconds, child) => TxCandleChart(
             candles: candles,
+            activeMinuteStep: session.lastPulseSecond > 0
+                ? session.marketTimeStep : null,
             // At exactly 0 seconds of an automatically running minute,
             // retain the cyan display-only price marker. Otherwise it
             // vanishes for one frame after *every* durable SQLite commit.
@@ -643,6 +708,26 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           const SizedBox(height: 8),
           SingleChildScrollView(scrollDirection: Axis.horizontal,
             child: Row(children: [
+            const Text('真实盘口结算', style: TextStyle(fontSize: 12)),
+            const SizedBox(width: 8),
+            for (final seconds in [5, 10, 15, 30, 60])
+              Padding(padding: const EdgeInsets.only(right: 4),
+                child: ChoiceChip(label: Text('${seconds}s',
+                    style: const TextStyle(fontSize: 10)),
+                  selected: _flow.pulseSeconds == seconds,
+                  onSelected: _ready && !_flow.awaitingCommit
+                      ? (_) => _changeMarketPulseSeconds(seconds)
+                      : null)),
+            TextButton(onPressed: _ready && !_flow.awaitingCommit
+                ? _showCustomMarketPulse : null,
+              child: const Text('自定义', style: TextStyle(fontSize: 10))),
+          ])),
+          const Text('间隔越短盘口越实时，但 Rust 撮合与 SQLite 提交次数越多；'
+              '60s 为原有分钟结算模式。',
+              style: TextStyle(color: Colors.white54, fontSize: 10)),
+          const SizedBox(height: 8),
+          SingleChildScrollView(scrollDirection: Axis.horizontal,
+            child: Row(children: [
               for (final value in [1, 5, 10, 30, 60, 100, 300, 600, 1200, 3600])
                 Padding(padding: const EdgeInsets.only(right: 5),
                   child: ChoiceChip(label: Text('$value×'),
@@ -663,10 +748,19 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           Text('目标 ${_speed}× · 实际已提交 ${_committedSpeed.achievedMultiplier.toStringAsFixed(1)}×'
               ' · 每分钟安全提交',
               style: const TextStyle(color: Colors.white60, fontSize: 11)),
+          if (_pulseLatency.count > 0)
+            Text('实时盘口最近 ${_pulseLatency.count} 次提交 p95 '
+                '${_pulseLatency.p95Milliseconds} ms（Rust + SQLite）',
+                style: const TextStyle(color: Colors.white60, fontSize: 11)),
           if (_commitLatency.count > 0) ...[
             Text('最近 ${_commitLatency.count} 次有效分钟提交耗时 p95 '
                 '${_commitLatency.p95Milliseconds} ms（含撮合及 SQLite）',
                 style: const TextStyle(color: Colors.white60, fontSize: 11)),
+            if (_marketLatency.count > 0 && _sqliteLatency.count > 0)
+              Text('阶段 p95：Rust/市场 ${_marketLatency.p95Milliseconds} ms'
+                  ' · SQLite/校验 ${_sqliteLatency.p95Milliseconds} ms'
+                  '（分别统计，不直接相加）',
+                  style: const TextStyle(color: Colors.white60, fontSize: 11)),
             Builder(builder: (context) {
               final health=TxRuntimeHealth.evaluate(speed:_speed,
                 sampleCount:_commitLatency.count,

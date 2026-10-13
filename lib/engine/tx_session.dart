@@ -32,7 +32,32 @@ class TxSession {
   /// game database. Values use integer cents, signed quantities and string IDs.
   /// Never contains pointers or runtime-specific handles.
   final List<List<Object?>> nativeEvents = <List<Object?>>[];
+  // The previous successfully committed Rust journal length is volatile. A
+  // TXD1 v2 storage delta appends only new commands, while full snapshots
+  // and exportJson continue to include the complete deterministic journal.
+  int _committedNativeEventCount = 0;
+
+  Map<String, dynamic> snapshotNativeJournalDelta() {
+    if (_committedNativeEventCount < 0 ||
+        _committedNativeEventCount > nativeEvents.length) {
+      throw StateError('Rust journal cursor rewound before SQLite commit');
+    }
+    return <String, dynamic>{
+      'oldLength': _committedNativeEventCount,
+      'append': nativeEvents.sublist(_committedNativeEventCount),
+    };
+  }
   int _quoteFillStart = 0;
+  // 0 for a fully closed minute. Positive when verified Rust orders have
+  // already executed in the upcoming minute. Stored inside schema-1 JSON.
+  int lastPulseSecond = 0;
+  int get marketTimeStep => step + (lastPulseSecond > 0 ? 1 : 0);
+  // Volatile per-symbol quote cursor. Cached values NEVER enter JSON, Rust
+  // events, stored OHLC or the executable order book. A new minute or a
+  // previously unseen fill invalidates only the appropriate part of it.
+  int _lastPriceCursor = -1;
+  int _lastPriceCursorStart = -1;
+  final Map<String, int> _minuteLastFillPrice = <String, int>{};
 
   static TxSession fresh() {
     final e = TxEngine();
@@ -128,6 +153,34 @@ class TxSession {
     }
   }
 
+  /// Executes actual funded NPC quotes/trades in the NEXT displayed minute.
+  /// The step counter changes only at the minute boundary; marketTimeStep
+  /// attributes the confirmed subminute fills to the correct candle.
+  /// Repeated pulses after restart are inert and cannot create duplicate IDs.
+  void marketPulse(int second) {
+    if (second < 5 || second >= 60) {
+      throw ArgumentError.value(second, 'second');
+    }
+    if (second <= lastPulseSecond) return;
+    if (!TxNpcMarket.isEnabled(engine)) {
+      lastPulseSecond = second;
+      return;
+    }
+    engine.runCheckedMinute(() {
+      if (lastPulseSecond == 0) _quoteFillStart = engine.fillCount;
+      TxNpcMarket.cancelResting(engine);
+      // Unique event seed per game-minute/pulse; never reuse minute-order IDs.
+      final seed = (step + 1) * 64 + second;
+      final movements = <int>[
+        for (var i = 0; i < symbols.length; i++)
+          activeReferenceMove(step + 1, i),
+      ];
+      TxNpcMarket.tradeMinute(
+          engine, seed, symbols, referenceCents, movements);
+      lastPulseSecond = second;
+    });
+  }
+
   void nextTick() {
     // Defer full O(history) checks across this one isolated minute only.
     engine.runCheckedMinute(() {
@@ -140,8 +193,10 @@ class TxSession {
     for (final order in restingMakerOrders) {
       engine.cancel(order.id, ownerId: order.ownerId);
     }
+    final hadPulses = lastPulseSecond > 0;
     step++;
-    _quoteFillStart = engine.fillCount;
+    if (!hadPulses) _quoteFillStart = engine.fillCount;
+    lastPulseSecond = 0;
     final movements = <int>[];
     final activeParticipants = TxNpcMarket.isEnabled(engine);
     for (var i = 0; i < symbols.length; i++) {
@@ -225,11 +280,22 @@ class TxSession {
       engine.cancel(orderId, ownerId: playerId);
 
   int lastPrice(String symbol) {
-    for (var i = engine.fillCount - 1; i >= _quoteFillStart; i--) {
-      final fill = engine.fillAt(i);
-      if (fill.symbol == symbol) return fill.priceCents;
+    final fillCount = engine.fillCount;
+    if (_lastPriceCursorStart != _quoteFillStart ||
+        _lastPriceCursor > fillCount || _lastPriceCursor < _quoteFillStart) {
+      _minuteLastFillPrice.clear();
+      _lastPriceCursorStart = _quoteFillStart;
+      _lastPriceCursor = _quoteFillStart;
     }
-    return referenceCents[symbols.indexOf(symbol)];
+    // Only process NEW fills since the previous read, in execution order.
+    // Reading the chart quote at 60/120 FPS is now O(1) after the first read.
+    for (var i = _lastPriceCursor; i < fillCount; i++) {
+      final fill = engine.fillAt(i);
+      _minuteLastFillPrice[fill.symbol] = fill.priceCents;
+    }
+    _lastPriceCursor = fillCount;
+    return _minuteLastFillPrice[symbol] ??
+        referenceCents[symbols.indexOf(symbol)];
   }
 
   /// Real fills since the start of the most recent simulated minute.
@@ -336,6 +402,7 @@ class TxSession {
         'referenceCents': referenceCents,
         'nextPlayerOrder': nextPlayerOrder,
         'quoteFillStart': _quoteFillStart,
+        'lastPulseSecond': lastPulseSecond,
         'archivedLegacyOrders': archivedLegacyOrders,
         'archivedLegacyTrades': archivedLegacyTrades,
         'isLegacyUpgrade': isLegacyUpgrade,
@@ -344,8 +411,10 @@ class TxSession {
 
   /// Establish a new delta base AFTER an atomic SQLite commit.
   /// Kept separate from the economic state and never serialized.
-  void acknowledgeCommittedSnapshot() =>
-      engine.acknowledgeCommittedSnapshot();
+  void acknowledgeCommittedSnapshot() {
+    engine.acknowledgeCommittedSnapshot();
+    _committedNativeEventCount = nativeEvents.length;
+  }
 
   /// R31: validate the already-typed candidate directly, without spending an
   /// additional full JSON export/import cycle before every SQLite save.
@@ -353,7 +422,9 @@ class TxSession {
   void checkInvariantsForCommit() {
     if (step < 0 || referenceCents.length != symbols.length ||
         referenceCents.any((value) => value <= 0) || nextPlayerOrder < 1 ||
-        _quoteFillStart < 0 || _quoteFillStart > engine.fillCount) {
+        _quoteFillStart < 0 || _quoteFillStart > engine.fillCount ||
+        lastPulseSecond < 0 || lastPulseSecond >= 60 ||
+        (lastPulseSecond > 0 && lastPulseSecond < 5)) {
       throw StateError('Invalid session metadata before SQLite commit');
     }
     for (final id in <String>[playerId, 'LP_A', 'LP_B']) {
@@ -397,6 +468,12 @@ class TxSession {
     final session = TxSession._(engine, step, references, counter,
         archivedOrders, archivedTrades, data['isLegacyUpgrade'] as bool)
       .._quoteFillStart = quoteFillStart;
+    final pulseSecond = data['lastPulseSecond'] ?? 0;
+    if (pulseSecond is! int || pulseSecond < 0 || pulseSecond >= 60 ||
+        (pulseSecond > 0 && pulseSecond < 5)) {
+      throw const FormatException('Invalid committed market pulse second');
+    }
+    session.lastPulseSecond = pulseSecond;
     final rawEvents = data['nativeEvents'];
     if (rawEvents is List) {
       for (final event in rawEvents) {
@@ -406,6 +483,7 @@ class TxSession {
         session.nativeEvents.add(List<Object?>.from(event));
       }
     }
+    session._committedNativeEventCount = session.nativeEvents.length;
     return session;
   }
 }

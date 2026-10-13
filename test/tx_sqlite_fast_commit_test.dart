@@ -80,6 +80,31 @@ void main() {
     expect(await count(), 1);
   });
 
+  test('R41 long prior checkpoint is still rehashed and tampering blocks save',
+      () async {
+    final fresh = TxSession.fresh();
+    fresh.archivedLegacyTrades.addAll(List<String>.generate(10000,
+        (i) => 'synthetic-$i-${i * i}-${i * 214013 + 2531011}'));
+    final first = await store.initializeFresh(fresh);
+    final candidate = TxSession.importJson(first.session.exportJson())
+      ..nextTick();
+    final saved = await store.saveSession(candidate, expectedRevision: 1);
+    expect(saved.revision, 2);
+    // A matching forged digest does not permit bypassing prior-head trust.
+    final payload = (await store.customSelect('''
+      SELECT payload_json FROM snapshots WHERE revision = 2
+    ''').getSingle()).read<String>('payload_json');
+    expect(payload.length, greaterThanOrEqualTo(64 * 1024));
+    await store.customStatement('''
+      UPDATE snapshots SET payload_json = ?, sha256 = ? WHERE revision = 2
+    ''', [payload + 'corrupt',
+        sha256.convert(utf8.encode(payload + 'corrupt')).toString()]);
+    final next = TxSession.importJson(saved.session.exportJson())..nextTick();
+    await expectLater(store.saveSession(next, expectedRevision: 2),
+        throwsStateError);
+    expect(await count(), 2);
+  });
+
   test('checkpoint failure rolls back the new snapshot and keeps old head',
       () async {
     await store.close();

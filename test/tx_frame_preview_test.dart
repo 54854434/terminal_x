@@ -63,6 +63,21 @@ void main() {
         flow120.minuteProgress);
   });
 
+  test('R40 provisional candles use current bucket rise/fall for display', () {
+    final last = c(10, 1000);
+    TxFrameCandleProjection preview(double value) =>
+        TxFrameCandleProjection.fromLastCommitted(
+          lastAggregated: last, nextMinuteStep: 11, periodMinutes: 1,
+          framePriceCents: value,
+          previewHighCents: value > 1001 ? value : 1001,
+          previewLowCents: value < 1001 ? value : 1001,
+        );
+    expect(preview(1020).rising, isTrue);
+    expect(preview(980).rising, isFalse);
+    expect(last.highCents, 1003);
+    expect(last.volumeShares, 7);
+  });
+
   test('one-minute preview always uses an uncommitted spare slot', () {
     final old=c(8, 1000);
     final p=TxFrameCandleProjection.fromLastCommitted(
@@ -177,6 +192,38 @@ void main() {
     expect(wick.groupStep, 25);
     expect(wick.highCents, 1009);
     expect(wick.lowCents, 1008);
+  });
+
+  test('R40 previous provisional wick lasts one 1m boundary only', () {
+    final wick = TxIndicativeWickMemory();
+    wick.observe(nextMinuteStep: 11, periodMinutes: 1,
+        committedCloseCents: 1000, framePriceCents: 1090);
+    wick.observe(nextMinuteStep: 11, periodMinutes: 1,
+        committedCloseCents: 1000, framePriceCents: 950);
+    // A new committed minute changes the screen, not immutable OHLC.
+    wick.observe(nextMinuteStep: 12, periodMinutes: 1,
+        committedCloseCents: 1020);
+    expect(wick.previousGroupStep, 11);
+    expect(wick.previousHighCents, 1090);
+    expect(wick.previousLowCents, 950);
+    expect(wick.highCents, 1020);
+    // Clock jump / old snapshot must never drag an unrelated shadow.
+    wick.observe(nextMinuteStep: 15, periodMinutes: 1,
+        committedCloseCents: 1005);
+    expect(wick.previousGroupStep, isNull);
+    wick.reset();
+    expect(wick.previousHighCents, isNull);
+    // At an hour boundary the old hour must be accessible by group key.
+    final hour = TxIndicativeWickMemory();
+    hour.observe(nextMinuteStep: 178, periodMinutes: 60,
+        committedCloseCents: 1000, framePriceCents: 1120);
+    hour.observe(nextMinuteStep: 179, periodMinutes: 60,
+        committedCloseCents: 1010, framePriceCents: 970);
+    hour.observe(nextMinuteStep: 180, periodMinutes: 60,
+        committedCloseCents: 1030);
+    expect(hour.previousGroupStep, 120);
+    expect(hour.previousHighCents, 1120);
+    expect(hour.previousLowCents, 970);
   });
 
   test('R32 all timeframe buckets reset only at their own boundary', () {

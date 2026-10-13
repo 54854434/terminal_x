@@ -11,6 +11,16 @@ import '../engine/tx_session.dart';
 import '../market/tx_live_candles.dart';
 import 'tx_delta_codec.dart';
 
+// The previous committed snapshot must be re-hashed inside each write
+// transaction to reject tampering even if its stored SHA was also forged.
+// Long-history TXZ1/TXD1 checksums are moved off the Flutter isolate; only
+// the hash result crosses back. Never capture a GeneratedDatabase in Isolate.
+String _snapshotChecksum(String data) =>
+    sha256.convert(utf8.encode(data)).toString();
+
+Future<String> _snapshotChecksumOffThread(String data) =>
+    Isolate.run(() => _snapshotChecksum(data));
+
 // Candidate audit/encoding happens on a worker. The prior canonical snapshot
 // and its hash are only accepted if the SQL transaction later verifies the
 // exact same on-disk revision. Never publish an uncommitted candidate.
@@ -34,6 +44,8 @@ _PreparedSnapshot _prepareSnapshot(
       ? null : proposed.snapshotHeader();
   final trackedEngineHeader = trackedLists == null
       ? null : proposed.engine.snapshotHeader();
+  final trackedNativeJournal = trackedLists == null
+      ? null : proposed.snapshotNativeJournalDelta();
   // The source is a typed, unpublished isolate candidate. One complete
   // release-mode invariant audit is sufficient; re-importing its full JSON
   // would audit and materialize the same ever-growing history again.
@@ -50,6 +62,7 @@ _PreparedSnapshot _prepareSnapshot(
     trackedSessionHeader: trackedSessionHeader,
     trackedEngineHeader: trackedEngineHeader,
     trackedLists: trackedLists,
+    trackedNativeJournal: trackedNativeJournal,
   );
   if (!encoded.checkpoint) {
     // Verify the delta reconstructs the EXACT validated canonical candidate.
@@ -167,6 +180,7 @@ class TxSqliteStore extends GeneratedDatabase {
   static const String primarySessionId = 'primary';
   static const String migrationSource = 'v01c_shared_preferences';
   static const String _checkpointPolicyKey = 'checkpoint_interval';
+  static const String _marketPulseSecondsKey = 'market_pulse_seconds_v1';
   static const String _candleIndexKey = 'candle_index_v1';
   TxLiveCandles? _indexedCandles;
   int? _indexedRevision;
@@ -181,6 +195,9 @@ class TxSqliteStore extends GeneratedDatabase {
   // In-memory only. Rebuilt with bounded, hash-chained replay on every open.
   // This never overrides the committed SQLite head or revision CAS guard.
   String? _headCanonical;
+  // Optimization only: reuse the last verified policy during preparation.
+  // The SQL transaction ALWAYS re-reads the policy before publishing.
+  int? _cachedCheckpointInterval;
 
   @override
   int get schemaVersion => 1;
@@ -266,6 +283,33 @@ class TxSqliteStore extends GeneratedDatabase {
     return value;
   }
 
+  /// User-selected *economic* market cadence. This is intentionally separate
+  /// from the SQLite checkpoint policy: every real trade remains durable.
+  Future<int> readMarketPulseSeconds() async {
+    final row = await customSelect('''
+      SELECT value FROM storage_metadata WHERE key = ?
+    ''', variables: [Variable.withString(_marketPulseSecondsKey)])
+        .getSingleOrNull();
+    if (row == null) return 15;
+    final seconds = int.tryParse(row.read<String>('value'));
+    if (seconds == null || seconds < 5 || seconds > 60) {
+      throw StateError('Invalid market pulse cadence in SQLite');
+    }
+    return seconds;
+  }
+
+  Future<void> setMarketPulseSeconds(int seconds) async {
+    if (seconds < 5 || seconds > 60) {
+      throw ArgumentError.value(seconds, 'marketPulseSeconds');
+    }
+    await transaction(() async {
+      await customStatement('''
+        INSERT INTO storage_metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      ''', <Object?>[_marketPulseSecondsKey, seconds.toString()]);
+    });
+  }
+
   /// Update only a storage policy, never the account state or revision.
   /// The next complete snapshot is determined by the updated interval.
   Future<void> setCheckpointInterval(int value) async {
@@ -285,6 +329,8 @@ class TxSqliteStore extends GeneratedDatabase {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       ''', <Object?>[_checkpointPolicyKey, value.toString()]);
     });
+    // Only advance the volatile cache after policy transaction success.
+    _cachedCheckpointInterval = value;
   }
 
   /// Non-authoritative, bounded OHLC read model. Corrupt/stale records are
@@ -312,7 +358,7 @@ class TxSqliteStore extends GeneratedDatabase {
       // authoritative account; display cache never supplies executable quotes.
       for (final symbol in TxSession.symbols) {
         final series = recovered.forSymbol(symbol);
-        if (series.isEmpty || series.last.step != committed.session.step ||
+        if (series.isEmpty || series.last.step != committed.session.marketTimeStep ||
             series.last.closeCents != committed.session.lastPrice(symbol)) {
           return null;
         }
@@ -343,7 +389,7 @@ class TxSqliteStore extends GeneratedDatabase {
     if (_indexedRevision == committed.revision) return;
     for (final symbol in TxSession.symbols) {
       final series = candles.forSymbol(symbol);
-      if (series.isEmpty || series.last.step != committed.session.step ||
+      if (series.isEmpty || series.last.step != committed.session.marketTimeStep ||
           series.last.closeCents != committed.session.lastPrice(symbol)) {
         throw StateError('Cannot index unverified candle state');
       }
@@ -542,7 +588,15 @@ class TxSqliteStore extends GeneratedDatabase {
     final data = row.read<String?>('payload_json');
     final oldHash = row.read<String?>('snapshot_hash');
     if (stored != active || source != primarySessionId ||
-        data == null || oldHash == null || _digest(data) != oldHash) {
+        data == null || oldHash == null) {
+      throw StateError('Corrupted SQLite session pointer or checksum');
+    }
+    // Still hash the actual on-disk payload on EVERY save. For large heads,
+    // moving the CPU-intensive digest off the Flutter/UI isolate avoids a
+    // frame-length synchronous calculation at each simulated minute boundary.
+    final actualHash = data.length >= 64 * 1024
+        ? await _snapshotChecksumOffThread(data) : _digest(data);
+    if (actualHash != oldHash) {
       throw StateError('Corrupted SQLite session pointer or checksum');
     }
     if (_verifiedRevision == active && _verifiedHash != oldHash) {
@@ -625,7 +679,8 @@ class TxSqliteStore extends GeneratedDatabase {
         ? _headCanonical : null;
     final cachedHash = _verifiedRevision == expectedRevision
         ? _verifiedHash : null;
-    final interval = await readCheckpointInterval();
+    final interval = _cachedCheckpointInterval ??
+        await readCheckpointInterval();
     final prepared = await _prepareSnapshotOffThread(
         session, cachedCanonical, expectedRevision, cachedHash, interval);
     final checked = prepared.session;
@@ -683,6 +738,7 @@ class TxSqliteStore extends GeneratedDatabase {
     _verifiedRevision = committed.revision;
     _verifiedHash = committed.sha256;
     _headCanonical = prepared.canonical;
+    _cachedCheckpointInterval = interval;
     _cachedCurrent = committed;
     if (nextCandles != null) {
       _indexedCandles = nextCandles;

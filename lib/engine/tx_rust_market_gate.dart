@@ -16,6 +16,29 @@ class TxRustMarketGate implements TxEngineNativeGate {
   int _nextOrderId = 0;
   int _verifiedFillCount = 0;
 
+  /// Compare only live orders, not the unbounded archived order history.
+  /// Cash, share reserves and actual fills are audited separately in verify().
+  static void verifyRestingParity(TxEngine engine, {
+    required int nativeActiveCount,
+    required int? Function(String) mapOrderId,
+    required int Function(int) remaining,
+    required int Function(int) status,
+  }) {
+    var dartActive = 0;
+    for (final order in engine.activeOrders) {
+      dartActive++;
+      final nativeId = mapOrderId(order.id);
+      if (nativeId == null ||
+          remaining(nativeId) != order.remaining ||
+          status(nativeId) != order.status.index) {
+        throw StateError('Rust live order differs: ${order.id}');
+      }
+    }
+    if (dartActive != nativeActiveCount) {
+      throw StateError('Rust active order count differs');
+    }
+  }
+
   static TxRustMarketGate open(TxSession session) {
     final api = TxNativeCoreFfi.openInstalledAndroidLibrary();
     final gate = TxRustMarketGate._(session, api);
@@ -157,6 +180,11 @@ class TxRustMarketGate implements TxEngineNativeGate {
     if (!native.isAudited || native.fillCount != engine.fillCount) {
       throw StateError('Rust order book or genuine fill count mismatch');
     }
+    verifyRestingParity(engine,
+        nativeActiveCount: native.activeOrderCount,
+        mapOrderId: (id) => _orderIds[id],
+        remaining: native.remaining,
+        status: native.orderStatus);
     for (final entry in _accountIds.entries) {
       final dart = engine.account(entry.key);
       final id = entry.value;

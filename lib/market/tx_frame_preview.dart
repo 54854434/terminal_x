@@ -41,6 +41,10 @@ class TxFrameCandleProjection {
   final bool overlaysLastCommitted;
   final double openCents, highCents, lowCents, closeCents;
 
+  /// Direction is based on the provisional bucket's open, NOT the
+  /// previous frame's close. A visual cue, never an executed trade.
+  bool get rising => closeCents >= openCents;
+
   static TxFrameCandleProjection fromLastCommitted({
     required TxCandle lastAggregated,
     required int nextMinuteStep,
@@ -90,15 +94,27 @@ class TxIndicativeWickMemory {
   int? _groupStep;
   double? _high;
   double? _low;
+  bool _hasPreviewSample = false;
+  // At most one PREVIOUS visual-only bucket. This is NOT historical OHLC.
+  int? _previousGroupStep;
+  double? _previousHigh;
+  double? _previousLow;
 
   int? get groupStep => _groupStep;
   double? get highCents => _high;
   double? get lowCents => _low;
+  int? get previousGroupStep => _previousGroupStep;
+  double? get previousHighCents => _previousHigh;
+  double? get previousLowCents => _previousLow;
 
   void reset() {
     _groupStep = null;
     _high = null;
     _low = null;
+    _hasPreviewSample = false;
+    _previousGroupStep = null;
+    _previousHigh = null;
+    _previousLow = null;
   }
 
   void observe({
@@ -115,11 +131,26 @@ class TxIndicativeWickMemory {
     }
     final group = (nextMinuteStep ~/ periodMinutes) * periodMinutes;
     if (group != _groupStep) {
+      // Preserve the last in-memory preview for ONE immediately preceding
+      // bucket, so a one-minute SQLite commit does not visually erase it.
+      // Never merge this envelope into the durable TxCandle or order book.
+      if (_hasPreviewSample && _groupStep != null &&
+          group == _groupStep! + periodMinutes) {
+        _previousGroupStep = _groupStep;
+        _previousHigh = _high;
+        _previousLow = _low;
+      } else {
+        _previousGroupStep = null;
+        _previousHigh = null;
+        _previousLow = null;
+      }
       _groupStep = group;
       _high = committedCloseCents;
       _low = committedCloseCents;
+      _hasPreviewSample = false;
     }
     if (framePriceCents != null) {
+      _hasPreviewSample = true;
       _high = math.max(_high!, framePriceCents);
       _low = math.min(_low!, framePriceCents);
     }

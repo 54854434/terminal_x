@@ -72,6 +72,9 @@ class TxPersistentMarketWorker {
 
   Future<TxMarketProposal> tick() => _request('tick', const <dynamic>[]);
 
+  Future<TxMarketProposal> pulse(int second) =>
+      _request('pulse', <dynamic>[second]);
+
   Future<TxMarketProposal> place({
     required String symbol,
     required TxSide side,
@@ -137,6 +140,8 @@ void _runMarketWorker(List<dynamic> launch) {
       }
       if (command == 'tick') {
         working.nextTick();
+      } else if (command == 'pulse') {
+        working.marketPulse(args[0] as int);
       } else if (command == 'place') {
         final order = working.placePlayer(
           symbol: args[0] as String,

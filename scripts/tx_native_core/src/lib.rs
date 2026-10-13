@@ -352,10 +352,13 @@ impl Engine {
         let mut expected_cash: BTreeMap<u64, i128> = BTreeMap::new();
         let mut expected_shares: BTreeMap<(u64, u32), i128> = BTreeMap::new();
         let mut resting_count = 0usize;
-        let mut sequences = BTreeSet::new();
+        // Order IDs are arbitrary, but order sequence is append-only and
+        // starts at 1 even for rejected orders. Checking index+1 verifies
+        // uniqueness AND continuity without a historical BTreeSet allocation.
+        if self.next_sequence != self.orders.len() as u64 { return false; }
         for (i, order) in self.orders.iter().enumerate() {
             if self.order_index.get(&order.id) != Some(&i) ||
-                !sequences.insert(order.sequence) || order.sequence == 0 ||
+                order.sequence != (i as u64) + 1 ||
                 order.remaining < 0 || order.remaining > order.quantity ||
                 !self.accounts.contains_key(&order.owner) { return false; }
             match order.status {
@@ -722,6 +725,36 @@ mod tests {
             assert_eq!(rebuilt.replay_event(event), 0);
         }
         assert_eq!(rebuilt.replay_event(&corrupted), -5);
+    }
+
+    #[test]
+    fn r43_append_only_sequence_audit_rejects_reorder_and_gaps() {
+        let mut e = funded();
+        // IOC-without-liquidity creates historical cancelled orders, not
+        // hidden fills or reservations. All remain auditable after growth.
+        for id in 1..=512_u64 {
+            assert_eq!(e.place(id, 1, 0, 0, 1, 1, 0), CANCELLED);
+        }
+        assert_eq!(e.orders.len(), 512);
+        assert_eq!(e.next_sequence, 512);
+        assert!(e.verify());
+        assert!(e.resting.values().all(|book| book.is_empty()));
+        // ID maps and balances can remain intact even if chronology is
+        // corrupt; rejecting this state must NOT depend on an unordered Set.
+        e.orders[101].sequence = 101;
+        assert!(!e.verify());
+        e.orders[101].sequence = 102;
+        assert!(e.verify());
+        // A simple uniqueness Set would accept this out-of-order swap; the
+        // contiguous chronological audit must reject it, too.
+        e.orders[101].sequence = 103;
+        e.orders[102].sequence = 102;
+        assert!(!e.verify());
+        e.orders[101].sequence = 102;
+        e.orders[102].sequence = 103;
+        assert!(e.verify());
+        e.next_sequence += 1;
+        assert!(!e.verify());
     }
 
     #[test]

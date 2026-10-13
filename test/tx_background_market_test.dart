@@ -10,6 +10,87 @@ import '../lib/storage/tx_sqlite_store.dart';
 import '../lib/storage/tx_trading_service.dart';
 
 void main() {
+  test('R44 intraminute NPC execution is deterministic, funded and replayable', () {
+    final first = TxSession.freshWithAgents();
+    final copy = TxSession.importJson(first.exportJson());
+    final opening = first.engine.fillCount;
+    for (final second in [15, 30, 45]) {
+      first.marketPulse(second);
+      copy.marketPulse(second);
+      expect(first.exportJson(), copy.exportJson());
+      expect(first.marketTimeStep, 1);
+      expect(first.lastPulseSecond, second);
+      first.engine.checkInvariants();
+    }
+    expect(first.engine.fillCount, greaterThan(opening));
+    final saved = first.exportJson();
+    first.marketPulse(30); // idempotent even after reopening at 0 seconds
+    expect(first.exportJson(), saved);
+    final reopened = TxSession.importJson(saved);
+    expect(reopened.marketTimeStep, 1);
+    expect(reopened.lastPulseSecond, 45);
+    expect(() => reopened.marketPulse(3), throwsArgumentError);
+    final corrupt = saved.replaceFirst('"lastPulseSecond":45',
+        '"lastPulseSecond":99');
+    expect(() => TxSession.importJson(corrupt), throwsFormatException);
+    first.nextTick();
+    reopened.nextTick();
+    expect(first.exportJson(), reopened.exportJson());
+    expect(first.marketTimeStep, 1);
+    expect(first.lastPulseSecond, 0);
+    expect(first.currentMinuteFills, isNotEmpty);
+    first.engine.checkInvariants();
+  });
+
+  test('R44 pulse-to-minute candle keeps intraminute real fill volume', () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    final trading = TxTradingService(db,
+        initialSessionFactory: TxSession.freshWithAgents,
+        persistentMarketWorker: true);
+    try {
+      final initial = await trading.open();
+      final candles = TxLiveCandles.fromVerifiedHistory(await db.readHistory());
+      await db.seedCandleIndex(initial, candles);
+      var total = 0;
+      for (final second in [15, 30, 45]) {
+        final before = trading.current;
+        final committed = await trading.marketPulse(second);
+        expect(committed.revision, before.revision + 1);
+        expect(committed.session.marketTimeStep, 1);
+        candles.addCommit(before, committed);
+        final realDelta = committed.session.engine.fillCount -
+            before.session.engine.fillCount;
+        expect(realDelta, greaterThanOrEqualTo(0));
+        total += realDelta;
+        final disk = (await db.readCurrent())!;
+        expect(disk.session.exportJson(), committed.session.exportJson());
+      }
+      final pulseVolume = candles.forSymbol('SIM-A01').last.volumeShares;
+      expect(pulseVolume, greaterThan(0));
+      final previous = trading.current;
+      final ended = await trading.nextTick();
+      candles.addCommit(previous, ended);
+      expect(ended.session.marketTimeStep, 1);
+      expect(candles.forSymbol('SIM-A01').last.step, 1);
+      expect(candles.forSymbol('SIM-A01').last.volumeShares,
+          greaterThanOrEqualTo(pulseVolume));
+      expect(total, greaterThan(0));
+      final reread = TxLiveCandles.fromVerifiedHistory(await db.readHistory());
+      for (final symbol in TxSession.symbols) {
+        final live = candles.forSymbol(symbol).last;
+        final rebuilt = reread.forSymbol(symbol).last;
+        expect(live.step, rebuilt.step);
+        expect(live.openCents, rebuilt.openCents);
+        expect(live.highCents, rebuilt.highCents);
+        expect(live.lowCents, rebuilt.lowCents);
+        expect(live.closeCents, rebuilt.closeCents);
+        expect(live.volumeShares, rebuilt.volumeShares);
+      }
+    } finally {
+      await trading.close();
+    }
+  });
+
   test('different market regimes appear during one 60-minute session', () {
     expect(TxSession.marketRegime(1, 0), 0);
     expect(TxSession.marketRegime(20, 0), 0);

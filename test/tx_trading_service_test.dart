@@ -102,6 +102,22 @@ void main() {
         .account(TxSession.playerId).cashCents, startingCash);
   });
 
+  test('R41 stage timings publish only after durable minute and never mutate save',
+      () async {
+    await service.open();
+    expect(service.lastTickTimings, isNull);
+    final before = service.current;
+    await service.nextTick();
+    final stages = service.lastTickTimings;
+    expect(stages, isNotNull);
+    expect(stages!.market.isNegative, isFalse);
+    expect(stages.sqlite.isNegative, isFalse);
+    expect(stages.acknowledgement.isNegative, isFalse);
+    expect(service.current.revision, before.revision + 1);
+    expect((await db.readCurrent())!.session.exportJson(),
+        service.current.session.exportJson());
+  });
+
   test('ticks persist and new service instance reads same account', () async {
     await service.open();
     await service.nextTick();

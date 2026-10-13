@@ -9,6 +9,27 @@ import '../lib/engine/tx_session.dart';
 import '../lib/storage/tx_sqlite_store.dart';
 
 void main() {
+  test('R44 market cadence is persisted independently of cash and revisions',
+      () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    try {
+      final first = await db.initializeFresh(TxSession.fresh());
+      expect(await db.readMarketPulseSeconds(), 15);
+      await db.setMarketPulseSeconds(37);
+      expect(await db.readMarketPulseSeconds(), 37);
+      expect((await db.readCurrent())!.revision, first.revision);
+      expect((await db.readCurrent())!.session.exportJson(),
+          first.session.exportJson());
+      await expectLater(db.setMarketPulseSeconds(4), throwsArgumentError);
+      await db.customStatement(
+          "UPDATE storage_metadata SET value='INVALID' "
+          "WHERE key='market_pulse_seconds_v1'");
+      await expectLater(db.readMarketPulseSeconds(), throwsStateError);
+    } finally {
+      await db.close();
+    }
+  });
+
   late TxSqliteStore store;
 
   setUp(() => store = TxSqliteStore(NativeDatabase.memory()));

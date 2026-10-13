@@ -13,6 +13,11 @@ TxSession _advanceMinute(TxSession session) {
   return session;
 }
 
+TxSession _advancePulse(TxSession session, int second) {
+  session.marketPulse(second);
+  return session;
+}
+
 class _TradeProposal {
   const _TradeProposal(this.session, this.orderId);
   final TxSession session;
@@ -53,6 +58,20 @@ Future<TxSession> _tickDetached(TxSession source) {
   return Isolate.run(() => _advanceMinute(source));
 }
 
+Future<TxSession> _pulseDetached(TxSession source, int second) {
+  return Isolate.run(() => _advancePulse(source, second));
+}
+
+/// Actual stage durations, published only after a successfully acknowledged
+/// SQLite minute. Never considered an achieved multiplier or FPS claim.
+class TxTickTimings {
+  const TxTickTimings({required this.market, required this.sqlite,
+      required this.acknowledgement});
+  final Duration market;
+  final Duration sqlite;
+  final Duration acknowledgement;
+}
+
 class TxTradingService {
   TxTradingService(this.database, {TxSession Function()? initialSessionFactory,
       this.persistentMarketWorker = false,
@@ -70,6 +89,11 @@ class TxTradingService {
   TxStoredSession? _current;
   bool _busy = false;
   bool _storageFault = false;
+  TxTickTimings? _lastTickTimings;
+
+  /// Null until the first complete, durably committed and acknowledged tick.
+  /// On failure the previous sample is cleared rather than reported as new.
+  TxTickTimings? get lastTickTimings => _lastTickTimings;
 
   TxStoredSession get current {
     if (_current == null) throw StateError('SQLite session not initialized');
@@ -163,15 +187,53 @@ class TxTradingService {
     return TxMinuteEventTape.fromCommits(before, after);
   }
 
+  /// Real Rust market pulse in the ongoing game minute. As with nextTick,
+  /// nothing becomes visible until SQLite has committed and acknowledged it.
+  Future<TxStoredSession> marketPulse(int second) async {
+    _ensureReady();
+    if (second < 5 || second >= 60) {
+      throw ArgumentError.value(second, 'second');
+    }
+    if (second <= current.session.lastPulseSecond) return current;
+    _busy = true;
+    try {
+      final candidate = _worker != null
+          ? (await _worker!.pulse(second)).session
+          : await _pulseDetached(current.session, second);
+      await _commit(candidate);
+      await _ackWorkerCommit();
+      return current;
+    } catch (_) {
+      if (_worker != null) {
+        _worker!.close();
+        _worker = null;
+      }
+      _storageFault = true;
+      rethrow;
+    } finally {
+      _busy = false;
+    }
+  }
+
   Future<TxStoredSession> nextTick() async {
     _ensureReady();
     _busy = true;
+    _lastTickTimings = null;
+    final clock = Stopwatch()..start();
     try {
       final candidate = _worker != null
           ? (await _worker!.tick()).session
           : await _tickDetached(current.session);
+      final marketMicros = clock.elapsedMicroseconds;
       await _commit(candidate);
+      final sqliteMicros = clock.elapsedMicroseconds - marketMicros;
       await _ackWorkerCommit();
+      final ackMicros = clock.elapsedMicroseconds - marketMicros - sqliteMicros;
+      _lastTickTimings = TxTickTimings(
+        market: Duration(microseconds: marketMicros),
+        sqlite: Duration(microseconds: sqliteMicros),
+        acknowledgement: Duration(microseconds: ackMicros),
+      );
       return current;
     } catch (_) {
       if (_worker != null) {

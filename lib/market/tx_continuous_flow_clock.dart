@@ -1,9 +1,9 @@
 /// Frame-driven game clock used only for *provisional* intraminute display.
 ///
-/// The engine and ledger still change only when the caller durably commits
-/// one complete game minute. A frame may request at most ONE such commit.
-/// A slow storage write therefore reduces achieved speed instead of skipping
-/// minutes, fabricating fills, or accumulating an unbounded transaction queue.
+/// A real NPC pulse or complete minute becomes authoritative only AFTER its
+/// own SQLite revision commits. At most one request may be in flight.
+/// Slow storage lowers achieved speed; the clock never skips ledger minutes,
+/// fabricates fills, or creates an unbounded transaction queue.
 ///
 /// This model is independent of Flutter/SQLite, so pause and timing semantics
 /// can be unit-tested without a device timer. Feed monotonic elapsed durations,
@@ -13,18 +13,22 @@ class TxFlowFrame {
     required this.second,
     required this.fractionOfMinute,
     required this.needsMinuteCommit,
+    required this.needsPulseCommit,
     required this.isWaitingForStorage,
   });
 
   final int second;
   final double fractionOfMinute;
   final bool needsMinuteCommit;
+  /// A verified Rust market pulse, not a completed game-minute boundary.
+  final bool needsPulseCommit;
   final bool isWaitingForStorage;
 }
 
 class TxContinuousFlowClock {
-  TxContinuousFlowClock({int speed = 1}) {
+  TxContinuousFlowClock({int speed = 1, int pulseSeconds = 60}) {
     setSpeed(speed);
+    setPulseSeconds(pulseSeconds);
   }
 
   static const int gameMicrosPerMinute = 60000000;
@@ -33,13 +37,27 @@ class TxContinuousFlowClock {
   // ACTUAL achieved speed. Fast targets never skip economic minutes.
   static const List<int> uiSpeeds = [1, 2, 5, 10, 15, 30, 60, 100, 120, 300, 600, 1200, 3600];
   int _speed = 1;
+  int _pulseSeconds = 60;
   int _fractionalGameMicros = 0;
   bool _running = false;
   bool _awaitingCommit = false;
   bool _faulted = false;
 
   int get speed => _speed;
+  int get pulseSeconds => _pulseSeconds;
   int get second => _fractionalGameMicros ~/ 1000000;
+
+  /// 60 disables intraminute execution. The new cadence is applied only
+  /// between completed SQLite revisions; nothing is committed on a timer.
+  void setPulseSeconds(int seconds) {
+    if (seconds < 5 || seconds > 60) {
+      throw ArgumentError.value(seconds, 'pulseSeconds');
+    }
+    if (_awaitingCommit || _faulted) {
+      throw StateError('Cannot change pulse cadence during an unresolved commit');
+    }
+    _pulseSeconds = seconds;
+  }
   double get minuteProgress =>
       _fractionalGameMicros / gameMicrosPerMinute;
   bool get running => _running;
@@ -92,12 +110,19 @@ class TxContinuousFlowClock {
     if (!_running || _awaitingCommit || _faulted) return _frame(false);
     final gameMicros = elapsed.inMicroseconds * _speed;
     if (gameMicros <= 0) return _frame(false);
-    if (gameMicros >= gameMicrosPerMinute - _fractionalGameMicros) {
-      // Hold the provisional candle at 59.999999 seconds while the account,
-      // fills, and completed minute are being verified and committed.
-      _fractionalGameMicros = gameMicrosPerMinute - 1;
+    final pulseMicros = _pulseSeconds * 1000000;
+    final nextPulse = ((_fractionalGameMicros ~/ pulseMicros) + 1) * pulseMicros;
+    final boundary = nextPulse < gameMicrosPerMinute
+        ? nextPulse : gameMicrosPerMinute;
+    if (gameMicros >= boundary - _fractionalGameMicros) {
       _awaitingCommit = true;
-      return _frame(true);
+      if (boundary == gameMicrosPerMinute) {
+        // No economic time advances past the unverified final revision.
+        _fractionalGameMicros = gameMicrosPerMinute - 1;
+        return _frame(true);
+      }
+      _fractionalGameMicros = boundary;
+      return _frame(false, pulse: true);
     }
     _fractionalGameMicros += gameMicros;
     return _frame(false);
@@ -114,6 +139,17 @@ class TxContinuousFlowClock {
     _awaitingCommit = false;
   }
 
+  /// A real intraminute Rust order-book revision has been durably committed.
+  /// Unlike a finished minute, preserve the clock position for the next pulse.
+  void completePulseCommit() {
+    if (!_awaitingCommit || _faulted ||
+        _fractionalGameMicros <= 0 ||
+        _fractionalGameMicros >= gameMicrosPerMinute - 1) {
+      throw StateError('No pending intraminute market pulse');
+    }
+    _awaitingCommit = false;
+  }
+
   /// Treat ambiguous outcomes as fatal, even when the caller thinks the DB
   /// might have rolled back. Never issue another order until reload/audit.
   void storageFailed() {
@@ -122,10 +158,11 @@ class TxContinuousFlowClock {
     _awaitingCommit = false;
   }
 
-  TxFlowFrame _frame(bool newCommit) => TxFlowFrame(
+  TxFlowFrame _frame(bool newCommit, {bool pulse = false}) => TxFlowFrame(
     second: second,
     fractionOfMinute: minuteProgress,
     needsMinuteCommit: newCommit,
+    needsPulseCommit: pulse,
     isWaitingForStorage: _awaitingCommit,
   );
 }

@@ -51,7 +51,8 @@ class TxCandleHistory {
         throw StateError('Snapshot revisions are not strictly increasing');
       }
       final session = stored.session;
-      if (session.step < lastStep) {
+      final marketStep = session.marketTimeStep;
+      if (marketStep < lastStep) {
         throw StateError('Simulation clock went backwards');
       }
       final price = session.lastPrice(symbol);
@@ -72,12 +73,12 @@ class TxCandleHistory {
           high = math.max(high, fill.priceCents);
         }
       }
-      if (result.isEmpty || session.step != result.last.step) {
+      if (result.isEmpty || marketStep != result.last.step) {
         // A new minute opens at the last observable mark. The first snapshot
         // in a shortened history has no known earlier opening mark.
         final open = result.isEmpty ? price : result.last.closeCents;
         result.add(TxCandle(
-          step: session.step,
+          step: marketStep,
           openCents: open,
           highCents: math.max(high, open),
           lowCents: math.min(low, open),
@@ -96,7 +97,7 @@ class TxCandleHistory {
         ));
       }
       lastRevision = stored.revision;
-      lastStep = session.step;
+      lastStep = marketStep;
       lastFillCount = fillCount;
       first = false;
     }

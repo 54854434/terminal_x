@@ -10,8 +10,10 @@ import '../market/tx_frame_preview.dart';
 class TxCandleChart extends StatefulWidget {
   const TxCandleChart({super.key, required this.candles,
       this.indicativePriceCents, this.indicativeFramePriceCents,
-      this.previewSeconds});
+      this.previewSeconds, this.activeMinuteStep});
   final List<TxCandle> candles;
+  /// A SQLite-verified intraminute candle is already present in [candles].
+  final int? activeMinuteStep;
   final int? indicativePriceCents;
   final double? indicativeFramePriceCents;
   final double? previewSeconds;
@@ -39,6 +41,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
   void _refreshCache() {
     final source = widget.candles;
     if (source.isEmpty) return;
+    final currentStep = widget.activeMinuteStep == source.last.step
+        ? source.last.step : source.last.step + 1;
     // The live view is a stable List object mutated on committed revisions.
     // Recompute only for a new revision or a requested interval.
     if (_maLength != source.length ||
@@ -60,7 +64,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
         widget.indicativePriceCents?.toDouble();
     if (price != null && widget.previewSeconds != null) {
       _timelineTrace.observe(
-        nextMinuteStep: source.last.step + 1,
+        nextMinuteStep: currentStep,
         seconds: widget.previewSeconds!,
         committedCloseCents: source.last.closeCents.toDouble(),
         framePriceCents: price);
@@ -70,7 +74,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
     // Never pass that sentinel into the positive-period wick accumulator.
     if (_period != TxChartPeriod.timeline) {
       _indicativeWick.observe(
-        nextMinuteStep: source.last.step + 1,
+        nextMinuteStep: currentStep,
         periodMinutes: _period.minutes,
         committedCloseCents: source.last.closeCents.toDouble(),
         framePriceCents: price,
@@ -116,7 +120,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
     final projection = preview == null || _period == TxChartPeriod.timeline
         ? null : TxFrameCandleProjection.fromLastCommitted(
             lastAggregated: all.last,
-            nextMinuteStep: widget.candles.last.step + 1,
+            nextMinuteStep: widget.activeMinuteStep == widget.candles.last.step
+                ? widget.activeMinuteStep! : widget.candles.last.step + 1,
             periodMinutes: _period.minutes,
             framePriceCents: preview,
             previewHighCents: _indicativeWick.highCents!,
@@ -161,9 +166,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 (v) => setState(() => _showMA = v)),
         const SizedBox(width: 6),
         if (preview != null && _period != TxChartPeriod.timeline)
-          Expanded(child: Text(_period.minutes == 1
-              ? '青色空心K/虚线：指示价（非成交）'
-              : '青色空心K/虚线：指示价（非成交）',
+          const Expanded(child: Text('绿涨红跌半透明K：指示价（非成交）',
             maxLines: 1, overflow: TextOverflow.ellipsis,
             style: TextStyle(fontSize: 10, color: Colors.white54))),
       ]),
@@ -202,8 +205,12 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 indicativeLowCents: projection?.lowCents,
                 indicativeOpenCents: projection?.openCents,
                 overlayLastCommitted: projection?.overlaysLastCommitted ?? false,
-                // One provisional candle per selected bucket, including 1m.
-                // Its cyan OHLC is never written into committed volume/fills.
+                preferCommittedBody: widget.activeMinuteStep != null,
+                // Retain a dotted visual tail for the previous bucket,
+                // including 1h/4h/day rollovers; never change real OHLC.
+                previousIndicativeStep: _indicativeWick.previousGroupStep,
+                previousIndicativeHighCents: _indicativeWick.previousHighCents,
+                previousIndicativeLowCents: _indicativeWick.previousLowCents,
                 showIndicativeWick: true)),
         )),
       )),
@@ -225,7 +232,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
           }))),
         Text('$_window', style: const TextStyle(fontSize: 12)),
       ]),
-      const Text('点击图表看 OHLCV · 无影线可能正常 · 不伪造成交量',
+      const Text('实心 K：已提交；半透明 K／青色短虚线影线：仅指示价，不进成交与存档',
           style: TextStyle(color: Colors.white54, fontSize: 10)),
     ]);
   }
@@ -235,13 +242,19 @@ class _CandlePainter extends CustomPainter {
   _CandlePainter(this.candles, {this.ma5, this.ma10, this.ma20,
     this.indicativePriceCents, this.indicativeHighCents,
     this.indicativeLowCents, this.indicativeOpenCents,
-    this.overlayLastCommitted = false, this.showIndicativeWick = true});
+    this.overlayLastCommitted = false, this.showIndicativeWick = true,
+    this.preferCommittedBody = false, this.previousIndicativeStep, this.previousIndicativeHighCents,
+    this.previousIndicativeLowCents});
   final List<TxCandle> candles;
   final List<double?>? ma5, ma10, ma20;
   final double? indicativePriceCents, indicativeHighCents,
       indicativeLowCents, indicativeOpenCents;
   final bool overlayLastCommitted;
   final bool showIndicativeWick;
+  /// Verified Rust intraminute trades keep the actual OHLC body opaque.
+  final bool preferCommittedBody;
+  final int? previousIndicativeStep;
+  final double? previousIndicativeHighCents, previousIndicativeLowCents;
   static const rise = Color(0xFF32D0A1), fall = Color(0xFFFF647C);
   static const grid = Color(0xFF293448),
       shortMA = Color(0xFFF5C54D), mediumMA = Color(0xFF7E9DFF),
@@ -272,6 +285,13 @@ class _CandlePainter extends CustomPainter {
       low = math.min(low, showIndicativeWick
           ? indicativeLowCents!.toDouble() : indicativePriceCents!);
     }
+    if (candles.any((c) => c.step == previousIndicativeStep) &&
+        previousIndicativeHighCents != null &&
+        previousIndicativeLowCents != null) {
+      // The ghost wick is separately labelled, never treated as an OHLC.
+      high = math.max(high, previousIndicativeHighCents!);
+      low = math.min(low, previousIndicativeLowCents!);
+    }
     for (final series in [ma5, ma10, ma20]) {
       if (series == null) continue;
       for (final v in series) {
@@ -298,8 +318,8 @@ class _CandlePainter extends CustomPainter {
       // The *one* aggregated active candle is painted in cyan below. Do
       // not draw the last committed body underneath it as a fake 1m ghost.
       final hiddenForAggregatePreview = overlayLastCommitted &&
-          showIndicativeWick && indicativePriceCents != null &&
-          i == candles.length - 1;
+          !preferCommittedBody && showIndicativeWick &&
+          indicativePriceCents != null && i == candles.length - 1;
       if (!hiddenForAggregatePreview) canvas.drawLine(Offset(x,y(c.highCents.toDouble())),
           Offset(x,y(c.lowCents.toDouble())),paint);
       final top=y(math.max(c.openCents,c.closeCents).toDouble());
@@ -312,21 +332,41 @@ class _CandlePainter extends CustomPainter {
             body,vh),Paint()..color=color.withAlpha(125));
       }
     }
+    // The previous bucket's UNCOMMITTED extrema are only a dotted optical
+    // memory on its verified bar. Never change real bar OHLCV.
+    if (candles.any((c) => c.step == previousIndicativeStep) &&
+        previousIndicativeHighCents != null &&
+        previousIndicativeLowCents != null) {
+      final prior = candles.indexWhere(
+          (c) => c.step == previousIndicativeStep);
+      final last = candles[prior];
+      final x = bar * (prior + .5);
+      final ghost = Paint()..color = const Color(0xFF54CEE5).withAlpha(160)
+          ..strokeWidth = 1.3;
+      void dotted(double startY, double endY) {
+        for (var yy = startY; yy < endY; yy += 7.0) {
+          canvas.drawLine(Offset(x, yy),
+              Offset(x, math.min(yy + 4.0, endY)), ghost);
+        }
+      }
+      dotted(y(previousIndicativeHighCents!), y(last.highCents.toDouble()));
+      dotted(y(last.lowCents.toDouble()), y(previousIndicativeLowCents!));
+    }
     if (indicativePriceCents!=null) {
       final x=bar*(candles.length-(overlayLastCommitted ? .5 : -.5));
       final open=indicativeOpenCents ?? candles.last.closeCents.toDouble();
       final mark=indicativePriceCents!;
       final top=y(math.max(open,mark));
       final bottom=y(math.min(open,mark));
-      final p=Paint()..color=const Color(0xFF54CEE5)
-          ..style=PaintingStyle.stroke..strokeWidth=1.6;
-      if (showIndicativeWick) {
-        // Draw the wick OUTSIDE the candle body. Drawing it straight through
-        // the hollow body was producing an apparent second overlapping bar.
+      final color = mark >= open ? rise : fall;
+      final p=Paint()..color=color.withAlpha(175)..strokeWidth=1.6;
+      if (showIndicativeWick &&
+          !(overlayLastCommitted && preferCommittedBody)) {
         final hi = y(indicativeHighCents!);
         final lo = y(indicativeLowCents!);
         if (hi < top) canvas.drawLine(Offset(x, hi), Offset(x, top), p);
         if (lo > bottom) canvas.drawLine(Offset(x, bottom), Offset(x, lo), p);
+        // Filled for visual consistency, translucent for provisional status.
         canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
             math.max(2.0,bottom-top)),p);
       } else {
@@ -367,7 +407,11 @@ class _CandlePainter extends CustomPainter {
       indicativeLowCents!=other.indicativeLowCents ||
       indicativeOpenCents!=other.indicativeOpenCents ||
       overlayLastCommitted!=other.overlayLastCommitted ||
+      preferCommittedBody!=other.preferCommittedBody ||
       showIndicativeWick!=other.showIndicativeWick ||
+      previousIndicativeStep!=other.previousIndicativeStep ||
+      previousIndicativeHighCents!=other.previousIndicativeHighCents ||
+      previousIndicativeLowCents!=other.previousIndicativeLowCents ||
       candles.length!=other.candles.length ||
       (ma5==null)!=(other.ma5==null) ||
       (candles.isNotEmpty && (candles.first.step!=other.candles.first.step ||

@@ -2,6 +2,51 @@ import 'package:flutter_test/flutter_test.dart';
 import '../lib/market/tx_continuous_flow_clock.dart';
 
 void main() {
+  test('R44 selectable verified intraminute pulse cadence and minute boundary', () {
+    final clock = TxContinuousFlowClock(speed: 1, pulseSeconds: 15)..resume();
+    for (final at in [15, 30, 45]) {
+      final frame = clock.advance(const Duration(seconds: 15));
+      expect(frame.needsPulseCommit, isTrue);
+      expect(frame.needsMinuteCommit, isFalse);
+      expect(frame.second, at);
+      expect(clock.advance(const Duration(seconds: 30)).needsPulseCommit,
+          isFalse);
+      expect(() => clock.setPulseSeconds(10), throwsStateError);
+      clock.completePulseCommit();
+      expect(clock.second, at);
+    }
+    final closed = clock.advance(const Duration(seconds: 15));
+    expect(closed.needsMinuteCommit, isTrue);
+    expect(closed.needsPulseCommit, isFalse);
+    clock.completeMinuteCommit();
+    expect(clock.second, 0);
+    clock.setPulseSeconds(60);
+    expect(clock.advance(const Duration(seconds: 30)).needsPulseCommit,
+        isFalse);
+    expect(() => clock.setPulseSeconds(4), throwsArgumentError);
+    clock.setPulseSeconds(7);
+    expect(clock.advance(const Duration(seconds: 7)).needsPulseCommit, isTrue);
+    clock.completePulseCommit();
+    expect(clock.second, 35);
+  });
+
+  test('R44 pulse pause, recovery and storage failure stay fail closed', () {
+    final clock = TxContinuousFlowClock(speed: 10, pulseSeconds: 5)..resume();
+    expect(clock.advance(const Duration(milliseconds: 500)).needsPulseCommit,
+        isTrue);
+    clock.pause();
+    expect(() => clock.resume(), throwsStateError);
+    clock.completePulseCommit();
+    expect(clock.running, isFalse);
+    expect(clock.second, 5);
+    clock.resume();
+    expect(clock.advance(const Duration(milliseconds: 500)).needsPulseCommit,
+        isTrue);
+    clock.storageFailed();
+    expect(() => clock.resume(), throwsStateError);
+    expect(() => clock.completePulseCommit(), throwsStateError);
+  });
+
   test('100x renders 1.67 minutes per real second, not 100 candles', () {
     final clock = TxContinuousFlowClock(speed: 100)..resume();
     var commits = 0;

@@ -1,7 +1,8 @@
 /// Funded, deterministic background counterparties. All prints and volume
 /// originate from TxEngine orders and ordinary price-time matching.
 /// This batch adds inventory-aware liquidity and finite risk budgets; economic
-/// events are STILL committed per game minute, not once per second.
+/// Pulse events can now be committed within a minute at a chosen cadence;
+/// they are actual Rust-backed orders, never rendered fake depth.
 import '../engine/tx_engine.dart';
 
 class TxNpcMarket {
@@ -31,10 +32,11 @@ class TxNpcMarket {
   /// Revise only resting NPC quotes. PLAYER orders remain on the FIFO book.
   static void cancelResting(TxEngine engine) {
     if (!isEnabled(engine)) return;
-    final pending = engine.orders.values.where((o) =>
-        isNpc(o.ownerId) && o.kind == TxKind.limit &&
-        (o.status == TxStatus.open || o.status == TxStatus.partiallyFilled))
-        .toList();
+    // The active-only index avoids scanning years of archived NPC orders.
+    // Preserve the original global sequence order for deterministic ledgers.
+    final pending = engine.activeOrders.where((o) =>
+        isNpc(o.ownerId) && o.kind == TxKind.limit).toList()
+      ..sort((a, b) => a.sequence.compareTo(b.sequence));
     for (final order in pending) {
       engine.cancel(order.id, ownerId: order.ownerId);
     }

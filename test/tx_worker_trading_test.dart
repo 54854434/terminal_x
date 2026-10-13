@@ -9,6 +9,31 @@ import '../lib/storage/tx_sqlite_store.dart';
 import '../lib/storage/tx_trading_service.dart';
 
 void main() {
+  test('R44 interrupted intraminute SQLite commit fails closed', () async {
+    var inserts = 0;
+    final db = TxSqliteStore(NativeDatabase.memory(),
+        testCheckpoint: (point) {
+      if (point == 'after_session_insert' && ++inserts == 2) {
+        throw StateError('simulated power loss before SQLite commit');
+      }
+    });
+    final trading = TxTradingService(db,
+        initialSessionFactory: TxSession.freshWithAgents,
+        persistentMarketWorker: true);
+    try {
+      final first = await trading.open();
+      await expectLater(trading.marketPulse(15), throwsStateError);
+      expect(trading.blocked, isTrue);
+      expect(trading.current.revision, first.revision);
+      final onDisk = (await db.readCurrent())!;
+      expect(onDisk.revision, first.revision);
+      expect(onDisk.session.engine.fillCount, first.session.engine.fillCount);
+      await expectLater(trading.marketPulse(30), throwsStateError);
+    } finally {
+      await trading.close();
+    }
+  });
+
   test('worker place/cancel preserves old revision and commits once', () async {
     final db = TxSqliteStore(NativeDatabase.memory());
     try {

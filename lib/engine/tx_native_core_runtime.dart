@@ -27,7 +27,11 @@ String _runNativeSelfTest() {
         rust.fillQuantity(0) != 2 || rust.cashCents(1001) != 98000 ||
         rust.cashCents(1002) != 2000 || rust.shares(1001, 0) != 2 ||
         rust.shares(1002, 0) != 8 || rust.reservedShares(1002, 0) != 1 ||
-        !rust.isAudited) {
+        rust.activeOrderCount != 1 ||
+        rust.orderStatus(201) != TxNativeCoreFfi.partial ||
+        rust.remaining(201) != 1 ||
+        rust.orderStatus(202) != TxNativeCoreFfi.filled ||
+        rust.remaining(202) != 0 || !rust.isAudited) {
       throw StateError('native account/ledger audit failed');
     }
     final rebuilt = rust.rebuildFromEvents();

@@ -5,6 +5,34 @@ import '../lib/engine/tx_session.dart';
 import '../lib/engine/tx_backup_import.dart';
 
 void main() {
+  test('R41 live price cache advances with fills and resets at minute boundary', () {
+    final session = TxSession.fresh();
+    const symbolA = 'SIM-A01';
+    const symbolB = 'SIM-A02';
+    expect(session.lastPrice(symbolA), 1000);
+    expect(session.lastPrice(symbolB), 2500);
+    // A second read at the same revision is observationally identical.
+    expect(session.lastPrice(symbolA), 1000);
+    final buy = session.placePlayer(symbol: symbolA, side: TxSide.buy,
+        kind: TxKind.market, quantity: 1);
+    expect(buy.status, TxStatus.filled);
+    expect(session.lastPrice(symbolA), 1001);
+    expect(session.lastPrice(symbolB), 2500);
+    session.placePlayer(symbol: symbolB, side: TxSide.buy,
+        kind: TxKind.market, quantity: 1);
+    expect(session.lastPrice(symbolB), 2501);
+    expect(session.lastPrice(symbolA), 1001);
+    final saved = session.exportJson();
+    final restored = TxSession.importJson(saved);
+    expect(restored.exportJson(), saved);
+    expect(restored.lastPrice(symbolA), session.lastPrice(symbolA));
+    expect(restored.lastPrice(symbolB), session.lastPrice(symbolB));
+    session.nextTick();
+    // Any old-minute fills are no longer considered for the current quote.
+    expect(session.lastPrice(symbolA), session.referenceCents[0]);
+    expect(session.lastPrice(symbolB), session.referenceCents[1]);
+  });
+
   test('new session: price-time book, 100-share buy and 50-share sell', () {
     final s = TxSession.fresh();
     final cash = s.engine.account(TxSession.playerId).cashCents;

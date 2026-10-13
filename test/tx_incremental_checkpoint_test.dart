@@ -35,6 +35,22 @@ String fixture(int size, {int count = 0, int quantity = 0}) {
 }
 
 void main() {
+  test('R44 old Rust journal header triggers first full checkpoint', () {
+    final newSession = TxSession.importJson(TxSession.fresh().exportJson());
+    final canonical = newSession.exportJson();
+    final previous = canonical.replaceFirst('"lastPulseSecond":0,', '');
+    expect(previous, isNot(canonical));
+    final encoded = TxDeltaCodec.encode(
+        canonical: canonical, revision: 2, previousRevision: 1,
+        previousCanonical: previous,
+        previousHash: TxDeltaCodec.checksum(previous),
+        trackedSessionHeader: newSession.snapshotHeader(),
+        trackedEngineHeader: newSession.engine.snapshotHeader(),
+        trackedLists: newSession.engine.snapshotDeltaLists());
+    expect(encoded.checkpoint, isTrue);
+    expect(TxDeltaCodec.decodeFull(encoded.stored), canonical);
+  });
+
   test('incremental codec replay exactly reconstructs canonical candidate', () {
     final before = fixture(120);
     final after = fixture(120, count: 2, quantity: 99);
@@ -46,6 +62,100 @@ void main() {
     expect(result.stored.length, lessThan(after.length));
     expect(TxDeltaCodec.replay(previousCanonical: before, previousRevision: 2,
       previousHash: baseHash, stored: result.stored), after);
+  });
+
+  test('R42 journal delta stores appended Rust events, not entire history', () {
+    final session = TxSession.fresh();
+    session.nativeEvents.addAll(List<List<Object?>>.generate(1200, (i) =>
+        <Object?>[3, 'LP-O-$i', i + 1, 1, 0, 0, 0, 10 + i % 17, 1000]));
+    final before = session.exportJson();
+    final afterSession = TxSession.importJson(before);
+    afterSession.nativeEvents.add(<Object?>[4, 1001, 1]);
+    final after = afterSession.exportJson();
+    final hash = TxDeltaCodec.checksum(before);
+    final patch = TxDeltaCodec.encode(
+      canonical: after, revision: 3, previousRevision: 2,
+      previousCanonical: before, previousHash: hash,
+      trackedSessionHeader: afterSession.snapshotHeader(),
+      trackedEngineHeader: afterSession.engine.snapshotHeader(),
+      trackedLists: afterSession.engine.snapshotDeltaLists(),
+      trackedNativeJournal: afterSession.snapshotNativeJournalDelta(),
+    );
+    expect(patch.checkpoint, isFalse);
+    expect(patch.stored.startsWith('TXD1:'), isTrue);
+    expect(patch.stored.length * 8, lessThan(after.length));
+    expect(TxDeltaCodec.replay(previousCanonical: before,
+      previousRevision: 2, previousHash: hash, stored: patch.stored), after);
+
+    final raw = jsonDecode(utf8.decode(ZLibCodec().decode(
+      base64Decode(patch.stored.substring(TxDeltaCodec.deltaPrefix.length)))))
+        as Map<String, dynamic>;
+    expect(raw['version'], 2);
+    expect((raw['session'] as Map).containsKey('nativeEvents'), isFalse);
+    expect((raw['nativeJournal'] as Map)['oldLength'], 1200);
+    expect((raw['nativeJournal'] as Map)['append'], <dynamic>[
+      <dynamic>[4, 1001, 1],
+    ]);
+    (raw['nativeJournal'] as Map)['oldLength'] = 1199;
+    final altered = '${TxDeltaCodec.deltaPrefix}${base64Encode(
+      ZLibCodec(level: 1).encode(utf8.encode(jsonEncode(raw))))}';
+    expect(() => TxDeltaCodec.replay(previousCanonical: before,
+      previousRevision: 2, previousHash: hash, stored: altered),
+      throwsStateError);
+    // Full canonical JSON is unaffected; reopening resets only the cursor.
+    expect(TxSession.importJson(after).exportJson(), after);
+  });
+
+  test('R42 SQLite saves and reopens append-only Rust journal revisions',
+      () async {
+    final store = TxSqliteStore(NativeDatabase.memory());
+    try {
+      final session = TxSession.fresh();
+      session.nativeEvents.addAll(List<List<Object?>>.generate(240, (i) =>
+          <Object?>[3, 'SIM-ORDER-$i', i + 1, 1, 0, 0, 0, 1, 1000]));
+      final initial = await store.initializeFresh(session);
+      final proposed = TxSession.importJson(initial.session.exportJson());
+      proposed.nativeEvents.add(<Object?>[4, 200, 1]);
+      final saved = await store.saveSession(proposed,
+          expectedRevision: initial.revision);
+      expect(saved.revision, 2);
+      final row = await store.customSelect('''
+        SELECT payload_json FROM snapshots WHERE revision = 2
+      ''').getSingle();
+      expect(row.read<String>('payload_json').startsWith('TXD1:'), isTrue);
+      final current = (await store.readCurrent())!;
+      expect(current.session.exportJson(), proposed.exportJson());
+      expect(current.session.nativeEvents.length, 241);
+      final next = TxSession.importJson(current.session.exportJson());
+      next.nativeEvents.add(<Object?>[4, 201, 1]);
+      final later = await store.saveSession(next, expectedRevision: 2);
+      expect(later.revision, 3);
+      expect((await store.readCurrent())!.session.exportJson(),
+          next.exportJson());
+      expect((await store.readHistory(limit: 3)).length, 3);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test('R42 tampered committed journal refuses an incremental save',
+      () async {
+    final store = TxSqliteStore(NativeDatabase.memory());
+    try {
+      final session = TxSession.fresh();
+      session.nativeEvents.addAll(List<List<Object?>>.generate(240, (i) =>
+          <Object?>[3, 'ORDER-$i', i + 1, 1, 0, 0, 0, 1, 1000]));
+      final initial = await store.initializeFresh(session);
+      final forged = TxSession.importJson(initial.session.exportJson());
+      forged.nativeEvents.first[1] = 'CHANGED-OLD-COMMAND';
+      await expectLater(store.saveSession(forged,
+          expectedRevision: initial.revision), throwsStateError);
+      final saved = (await store.readCurrent())!;
+      expect(saved.revision, 1);
+      expect(saved.session.exportJson(), initial.session.exportJson());
+    } finally {
+      await store.close();
+    }
   });
 
   test('delta chain rejects a wrong revision and a wrong base digest', () {

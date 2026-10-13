@@ -66,6 +66,7 @@ class TxDeltaCodec {
     Map<String, dynamic>? trackedSessionHeader,
     Map<String, dynamic>? trackedEngineHeader,
     Map<String, dynamic>? trackedLists,
+    Map<String, dynamic>? trackedNativeJournal,
   }) {
     if (!validCheckpointInterval(checkpointInterval)) {
       throw ArgumentError.value(checkpointInterval, 'checkpointInterval');
@@ -76,7 +77,16 @@ class TxDeltaCodec {
     // User-selected cadence writes full snapshots more/less frequently.
     // A universal 64-revision checkpoint prevents an unbounded replay chain
     // when the user changes cadence in the middle of an existing chain.
+    // R44 adds a schema-1 session-header field. The first write after an
+    // older app's snapshot must be a complete checkpoint; v2 delta replay
+    // intentionally refuses unannounced header key additions. Restrict the
+    // check to the short header prefix, never scan the full historical log.
+    final previousHeader = previousCanonical == null ? '' :
+        previousCanonical.substring(0,
+            previousCanonical.length < 256 ? previousCanonical.length : 256);
+    final newHeaderHasPulse = trackedSessionHeader?.containsKey('lastPulseSecond') == true;
     if (previousCanonical == null || previousHash == null ||
+        (newHeaderHasPulse && !previousHeader.contains('"lastPulseSecond":')) ||
         revision % checkpointInterval == 0 ||
         revision % maxCheckpointInterval == 0) {
       final stored = _compress(fullPrefix, canonical);
@@ -88,13 +98,22 @@ class TxDeltaCodec {
     final tracked = trackedSessionHeader != null &&
         trackedEngineHeader != null && trackedLists != null;
     if (tracked) {
+      // v2 keeps the same TXD1 envelope and schema-1 SQLite table. Only the
+      // Rust event journal switches from full-history replacement to an
+      // append-only patch, avoiding O(history) bytes in each delta snapshot.
+      // Older v1 patches remain readable without migration.
+      final hasNativeDelta = trackedNativeJournal != null &&
+          trackedSessionHeader!.containsKey('nativeEvents');
+      final header = Map<String, dynamic>.from(trackedSessionHeader!);
+      if (hasNativeDelta) header.remove('nativeEvents');
       final patch = jsonEncode(<String, dynamic>{
-        'version': 1,
+        'version': hasNativeDelta ? 2 : 1,
         'baseRevision': previousRevision,
         'baseSha256': previousHash,
-        'session': trackedSessionHeader,
+        'session': header,
         'engine': trackedEngineHeader,
         'lists': trackedLists,
+        if (hasNativeDelta) 'nativeJournal': trackedNativeJournal,
       });
       if (patch.length * 5 >= canonical.length * 4) {
         final stored = _compress(fullPrefix, canonical);
@@ -162,7 +181,8 @@ class TxDeltaCodec {
     if (!isDelta(stored)) throw StateError('Expected TXD1 delta');
     final patch = Map<String, dynamic>.from(
         jsonDecode(_decompress(stored, deltaPrefix)) as Map);
-    if (patch['version'] != 1 ||
+    final format = patch['version'];
+    if ((format != 1 && format != 2) ||
         patch['baseRevision'] != previousRevision ||
         patch['baseSha256'] != previousHash) {
       throw StateError('Broken SQLite revision delta chain');
@@ -175,13 +195,34 @@ class TxDeltaCodec {
     final engineHeader = Map<String, dynamic>.from(patch['engine'] as Map);
     final changes = Map<String, dynamic>.from(patch['lists'] as Map);
     if (sessionHeader.containsKey('engine') ||
+        (format == 2 && (sessionHeader.containsKey('nativeEvents') ||
+            !session.containsKey('nativeEvents'))) ||
         _lists.any((key) => engineHeader.containsKey(key)) ||
         changes.length != _lists.length ||
-        sessionHeader.length != session.length - 1 ||
+        sessionHeader.length != session.length - (format == 2 ? 2 : 1) ||
         engineHeader.length != engine.length - _lists.length ||
         sessionHeader.keys.any((k) => !session.containsKey(k)) ||
         engineHeader.keys.any((k) => !engine.containsKey(k))) {
       throw StateError('Invalid SQLite incremental snapshot schema');
+    }
+    if (format == 2) {
+      if (patch.length != 7 || patch['nativeJournal'] is! Map) {
+        throw StateError('Malformed Rust journal delta');
+      }
+      final native = Map<String, dynamic>.from(patch['nativeJournal'] as Map);
+      final original = List<dynamic>.from(session['nativeEvents'] as List);
+      if (native.length != 2 || native['oldLength'] != original.length ||
+          native['append'] is! List) {
+        throw StateError('Invalid Rust journal delta base');
+      }
+      final appended = native['append'] as List;
+      for (final row in appended) {
+        if (row is! List || row.isEmpty || row.length > 9) {
+          throw StateError('Malformed appended Rust event');
+        }
+      }
+      original.addAll(appended);
+      session['nativeEvents'] = original;
     }
     for (final key in sessionHeader.keys) {
       session[key] = sessionHeader[key];

@@ -730,17 +730,19 @@ class TxEngine {
   void checkInvariants() {
     final expectedCashReserve = <String, int>{};
     final expectedShareReserve = <String, Map<String, int>>{};
-    var maxOrderSeq = 0;
+    // Orders are append-only: every newly submitted (including rejected)
+    // order consumes exactly one sequence. Validate it in insertion order,
+    // without allocating an O(all historical orders) duplicate-detection Set
+    // on every Rust/Dart full ledger audit.
+    var nextExpectedOrderSeq = 1;
     var activeOrderCount = 0;
-    final orderSequences = <int>{};
     for (final o in _orders.values) {
-      if (o.sequence <= 0 || !orderSequences.add(o.sequence) ||
+      if (o.sequence != nextExpectedOrderSeq++ ||
           (o.status != TxStatus.rejected &&
               (o.quantity <= 0 || o.quantity > maxQuantity ||
                o.remaining < 0 || o.remaining > o.quantity))) {
         throw StateError('Invalid order quantity or sequence');
       }
-      maxOrderSeq = math.max(maxOrderSeq, o.sequence);
       final active = o.status == TxStatus.open || o.status == TxStatus.partiallyFilled;
       if (active && (o.remaining == 0 || o.kind != TxKind.limit ||
           !_accounts.containsKey(o.ownerId))) {
@@ -784,7 +786,8 @@ class TxEngine {
     if (indexedOrderCount != activeOrderCount) {
       throw StateError('Resting index count does not match the ledger');
     }
-    if (_nextOrderSequence <= maxOrderSeq || _nextFillSequence <= _fills.length) {
+    if (_nextOrderSequence != nextExpectedOrderSeq ||
+        _nextFillSequence <= _fills.length) {
       throw StateError('Non-monotonic sequence');
     }
     final dCash = <String, int>{};
