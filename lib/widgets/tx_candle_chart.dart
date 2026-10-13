@@ -135,8 +135,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
             nextMinuteStep: _previewStep(widget.candles),
             periodMinutes: _period.minutes,
             framePriceCents: preview,
+            // The first frame after a symbol/period rebase can arrive before
+            // the visual envelope has observed a sample. Falling back to the
+            // mark keeps the chart paint-safe and never invents a wick.
             previewHighCents: _indicativeWick.highCents ?? preview,
-            previewLowCents: _indicativeWick.lowCents!);
+            previewLowCents: _indicativeWick.lowCents ?? preview);
     return Column(children: [
       Row(children: [
         Text(_period == TxChartPeriod.timeline
@@ -222,7 +225,12 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 indicativeLowCents: projection?.lowCents,
                 indicativeOpenCents: projection?.openCents,
                 overlayLastCommitted: projection?.overlaysLastCommitted ?? false,
-                preferCommittedBody: widget.activeMinuteStep != null,
+                // A 1m bar is already the real committed OHLC bucket. Keep
+                // its body and wick visible while the cyan quote is painted
+                // over it; otherwise the provisional marker can make a real
+                // high/low appear to disappear at 600x or at second 0.
+                preferCommittedBody: _period == TxChartPeriod.oneMinute ||
+                    widget.activeMinuteStep != null,
                 // Retain a dotted visual tail for the previous bucket,
                 // including 1h/4h/day rollovers; never change real OHLC.
                 previousIndicativeStep: _indicativeWick.previousGroupStep,
@@ -250,8 +258,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
         Text('$_window', style: const TextStyle(fontSize: 12)),
       ]),
       Text(widget.pending
-          ? '实心 K：真实撮合（含待保存候选）；半透明 K／青色短虚线影线：仅指示价，不进成交与存档'
-          : '实心 K：已提交；半透明 K／青色短虚线影线：仅指示价，不进成交与存档',
+          ? '实心 K：真实撮合（含待保存候选）；半透明 K／青色短虚线影线：仅预览，不进成交与存档'
+          : '实心 K：已提交；半透明 K／青色短虚线影线：仅预览，不进成交与存档',
           style: TextStyle(color: Colors.white54, fontSize: 10)),
     ]);
   }

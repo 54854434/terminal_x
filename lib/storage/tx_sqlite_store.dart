@@ -39,13 +39,51 @@ _PreparedSnapshot _prepareSnapshot(
   // Capture the worker's dirty-record journal BEFORE canonical import resets
   // the in-memory hints. Canonical import itself already performs the full
   // engine invariant audit: don't repeat that costly ledger scan here.
-  final trackedLists = proposed.engine.snapshotDeltaLists();
-  final trackedSessionHeader = trackedLists == null
+  var trackedLists = proposed.engine.snapshotDeltaLists();
+  var trackedSessionHeader = trackedLists == null
       ? null : proposed.snapshotHeader();
-  final trackedEngineHeader = trackedLists == null
+  var trackedEngineHeader = trackedLists == null
       ? null : proposed.engine.snapshotHeader();
-  final trackedNativeJournal = trackedLists == null
+  var trackedNativeJournal = trackedLists == null
       ? null : proposed.snapshotNativeJournalDelta();
+  // A deferred automatic candidate can contain several game minutes while
+  // SQLite still points at the older durable head. The typed object keeps its
+  // own delta cursor, but that cursor is only safe when its list lengths and
+  // native journal length still match the exact on-disk base. If they drift,
+  // use the older exact-diff encoder; never construct a patch against the
+  // wrong base and discover it only during replay.
+  if (trackedLists != null && previousCanonical != null) {
+    var compatible = true;
+    try {
+      final previous = Map<String, dynamic>.from(
+          jsonDecode(previousCanonical) as Map);
+      final previousEngine = Map<String, dynamic>.from(
+          jsonDecode(previous['engine'] as String) as Map);
+      for (final key in const <String>['accounts', 'orders', 'fills', 'ledger']) {
+        final spec = Map<String, dynamic>.from(trackedLists![key] as Map);
+        if (spec['oldLength'] !=
+            (previousEngine[key] as List<dynamic>).length) {
+          compatible = false;
+          break;
+        }
+      }
+      final native = trackedNativeJournal;
+      final previousNative = previous['nativeEvents'];
+      if (compatible && native != null &&
+          (previousNative is! List ||
+              native['oldLength'] != previousNative.length)) {
+        compatible = false;
+      }
+    } catch (_) {
+      compatible = false;
+    }
+    if (!compatible) {
+      trackedLists = null;
+      trackedSessionHeader = null;
+      trackedEngineHeader = null;
+      trackedNativeJournal = null;
+    }
+  }
   // The source is a typed, unpublished isolate candidate. One complete
   // release-mode invariant audit is sufficient; re-importing its full JSON
   // would audit and materialize the same ever-growing history again.

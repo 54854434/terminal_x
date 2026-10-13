@@ -431,19 +431,17 @@ class TxSettingsPage extends StatelessWidget {
     required int selected,
     required String Function(int) label,
     required ValueChanged<int>? onSelected,
-  }) => SingleChildScrollView(
-    scrollDirection: Axis.horizontal,
-    child: Row(children: [
+  }) => Wrap(
+    spacing: 7,
+    runSpacing: 6,
+    children: [
       for (final value in values)
-        Padding(
-          padding: const EdgeInsets.only(right: 7),
-          child: ChoiceChip(
-            label: Text(label(value)),
-            selected: selected == value,
-            onSelected: onSelected == null ? null : (_) => onSelected(value),
-          ),
+        ChoiceChip(
+          label: Text(label(value)),
+          selected: selected == value,
+          onSelected: onSelected == null ? null : (_) => onSelected(value),
         ),
-    ]),
+    ],
   );
 
   Widget _diagnosticRow(IconData icon, String label, String value) => Row(

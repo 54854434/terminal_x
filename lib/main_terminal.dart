@@ -39,6 +39,7 @@ import 'widgets/tx_terminal_theme.dart';
 import 'widgets/tx_market_hero.dart';
 import 'widgets/tx_terminal_status.dart';
 import 'widgets/tx_market_radar.dart';
+import 'widgets/tx_market_objectives_card.dart';
 import 'widgets/tx_back_exit_guard.dart';
 import 'widgets/tx_settings_page.dart';
 
@@ -119,6 +120,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   String _startupStage = '准备启动 Terminal X';
   Future<void>? _candleWarmup;
   bool _serviceClosed = false;
+  bool _recoveringStorage = false;
 
   bool get _ready => !_loading && !_busy && _fault == null &&
       !_historyWarming &&
@@ -279,6 +281,52 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     if (_serviceClosed) return;
     _serviceClosed = true;
     await service.close();
+  }
+
+  /// Adopt only the revision that is actually present in SQLite after a
+  /// failed/ambiguous operation. The provisional clock and chart are rebased
+  /// to that audited head; no in-memory candidate is retried automatically.
+  Future<void> _recoverStorage() async {
+    final service = _trader;
+    if (service == null || _recoveringStorage) return;
+    setState(() {
+      _recoveringStorage = true;
+      _historyWarming = true;
+      _startupProgress = .72;
+      _startupStage = '正在重新校验 SQLite 并恢复已落盘状态';
+      _notice = '正在读取真实 SQLite 修订；未确认的临时行情将被安全丢弃';
+    });
+    try {
+      final loaded = await service.reopenAndVerify();
+      _flow.recoverAfterStorageAudit();
+      _previousBookQty.clear();
+      _positionCache = null;
+      _positionCacheRevision = null;
+      _journalCache = null;
+      _journalCacheRevision = null;
+      final baseline = TxLiveCandles.fromVerifiedHistory(
+          <TxStoredSession>[loaded]);
+      if (!mounted) return;
+      setState(() {
+        _candles = baseline;
+        _fault = null;
+        _auto = false;
+        _seconds.value = 0;
+        _startupStage = '存档已恢复，正在重建真实 K 线缓存';
+        _startupProgress = .78;
+      });
+      _candleWarmup = _warmCandleHistory(service, loaded);
+      await _candleWarmup;
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _historyWarming = false;
+        _fault = 'SQLite 重新校验失败，仍保持停止状态：$error';
+        _notice = '没有重试未确认的交易或行情';
+      });
+    } finally {
+      if (mounted) setState(() => _recoveringStorage = false);
+    }
   }
 
   /// The account head is authoritative and must be audited before the main
@@ -838,6 +886,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         pending: _trader!.current.pending,
         onBuy: () => _openTradeTicket(TxSide.buy),
         onSell: () => _openTradeTicket(TxSide.sell)),
+      TxMarketObjectivesCard(session: session, symbol: _symbolName),
       RepaintBoundary(child: Card(child: Padding(
         padding: const EdgeInsets.all(12),
         child: ValueListenableBuilder<double>(
@@ -1994,7 +2043,22 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         ]),
         if (_busy) const LinearProgressIndicator(minHeight: 2),
         if (_fault != null) Padding(padding: const EdgeInsets.all(10),
-            child: SelectableText(_fault!, style: const TextStyle(color: red))),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SelectableText(_fault!, style: const TextStyle(color: red)),
+                if (_trader != null) ...[
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: _recoveringStorage ? null : _recoverStorage,
+                    icon: _recoveringStorage
+                        ? const SizedBox(width: 16, height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.verified_outlined, size: 17),
+                    label: Text(_recoveringStorage
+                        ? '正在重新校验…' : '重新校验 SQLite 并恢复'),
+                  ),
+                ],
+              ])),
         if (_fault == null) Padding(padding: const EdgeInsets.all(8),
           child: Text(_notice, maxLines: 2, overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: Colors.amberAccent, fontSize: 12))),

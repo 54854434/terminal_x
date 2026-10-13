@@ -223,6 +223,29 @@ void main() {
     await expectLater(service.nextTick(), throwsStateError);
   });
 
+  test('audited SQLite recovery adopts the durable head after a failed save',
+      () async {
+    var writes = 0;
+    await db.close();
+    db = TxSqliteStore(NativeDatabase.memory(), testCheckpoint: (point) {
+      if (point == 'after_session_insert' && ++writes == 2) {
+        throw StateError('injected recovery failure');
+      }
+    });
+    service = TxTradingService(db);
+    final first = await service.open();
+    await expectLater(service.nextTick(), throwsStateError);
+    expect(service.blocked, isTrue);
+    expect(service.current.session.step, 0);
+    final recovered = await service.reopenAndVerify();
+    expect(recovered.revision, first.revision);
+    expect(recovered.session.step, 0);
+    expect(service.blocked, isFalse);
+    final next = await service.nextTick();
+    expect(next.revision, first.revision + 1);
+    expect(next.session.step, 1);
+  });
+
   test('Android-style file close and reopen preserves trade and clock', () async {
     final folder = await Directory.systemTemp.createTemp('terminal_x_v01d_');
     final file = File('${folder.path}/fresh.sqlite');

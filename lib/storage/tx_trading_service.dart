@@ -99,6 +99,7 @@ class TxTradingService {
   int _automaticSaveMinutes = TxSqliteStore.defaultAutomaticSaveMinutes;
   int _pendingAutomaticOperations = 0;
   int _pendingGameMinutes = 0;
+  String? _lastStorageFailure;
 
 
   /// Null until the first complete, durably committed and acknowledged tick.
@@ -109,6 +110,7 @@ class TxTradingService {
   bool get hasPendingPersistence => _current?.pending ?? false;
   int get pendingAutomaticOperations => _pendingAutomaticOperations;
   int get pendingGameMinutes => _pendingGameMinutes;
+  String? get lastStorageFailure => _lastStorageFailure;
 
   TxStoredSession get current {
     if (_current == null) throw StateError('SQLite session not initialized');
@@ -148,8 +150,9 @@ class TxTradingService {
       _current = loaded;
       _durableCurrent = loaded;
       return loaded;
-    } catch (_) {
+    } catch (error) {
       _storageFault = true;
+      _lastStorageFailure = error.toString();
       _worker?.close();
       _worker = null;
       rethrow;
@@ -246,12 +249,13 @@ class TxTradingService {
         await _ackWorkerCommit();
       }
       return current;
-    } catch (_) {
+    } catch (error) {
       if (_worker != null) {
         _worker!.close();
         _worker = null;
       }
       _storageFault = true;
+      _lastStorageFailure = error.toString();
       rethrow;
     } finally {
       _busy = false;
@@ -285,12 +289,13 @@ class TxTradingService {
         );
       }
       return current;
-    } catch (_) {
+    } catch (error) {
       if (_worker != null) {
         _worker!.close();
         _worker = null;
-        _storageFault = true;
       }
+      _storageFault = true;
+      _lastStorageFailure = error.toString();
       rethrow;
     } finally {
       _busy = false;
@@ -341,7 +346,7 @@ class TxTradingService {
     if (worker == null) return;
     try {
       await worker.acknowledgeCommitted();
-    } catch (_) {
+    } catch (error) {
       // SQLite has already committed; recover the worker from the exact
       // committed UI mirror, never retry the trade or duplicate an order.
       worker.close();
@@ -349,10 +354,54 @@ class TxTradingService {
       try {
         _worker = await TxPersistentMarketWorker.start(current.session,
             useNative: nativeMarketWorker);
-      } catch (_) {
+      } catch (error) {
         _storageFault = true;
+        _lastStorageFailure = error.toString();
         rethrow;
       }
+    }
+  }
+
+  /// Re-read and audit the durable SQLite head after an ambiguous failure.
+  ///
+  /// A failed save may have rolled back, or it may have committed just before
+  /// the caller lost its acknowledgement. Reading the database is therefore
+  /// the only safe recovery operation: it adopts whichever revision is
+  /// actually on disk and discards the uncommitted in-memory candidate.
+  Future<TxStoredSession> reopenAndVerify() async {
+    if (_busy) throw StateError('A save is already in progress');
+    _busy = true;
+    try {
+      _worker?.close();
+      _worker = null;
+      final loaded = await database.readCurrent();
+      if (loaded == null) {
+        throw StateError('SQLite session is missing; recovery refused');
+      }
+      final configured = _requestedAutomaticSaveMinutes ??
+          await database.readAutomaticSaveMinutes();
+      if (configured < TxSqliteStore.minAutomaticSaveMinutes ||
+          configured > TxSqliteStore.maxAutomaticSaveMinutes) {
+        throw StateError('Invalid automatic SQLite save cadence');
+      }
+      _automaticSaveMinutes = configured;
+      _current = loaded;
+      _durableCurrent = loaded;
+      _pendingAutomaticOperations = 0;
+      _pendingGameMinutes = 0;
+      if (persistentMarketWorker) {
+        _worker = await TxPersistentMarketWorker.start(loaded.session,
+            useNative: nativeMarketWorker);
+      }
+      _storageFault = false;
+      _lastStorageFailure = null;
+      return loaded;
+    } catch (error) {
+      _storageFault = true;
+      _lastStorageFailure = error.toString();
+      rethrow;
+    } finally {
+      _busy = false;
     }
   }
 
@@ -365,8 +414,9 @@ class TxTradingService {
     try {
       _worker = await TxPersistentMarketWorker.start(current.session,
             useNative: nativeMarketWorker);
-    } catch (_) {
+    } catch (error) {
       _storageFault = true;
+      _lastStorageFailure = error.toString();
       rethrow;
     }
   }
@@ -386,8 +436,9 @@ class TxTradingService {
       );
       _current = saved;
       _durableCurrent = saved;
-    } catch (_) {
+    } catch (error) {
       _storageFault = true;
+      _lastStorageFailure = error.toString();
       rethrow;
     }
     _pendingAutomaticOperations = 0;

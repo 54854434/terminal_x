@@ -36,4 +36,7 @@ jobs:
         run: flutter pub get
 
       - name: Run the complete real regression suite
-        run: flutter test --no-pub
+        # GitHub's reporter keeps each failing Dart test visible as a native
+        # Actions annotation, so a public run can be diagnosed without
+        # pretending that a summary count is a pass.
+        run: flutter test --no-pub --reporter github

@@ -31,8 +31,11 @@ class TxTicketSubmitBar extends StatelessWidget {
             const SizedBox(width: 5),
             const Expanded(child: Text('模拟交易 · 点击后仍需核对确认',
               style: TextStyle(fontSize: 11, color: Colors.white60))),
-            Text(isLimit ? '限价 · ${timeInForce.label}' : '市价',
+            Text(isLimit ? '限价' : '市价',
               style: const TextStyle(fontSize: 11, color: Colors.white70)),
+            if (isLimit)
+              Text(' · ${timeInForce.label}',
+                style: const TextStyle(fontSize: 11, color: Colors.white70)),
           ]),
           const SizedBox(height: 6),
           SizedBox(width: double.infinity, height: 48,

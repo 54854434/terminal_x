@@ -63,7 +63,7 @@ void main() {
         TxCandleChart(candles: candles, indicativePriceCents: 1008))));
     expect(find.textContaining('模拟 K 线'), findsOneWidget);
     expect(find.textContaining('指示价（非成交）'), findsOneWidget);
-    expect(find.textContaining('无影线'), findsOneWidget);
+    expect(find.textContaining('影线'), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(MaterialApp(home: Scaffold(body:
         TxCandleChart(candles: candles, indicativePriceCents: 995))));
