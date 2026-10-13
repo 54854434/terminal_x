@@ -117,6 +117,13 @@ void main() {
     expect(active.currentMinuteFills.any((f) => f.symbol == 'SIM-A01'), isTrue);
     expect(active.currentMinuteFills.any((f) => f.symbol == 'SIM-A02'), isTrue);
     expect(active.playerFills, isEmpty);
+    final aggressive = active.engine.orders.values.where((o) =>
+        o.id.startsWith('NPC-M-')).toList();
+    expect(aggressive, isNotEmpty);
+    expect(aggressive.every((o) => o.kind == TxKind.limit &&
+        o.timeInForce == TxTimeInForce.ioc), isTrue);
+    expect(active.engine.activeOrders.where((o) => o.id.startsWith('NPC-M-')),
+        isEmpty);
     active.engine.checkInvariants();
   });
 

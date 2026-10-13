@@ -186,6 +186,82 @@ void main() {
       expect(e.account('self').reservedCashCents, 0);
       e.checkInvariants();
     });
+
+    test('post-only rejects a crossing order without freezing or filling', () {
+      final e = TxEngine()
+        ..registerAccount('buyer', cashCents: 20000)
+        ..registerAccount('seller', cashCents: 0, shares: {'LOW': 5});
+      e.place(id: 'ask', ownerId: 'seller', symbol: 'LOW', side: TxSide.sell,
+          kind: TxKind.limit, quantity: 5, limitPriceCents: 100);
+      final post = e.place(id: 'maker', ownerId: 'buyer', symbol: 'LOW',
+          side: TxSide.buy, kind: TxKind.limit, quantity: 2,
+          limitPriceCents: 101, timeInForce: TxTimeInForce.postOnly);
+      expect(post.status, TxStatus.rejected);
+      expect(post.rejectReason, contains('Post-only'));
+      expect(e.fills, isEmpty);
+      expect(e.account('buyer').reservedCashCents, 0);
+      expect(e.depth('LOW', TxSide.sell).single.quantity, 5);
+      e.checkInvariants();
+    });
+
+    test('post-only rests when it does not cross the visible book', () {
+      final e = TxEngine()
+        ..registerAccount('buyer', cashCents: 20000)
+        ..registerAccount('seller', cashCents: 0, shares: {'LOW': 5});
+      e.place(id: 'ask', ownerId: 'seller', symbol: 'LOW', side: TxSide.sell,
+          kind: TxKind.limit, quantity: 5, limitPriceCents: 100);
+      final post = e.place(id: 'maker', ownerId: 'buyer', symbol: 'LOW',
+          side: TxSide.buy, kind: TxKind.limit, quantity: 2,
+          limitPriceCents: 99, timeInForce: TxTimeInForce.postOnly);
+      expect(post.status, TxStatus.open);
+      expect(e.account('buyer').reservedCashCents, 198);
+      expect(e.depth('LOW', TxSide.buy).single.quantity, 2);
+      e.cancel('maker', ownerId: 'buyer');
+      expect(e.account('buyer').reservedCashCents, 0);
+      e.checkInvariants();
+    });
+
+    test('IOC fills available levels and releases the unfilled reservation', () {
+      final e = TxEngine()
+        ..registerAccount('buyer', cashCents: 10000)
+        ..registerAccount('seller', cashCents: 0, shares: {'LOW': 3});
+      e.place(id: 'ask', ownerId: 'seller', symbol: 'LOW', side: TxSide.sell,
+          kind: TxKind.limit, quantity: 3, limitPriceCents: 100);
+      final ioc = e.place(id: 'ioc', ownerId: 'buyer', symbol: 'LOW',
+          side: TxSide.buy, kind: TxKind.limit, quantity: 5,
+          limitPriceCents: 110, timeInForce: TxTimeInForce.ioc);
+      expect(ioc.status, TxStatus.cancelled);
+      expect(ioc.filled, 3);
+      expect(ioc.remaining, 2);
+      expect(e.account('buyer').cashCents, 9700);
+      expect(e.account('buyer').reservedCashCents, 0);
+      expect(e.account('buyer').sharesOf('LOW'), 3);
+      e.checkInvariants();
+    });
+
+    test('FOK rejects insufficient depth atomically and fills across levels when complete', () {
+      final e = TxEngine()
+        ..registerAccount('buyer', cashCents: 10000)
+        ..registerAccount('seller', cashCents: 0, shares: {'LOW': 5});
+      e.place(id: 'ask1', ownerId: 'seller', symbol: 'LOW', side: TxSide.sell,
+          kind: TxKind.limit, quantity: 2, limitPriceCents: 100);
+      final rejected = e.place(id: 'fok-bad', ownerId: 'buyer', symbol: 'LOW',
+          side: TxSide.buy, kind: TxKind.limit, quantity: 3,
+          limitPriceCents: 100, timeInForce: TxTimeInForce.fok);
+      expect(rejected.status, TxStatus.rejected);
+      expect(e.fills, isEmpty);
+      expect(e.account('buyer').reservedCashCents, 0);
+      e.place(id: 'ask2', ownerId: 'seller', symbol: 'LOW', side: TxSide.sell,
+          kind: TxKind.limit, quantity: 3, limitPriceCents: 101);
+      final filled = e.place(id: 'fok-good', ownerId: 'buyer', symbol: 'LOW',
+          side: TxSide.buy, kind: TxKind.limit, quantity: 5,
+          limitPriceCents: 110, timeInForce: TxTimeInForce.fok);
+      expect(filled.status, TxStatus.filled);
+      expect(filled.remaining, 0);
+      expect(e.fills.map((f) => f.quantity).toList(), [2, 3]);
+      expect(e.account('buyer').reservedCashCents, 0);
+      e.checkInvariants();
+    });
   });
 
   test('R43 long-history sequence audit stays append-only and detects corruption', () {

@@ -76,7 +76,8 @@ void main() {
           final aggregates = <int, List<int>>{};
           for (final o in engine.orders.values) {
             if (o.symbol != symbol || o.side != side ||
-                o.kind != TxKind.limit || o.remaining == 0 ||
+                o.kind != TxKind.limit || !o.timeInForce.canRest ||
+                o.remaining == 0 ||
                 (o.status != TxStatus.open &&
                  o.status != TxStatus.partiallyFilled)) continue;
             final row = aggregates.putIfAbsent(o.limitPriceCents!,
@@ -148,7 +149,8 @@ void main() {
       imported.nextTick();
       expect(imported.exportJson(), oldSession.exportJson());
       expect(imported.engine.activeOrders.every((o) =>
-          o.kind == TxKind.limit && o.remaining > 0), isTrue);
+          o.kind == TxKind.limit && o.timeInForce.canRest &&
+          o.remaining > 0), isTrue);
     }
     imported.engine.checkInvariants();
   });

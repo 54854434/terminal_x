@@ -5,6 +5,9 @@ import 'package:flutter_test/flutter_test.dart';
 import '../lib/widgets/tx_market_hero.dart';
 import '../lib/widgets/tx_terminal_status.dart';
 import '../lib/widgets/tx_terminal_theme.dart';
+import '../lib/widgets/tx_settings_page.dart';
+import '../lib/widgets/tx_ticket_submit_bar.dart';
+import '../lib/engine/tx_engine.dart';
 
 void main() {
   test('dark theme uses shared primary and surface colors', () {
@@ -116,5 +119,59 @@ void main() {
       ])))));
     expect(tester.takeException(), isNull);
     expect(find.text('快捷买入'), findsOneWidget);
+  });
+
+  testWidgets('settings page groups runtime market storage and diagnostics',
+      (tester) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var selectedSpeed = 100;
+    await tester.pumpWidget(MaterialApp(
+      theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxSettingsPage(
+        appVersion: '0.3.5',
+        rustStatus: 'ARM64 ABI v2 已绑定',
+        ready: true,
+        running: false,
+        speed: selectedSpeed,
+        actualMultiplier: '等待样本',
+        pulseSeconds: 15,
+        automaticSaveMinutes: 60,
+        automaticSaveDraft: 60,
+        checkpointInterval: 32,
+        checkpointDraft: 32,
+        currentRevision: 12,
+        pendingSave: true,
+        pendingOperations: 3,
+        pendingGameMinutes: 3,
+        storageSummary: 'SQLite 1.20 MiB · 12 份快照',
+        onSpeedPreset: (value) => selectedSpeed = value,
+      ))));
+    expect(find.text('设置中心'), findsOneWidget);
+    expect(find.text('实测提交速度'), findsOneWidget);
+    await tester.tap(find.text('600×'));
+    expect(selectedSpeed, 600);
+    await tester.drag(find.byType(ListView), const Offset(0, -1600));
+    await tester.pump();
+    expect(find.text('自动保存周期'), findsOneWidget);
+    expect(find.textContaining('当前有 3 项待保存'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('order submit bar exposes the selected limit policy',
+      (tester) async {
+    await tester.pumpWidget(MaterialApp(
+      theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxTicketSubmitBar(
+        side: TxSide.buy, isLimit: true,
+        timeInForce: TxTimeInForce.postOnly,
+        enabled: true, onReview: () {}),
+      ),
+    ));
+    expect(find.text('限价 · Post Only'), findsOneWidget);
+    expect(find.text('检查并买入'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }

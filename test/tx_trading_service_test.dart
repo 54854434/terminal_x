@@ -76,6 +76,26 @@ void main() {
     expect(restored.session.playerOrders.first.status, TxStatus.cancelled);
   });
 
+  test('IOC limit policy crosses real depth and persists its execution mode',
+      () async {
+    await service.open();
+    final ask = service.current.session.engine
+        .depth(TxSession.symbols[0], TxSide.sell).first;
+    final order = await service.place(
+      symbol: TxSession.symbols[0], side: TxSide.buy, kind: TxKind.limit,
+      quantity: ask.quantity + 2, limitPriceCents: ask.priceCents + 1,
+      timeInForce: TxTimeInForce.ioc);
+    expect(order.timeInForce, TxTimeInForce.ioc);
+    expect(order.filled, greaterThan(0));
+    expect(order.status, anyOf(TxStatus.filled, TxStatus.cancelled));
+    expect(service.current.session.engine.activeOrders
+        .any((o) => o.id == order.id), isFalse);
+    final restored = (await db.readCurrent())!;
+    expect(restored.session.engine.order(order.id).timeInForce,
+        TxTimeInForce.ioc);
+    restored.session.engine.checkInvariants();
+  });
+
   test('resting sell freeze releases after cancellation', () async {
     await service.open();
     await service.place(symbol: TxSession.symbols[0],

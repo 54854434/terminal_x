@@ -82,4 +82,15 @@ void main() {
     expect(r.spreadCents!, greaterThan(0));
     expect(session.exportJson(), before);
   });
+
+  test('visible depth metrics stay grounded in the actual BBO', () {
+    final r = TxOrderBookInsight.fromLevels(
+      bids: [const TxBookLevel(1099, 20, 2)],
+      asks: [const TxBookLevel(1101, 10, 1)],
+    );
+    expect(r.bestBidCents, 1099);
+    expect(r.bestAskCents, 1101);
+    expect(r.spreadCents, 2);
+    expect(r.bidShareFraction, closeTo(2 / 3, .0000001));
+  });
 }
