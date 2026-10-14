@@ -1,4 +1,4 @@
-/// Terminal X 0.3.5 unified trading interface and position analytics.
+/// Terminal X 0.3.7 unified trading interface and market-structure analytics.
 /// Existing V0.2 + V0.1 apps and backups are never accessed.
 import 'dart:async';
 import 'dart:io';
@@ -25,6 +25,7 @@ import 'market/tx_frame_preview.dart';
 import 'market/tx_trade_journal.dart';
 import 'market/tx_portfolio_scenarios.dart';
 import 'market/tx_market_phase_timeline.dart';
+import 'market/tx_market_profiles.dart';
 import 'market/tx_frame_render_gate.dart';
 import 'market/tx_storage_footprint.dart';
 import 'market/tx_market_tape_window.dart';
@@ -38,7 +39,9 @@ import 'widgets/tx_terminal_theme.dart';
 import 'widgets/tx_market_hero.dart';
 import 'widgets/tx_terminal_status.dart';
 import 'widgets/tx_market_radar.dart';
-import 'widgets/tx_market_objectives_card.dart';
+import 'widgets/tx_market_ecosystem_card.dart';
+import 'widgets/tx_market_mode_selector.dart';
+import 'widgets/tx_market_mode_preview_card.dart';
 import 'widgets/tx_back_exit_guard.dart';
 import 'widgets/tx_settings_page.dart';
 
@@ -69,7 +72,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const green = TxTerminalColors.buy;
   static const red = TxTerminalColors.sell;
-  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.5');
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.7');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
@@ -94,10 +97,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Future<void>? _operation;
   int _page = 0;
   int _symbol = 0;
+  TxMarketMode _marketMode = TxMarketMode.aShare;
   int _speed = 1;
   final ValueNotifier<double> _seconds = ValueNotifier<double>(0.0);
   final ValueNotifier<int> _marketRepaint = ValueNotifier<int>(0);
   final ValueNotifier<bool> _settling = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> _pulseSettling = ValueNotifier<bool>(false);
   final ValueNotifier<double> _settlementPhase = ValueNotifier<double>(0.0);
   bool _auto = false;
   bool _busy = false;
@@ -125,6 +130,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   bool get _ready => !_loading && !_busy && _fault == null &&
       !_historyWarming &&
       _trader != null && !_trader!.blocked;
+  bool get _tradingReady => _ready &&
+      TxMarketProfile.of(_marketMode).isCoreConnected;
   String get _symbolName => TxSession.symbols[_symbol];
   String money(int cents) => (cents / 100).toStringAsFixed(2);
   String signedMoney(int cents) => '${cents >= 0 ? '+' : '-'}¥${money(cents.abs())}';
@@ -455,6 +462,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       // Automatic minute commits stay single-flight, but do not flash a
       // global loading indicator or rebuild the entire UI before each save.
       _settling.value = true;
+      _pulseSettling.value = pulse;
       _settlementPhase.value = 0.0;
       _busy = true;
     }
@@ -500,6 +508,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         }
         if (mounted) {
           _settling.value = false;
+          _pulseSettling.value = false;
           _settlementPhase.value = 0.0;
         }
         if (_auto && !pulse && !after.pending) {
@@ -523,6 +532,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _flow.storageFailed();
       if (mounted) {
         _settling.value = false;
+        _pulseSettling.value = false;
         _settlementPhase.value = 0.0;
       }
       if (mounted) setState(() =>
@@ -588,6 +598,17 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   void _trade(TxSide side) {
+    if (!_tradingReady) {
+      setState(() => _notice = '当前市场模式仅规则预览，切回 A 股后才可提交订单');
+      return;
+    }
+    final sessionStatus = TxSession.marketSessionStatusAt(
+        committedStep: _trader!.current.session.step,
+        fractionalSeconds: _seconds.value.floor());
+    if (!sessionStatus.isOpen) {
+      setState(() => _notice = 'A股${sessionStatus.label}，交易入口已锁定；开市后可继续下单');
+      return;
+    }
     final n = int.tryParse(_qty.text.trim());
     final limitPrice = _limit ? _cents(_price.text) : null;
     if (n == null || n <= 0 || n > TxEngine.maxQuantity ||
@@ -878,13 +899,33 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   );
 
   Widget _marketContent(TxSession session) {
+    final profile = TxMarketProfile.of(_marketMode);
+    Widget modeSelector() => ValueListenableBuilder<double>(
+      valueListenable: _seconds,
+      builder: (context, seconds, child) => TxMarketModeSelector(
+        selected: _marketMode,
+        gameDay: TxRealtimeClock.gameDay(session.step, seconds.floor()),
+        minuteOfDay: TxRealtimeClock.gameMinuteOfDay(
+            session.step, seconds.floor()),
+        onSelected: (mode) => setState(() => _marketMode = mode),
+      ),
+    );
+    if (!profile.isCoreConnected) {
+      return ListView(padding: const EdgeInsets.all(14), children: [
+        modeSelector(),
+        TxMarketModePreviewCard(profile: profile,
+          onReturnToConnected: () => setState(() {
+            _marketMode = TxMarketMode.aShare;
+          })),
+      ]);
+    }
     final minuteFills = session.currentMinuteFills
         .where((f) => f.symbol == _symbolName).toList();
     final minuteVolume = minuteFills.fold<int>(0, (sum, f) => sum + f.quantity);
-    final price = session.lastPrice(_symbolName);
     final durablePrice = _trader!.durableCurrent.session.lastPrice(_symbolName);
     final candles = _candles!.forSymbol(_symbolName);
     return ListView(padding: const EdgeInsets.all(14), children: [
+      modeSelector(),
       TxMarketRadar(quotes: [
         for (var i=0;i<TxSession.symbols.length;i++)
           TxRadarQuote(symbol:TxSession.symbols[i],
@@ -896,11 +937,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         })),
       TxMarketHero(symbol: _symbolName, committedPriceCents: durablePrice,
         step: session.step, seconds: _seconds,
+        quoteCurrency: profile.quoteCurrency,
+        coreConnected: _tradingReady,
         indicativeCents: (seconds) => _indication(session, seconds),
         pending: _trader!.current.pending,
-        onBuy: () => _openTradeTicket(TxSide.buy),
-        onSell: () => _openTradeTicket(TxSide.sell)),
-      TxMarketObjectivesCard(session: session, symbol: _symbolName),
+        onBuy: profile.isCoreConnected
+            ? () => _openTradeTicket(TxSide.buy) : null,
+        onSell: profile.isCoreConnected
+            ? () => _openTradeTicket(TxSide.sell) : null),
+      TxMarketEcosystemCard(session: session, symbol: _symbolName,
+        profile: profile),
       RepaintBoundary(child: Card(child: Padding(
         padding: const EdgeInsets.all(12),
         child: ValueListenableBuilder<double>(
@@ -908,8 +954,14 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           builder: (context, seconds, child) => TxCandleChart(
             candles: candles,
             pending: _trader!.current.pending,
-            activeMinuteStep: session.lastPulseSecond > 0
-                ? session.marketTimeStep : null,
+            // Higher timeframes need the next minute bucket from the first
+            // provisional frame, not only after the first Rust pulse. Without
+            // this, 5m/15m/1h previews briefly rebase onto the last committed
+            // bar and look like one dot moving in place.
+            activeMinuteStep: (_auto || seconds > 0)
+                ? session.step + 1
+                : (session.lastPulseSecond > 0
+                    ? session.marketTimeStep : null),
             // At exactly 0 seconds of an automatically running minute,
             // retain the cyan display-only price marker. Otherwise it
             // vanishes for one frame after *every* durable SQLite commit.
@@ -1036,21 +1088,6 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           '自动保存周期内的实时图可包含已标注的待保存候选，重启只恢复 SQLite 已落盘记录；成交量不把秒级报价变动伪造成交易。',
           style: TextStyle(color: Colors.white54, fontSize: 11)),
       */
-      _title('运行设置', sub: '倍率、Rust 盘口节奏和 SQLite 存档策略统一在设置中心管理'),
-      Card(child: Padding(padding: const EdgeInsets.all(12),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('当前 ${_auto ? '运行中' : '已暂停'} · ${_speed}× · '
-              '盘口每 ${_flow.pulseSeconds}s · 自动保存每 $_automaticSaveMinutes 分钟'),
-          const SizedBox(height: 5),
-          const Text('行情页保留真实盘口和 K 线；可操作设置不再在多个页面重复出现。',
-              style: TextStyle(color: Colors.white60, fontSize: 11)),
-          Align(alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: () => setState(() => _page = 4),
-              icon: const Icon(Icons.settings_outlined, size: 17),
-              label: const Text('打开设置中心'))),
-        ])),
-      ),
     ]);
   }
 
@@ -1083,7 +1120,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   void _showMarketEstimate(TxSide side) {
-    if (!_ready || _limit) return;
+    if (!_tradingReady || _limit) return;
     final quantity = int.tryParse(_qty.text.trim());
     if (quantity == null || quantity < 1 || quantity > TxEngine.maxQuantity) {
       setState(() => _notice = '请先输入有效的市价委托股数');
@@ -1124,6 +1161,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           Text('预计成交均价 ${average == null ? '—' : '¥${(average / 100).toStringAsFixed(4)}'}'),
           Text('最优价 ${price(estimate.bestPriceCents)}'
               ' · 最差价 ${price(estimate.worstPriceCents)}'),
+          Text('预计消耗 ${estimate.levelsConsumed} 档可见流动性'),
           Text('预估滑点 ${slippage == null ? '—' : '${slippage.toStringAsFixed(2)} 分/股'}'),
           if (estimate.rejected) Text('无法执行：${estimate.rejectReason}',
             style: const TextStyle(color: Colors.amberAccent)),
@@ -1143,7 +1181,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   // buy side uses the displayed best ask/limit price as a conservative UI
   // reference, not as a promise of executable market depth or final VWAP.
   void _applyTicketPercent(TxSession session, int percent) {
-    if (!_ready) return;
+    if (!_tradingReady) return;
     final account = session.engine.account(TxSession.playerId);
     int maximum;
     if (_ticketSide == TxSide.sell) {
@@ -1191,7 +1229,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             padding: EdgeInsets.symmetric(vertical: 8),
             child: Text('暂无挂单', style: TextStyle(fontSize: 11))),
           for (final level in levels.take(5)) InkWell(
-            onTap: !_ready ? null : () => setState(() {
+            onTap: !_tradingReady ? null : () => setState(() {
               _limit = true;
               _ticketSide = tint == green ? TxSide.sell : TxSide.buy;
               _timeInForce = TxTimeInForce.gtc;
@@ -1252,7 +1290,17 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   /// A review is separate from an order. Entering review pauses the visual
   /// clock, and revision + input fields must still match at confirmation.
   void _confirmTicket() {
-    if (!_ready) return;
+    if (!_tradingReady) {
+      setState(() => _notice = '当前市场模式仅规则预览，切回 A 股后才可提交订单');
+      return;
+    }
+    final sessionStatus = TxSession.marketSessionStatusAt(
+        committedStep: _trader!.current.session.step,
+        fractionalSeconds: _seconds.value.floor());
+    if (!sessionStatus.isOpen) {
+      setState(() => _notice = 'A股${sessionStatus.label}，交易入口已锁定；开市后可继续下单');
+      return;
+    }
     final quantityText = _qty.text.trim();
     final quantity = int.tryParse(quantityText);
     final limited = _limit;
@@ -1305,7 +1353,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         FilledButton(onPressed: () {
           Navigator.of(dialogContext).pop();
           if (!mounted) return;
-          if (!_ready || !review.isStillCurrent(
+          if (!_tradingReady || !review.isStillCurrent(
               revision: _trader!.current.revision, symbol: _symbolName,
               side: _ticketSide, limited: _limit,
               quantityText: _qty.text.trim(), priceText: _price.text.trim(),
@@ -1320,6 +1368,24 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   Widget _trading(TxSession session) {
+    final profile = TxMarketProfile.of(_marketMode);
+    final canTrade = _tradingReady && session.marketSessionStatus.isOpen;
+    if (!profile.isCoreConnected) {
+      return Column(children: [
+        Expanded(child: ListView(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 14),
+          children: [
+            _title('交易委托', sub: '${profile.label} · 规则预览'),
+            TxMarketModePreviewCard(profile: profile,
+              onReturnToConnected: () => setState(() {
+                _marketMode = TxMarketMode.aShare;
+              })),
+            const Text('下单入口已锁定，不会把现货订单误投到其他市场。',
+                style: TextStyle(fontSize: 11, color: Colors.white60)),
+          ],
+        )),
+      ]);
+    }
     final account = session.engine.account(TxSession.playerId);
     final ask = session.engine.depth(_symbolName, TxSide.sell);
     final bid = session.engine.depth(_symbolName, TxSide.buy);
@@ -1330,12 +1396,21 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
     Widget reviewButton() => TxTicketSubmitBar(side: _ticketSide,
         isLimit: _limit, timeInForce: _timeInForce,
-        enabled: _ready, onReview: _confirmTicket);
+        enabled: canTrade, onReview: _confirmTicket);
     return Column(children: [
       Expanded(child: ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.fromLTRB(12, 4, 12, 14), children: [
-      _title('交易委托', sub: '市价可能跨档滑点；真实资金/库存限制'),
+      _title('交易委托', sub: '${profile.label} · 市价可能跨档滑点；真实资金/库存限制'),
+      if (!session.marketSessionStatus.isOpen)
+        Card(child: ListTile(
+          dense: true,
+          leading: Icon(session.marketSessionStatus.isBreak
+              ? Icons.pause_circle_outline : Icons.event_busy,
+              color: Colors.amberAccent),
+          title: Text('当前${session.marketSessionStatus.label}'),
+          subtitle: const Text('交易入口已锁定；玩家 GTC 委托保留，开市后再参与撮合。'),
+        )),
       _chooseSymbol(session),
       Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(children: [
         SizedBox(width: double.infinity, child: SegmentedButton<TxSide>(
@@ -1345,7 +1420,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             ButtonSegment(value: TxSide.sell, label: Text('卖出 Sell'),
                 icon: Icon(Icons.trending_down)),
           ], selected: {_ticketSide},
-          onSelectionChanged: !_ready ? null :
+          onSelectionChanged: !canTrade ? null :
               (selected) => setState(() => _ticketSide = selected.first))),
         const SizedBox(height: 12),
         Wrap(children: [
@@ -1362,7 +1437,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             ButtonSegment(value: true, label: Text('限价 Limit'),
                 icon: Icon(Icons.tune)),
           ], selected: {_limit},
-          onSelectionChanged: !_ready ? null :
+          onSelectionChanged: !canTrade ? null :
               (values) => setState(() {
                 _limit = values.first;
                 if (!_limit) _timeInForce = TxTimeInForce.gtc;
@@ -1382,7 +1457,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                 ButtonSegment(value: TxTimeInForce.fok, label: Text('FOK')),
               ],
               selected: {_timeInForce},
-              onSelectionChanged: !_ready ? null :
+              onSelectionChanged: !canTrade ? null :
                   (values) => setState(() => _timeInForce = values.first))),
           const SizedBox(height: 4),
           Text(
@@ -1396,10 +1471,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         ],
         if (_limit) Wrap(spacing: 6, children: [
           ActionChip(label: const Text('卖一价'),
-            onPressed: ask.isEmpty || !_ready ? null : () =>
+            onPressed: ask.isEmpty || !canTrade ? null : () =>
                 _price.text = money(ask.first.priceCents)),
           ActionChip(label: const Text('买一价'),
-            onPressed: bid.isEmpty || !_ready ? null : () =>
+            onPressed: bid.isEmpty || !canTrade ? null : () =>
                 _price.text = money(bid.first.priceCents)),
         ]),
         const Align(alignment: Alignment.centerLeft,
@@ -1407,7 +1482,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         Wrap(spacing: 5, runSpacing: 0, children: [
           for (final amount in [1, 10, 100, 500])
             ActionChip(label: Text('$amount股'),
-              onPressed: _ready ? () => _qty.text = '$amount' : null),
+              onPressed: canTrade ? () => _qty.text = '$amount' : null),
         ]),
         const SizedBox(height: 5),
         const Align(alignment: Alignment.centerLeft,
@@ -1416,17 +1491,17 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         Wrap(spacing: 5, children: [
           for (final percent in [25, 50, 75, 100])
             ActionChip(label: Text('$percent%'),
-              onPressed: !_ready ? null :
+              onPressed: !canTrade ? null :
                   () => _applyTicketPercent(session, percent)),
         ]),
         const SizedBox(height: 6),
-        TextField(controller: _qty, enabled: _ready,
+        TextField(controller: _qty, enabled: canTrade,
           keyboardType: TextInputType.number,
           decoration: const InputDecoration(labelText: '委托股数',
               border: OutlineInputBorder())),
         if (_limit) ...[
           const SizedBox(height: 10),
-          TextField(controller: _price, enabled: _ready,
+          TextField(controller: _price, enabled: canTrade,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(labelText: '限价 ¥',
                 border: OutlineInputBorder())),
@@ -1449,12 +1524,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         if (!_limit) ...[
           Row(children: [
             Expanded(child: OutlinedButton.icon(
-              onPressed: _ready ? () => _showMarketEstimate(TxSide.buy) : null,
+              onPressed: canTrade ? () => _showMarketEstimate(TxSide.buy) : null,
               icon: const Icon(Icons.calculate_outlined, size: 17),
               label: const Text('试算买入'))),
             const SizedBox(width: 8),
             Expanded(child: OutlinedButton.icon(
-              onPressed: _ready ? () => _showMarketEstimate(TxSide.sell) : null,
+              onPressed: canTrade ? () => _showMarketEstimate(TxSide.sell) : null,
               icon: const Icon(Icons.calculate_outlined, size: 17),
               label: const Text('试算卖出'))),
           ]),
@@ -1998,6 +2073,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _seconds.dispose();
     _marketRepaint.dispose();
     _settling.dispose();
+    _pulseSettling.dispose();
     _settlementPhase.dispose();
     _qty.dispose();
     _price.dispose();
@@ -2058,6 +2134,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           revision: stored.revision, running: _auto,
           speed: _speed, busy: _busy, settling: _settling,
           settlementPhase: _settlementPhase,
+          settlingPulse: _pulseSettling,
           pendingSave: stored.pending,
           pendingOperations: stored.pendingOperations,
           pendingGameMinutes: _trader!.pendingGameMinutes,

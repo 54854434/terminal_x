@@ -3,6 +3,8 @@
 import 'dart:convert';
 import 'tx_engine.dart';
 import '../market/tx_npc_market.dart';
+import '../market/tx_market_session_schedule.dart';
+import '../market/tx_realtime_clock.dart';
 
 class TxSession {
   TxSession._(
@@ -20,6 +22,23 @@ class TxSession {
   static const saveKey = 'terminal_x_v01b_state';
   static const oldSaveKey = 'terminal_state';
   static const schemaVersion = 1;
+
+  /// The connected core is an A-share spot book. Its session rule is enforced
+  /// at order and minute boundaries; other market profiles stay isolated
+  /// previews until they receive their own ledger/core.
+  static TxMarketSessionStatus marketSessionStatusAt({
+    required int committedStep,
+    int fractionalSeconds = 0,
+  }) {
+    final day = TxRealtimeClock.gameDay(committedStep, fractionalSeconds);
+    final minute = TxRealtimeClock.gameMinuteOfDay(
+        committedStep, fractionalSeconds);
+    return TxMarketSessionSchedules.aShare.status(
+        gameDay: day, minuteOfDay: minute);
+  }
+
+  TxMarketSessionStatus get marketSessionStatus =>
+      marketSessionStatusAt(committedStep: step);
 
   final TxEngine engine;
   int step;
@@ -162,6 +181,14 @@ class TxSession {
       throw ArgumentError.value(second, 'second');
     }
     if (second <= lastPulseSecond) return;
+    // Pulses are stored against the next displayed market minute. Never
+    // create an intraminute candidate whose persisted candle is outside the
+    // connected A-share session.
+    if (!marketSessionStatusAt(committedStep: step + 1).isOpen) {
+      lastPulseSecond = second;
+      _quoteFillStart = engine.fillCount;
+      return;
+    }
     if (!TxNpcMarket.isEnabled(engine)) {
       lastPulseSecond = second;
       return;
@@ -176,7 +203,8 @@ class TxSession {
           activeReferenceMove(step + 1, i),
       ];
       TxNpcMarket.tradeMinute(
-          engine, seed, symbols, referenceCents, movements);
+          engine, seed, symbols, referenceCents, movements,
+          eventKey: 'P-${step + 1}-$second');
       lastPulseSecond = second;
     });
   }
@@ -197,6 +225,12 @@ class TxSession {
     step++;
     if (!hadPulses) _quoteFillStart = engine.fillCount;
     lastPulseSecond = 0;
+    final sessionOpen = marketSessionStatus.isOpen;
+    if (!sessionOpen) {
+      // Participant liquidity is withdrawn through the cancellations above;
+      // player GTC orders remain reserved for the next open boundary.
+      return;
+    }
     final movements = <int>[];
     final activeParticipants = TxNpcMarket.isEnabled(engine);
     for (var i = 0; i < symbols.length; i++) {
@@ -208,7 +242,8 @@ class TxSession {
     }
     _quoteMakers();
     TxNpcMarket.tradeMinute(
-        engine, step, symbols, referenceCents, movements);
+        engine, step, symbols, referenceCents, movements,
+        eventKey: 'T-$step');
     });
   }
 
@@ -266,6 +301,10 @@ class TxSession {
     TxTimeInForce timeInForce = TxTimeInForce.gtc,
   }) {
     if (!symbols.contains(symbol)) throw ArgumentError('Unsupported symbol');
+    final sessionStatus = marketSessionStatus;
+    if (!sessionStatus.isOpen) {
+      throw StateError('A股${sessionStatus.label}，暂不可下单');
+    }
     return engine.place(
       id: 'PLAYER-${nextPlayerOrder++}',
       ownerId: playerId,

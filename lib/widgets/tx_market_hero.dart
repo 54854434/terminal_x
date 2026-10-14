@@ -11,18 +11,29 @@ class TxMarketHero extends StatelessWidget {
   const TxMarketHero({super.key, required this.symbol,
     required this.committedPriceCents, required this.step,
     required this.seconds, required this.indicativeCents,
-    required this.onBuy, required this.onSell, this.pending = false});
+    required this.onBuy, required this.onSell, this.pending = false,
+    this.quoteCurrency = 'CNY', this.coreConnected = false});
 
   final String symbol;
   final int committedPriceCents;
   final int step;
   final ValueListenable<double> seconds;
   final double Function(double seconds) indicativeCents;
-  final VoidCallback onBuy;
-  final VoidCallback onSell;
+  final VoidCallback? onBuy;
+  final VoidCallback? onSell;
   final bool pending;
+  final String quoteCurrency;
+  final bool coreConnected;
 
-  String _yuan(int cents) => (cents / 100).toStringAsFixed(2);
+  String _mark() => switch (quoteCurrency) {
+    'CNY' => '¥',
+    'USD' => '\$',
+    'USDT' => '₮',
+    _ => '$quoteCurrency ',
+  };
+
+  String _price(double cents, int decimals) =>
+      '${_mark()}${(cents / 100).toStringAsFixed(decimals)}';
 
   @override
   Widget build(BuildContext context) => Card(child: Padding(
@@ -38,9 +49,10 @@ class TxMarketHero extends StatelessWidget {
           decoration: BoxDecoration(
             color: TxTerminalColors.raised,
             borderRadius: BorderRadius.circular(8)),
-          child: const Text('OFFLINE · SIM',
+          child: Text(coreConnected ? 'RUST · 已连接' : 'OFFLINE · SIM',
             style: TextStyle(fontSize: 10,
-              color: TxTerminalColors.secondaryText))),
+              color: coreConnected ? TxTerminalColors.buy
+                  : TxTerminalColors.secondaryText))),
       ]),
       const SizedBox(height: 11),
       ValueListenableBuilder<double>(
@@ -48,8 +60,8 @@ class TxMarketHero extends StatelessWidget {
         builder: (context, value, child) {
           final quote = indicativeCents(value);
           return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Semantics(label: '模拟指示价 ¥${(quote / 100).toStringAsFixed(4)}，不可用于真实成交',
-              child: Text('¥${(quote / 100).toStringAsFixed(4)}',
+            Semantics(label: '模拟指示价 ${_price(quote, 4)}，不可用于真实成交',
+              child: Text(_price(quote, 4),
                 style: const TextStyle(fontSize: 32,
                   color: TxTerminalColors.cyan, fontWeight: FontWeight.w800,
                   fontFeatures: [FontFeature.tabularFigures()]))),
@@ -62,8 +74,8 @@ class TxMarketHero extends StatelessWidget {
         }),
       const SizedBox(height: 6),
       Text(pending
-          ? '当前盘口为待保存候选 · SQLite 恢复收盘 ¥${_yuan(committedPriceCents)}'
-          : '指示走势逐帧演示 · 非真实成交 | 已提交收盘 ¥${_yuan(committedPriceCents)}',
+          ? '当前盘口为待保存候选 · SQLite 恢复收盘 ${_price(committedPriceCents.toDouble(), 2)}'
+          : '指示走势逐帧演示 · 非真实成交 | 已提交收盘 ${_price(committedPriceCents.toDouble(), 2)}',
         style: const TextStyle(
           color: TxTerminalColors.secondaryText, fontSize: 11)),
       const SizedBox(height: 12),

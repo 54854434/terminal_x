@@ -10,6 +10,7 @@ class TxTerminalStatus extends StatelessWidget {
     required this.step, required this.revision,
     required this.running, required this.speed, required this.busy,
     this.settling, this.settlementPhase,
+    this.settlingPulse,
     this.pendingSave = false, this.pendingOperations = 0,
     this.pendingGameMinutes = 0, this.automaticSaveMinutes = 1});
 
@@ -24,6 +25,10 @@ class TxTerminalStatus extends StatelessWidget {
   /// automatic commit.
   final ValueListenable<bool>? settling;
   final ValueListenable<double>? settlementPhase;
+  /// True when the pending operation is an intraminute real-book pulse. It
+  /// still obeys single-flight backpressure, but is not a full SQLite minute
+  /// settlement and should be labelled differently to the player.
+  final ValueListenable<bool>? settlingPulse;
   final bool pendingSave;
   final int pendingOperations;
   final int pendingGameMinutes;
@@ -35,10 +40,11 @@ class TxTerminalStatus extends StatelessWidget {
     if (notifier == null) return _body(context, false);
     return ValueListenableBuilder<bool>(
       valueListenable: notifier,
-      builder: (context, value, child) => _body(context, value));
+      builder: (context, value, child) => _body(context, value,
+          pulse: settlingPulse?.value ?? false));
   }
 
-  Widget _body(BuildContext context, bool isSettling) {
+  Widget _body(BuildContext context, bool isSettling, {bool pulse = false}) {
     final saveMinutes = automaticSaveMinutes < 1 ? 1 : automaticSaveMinutes;
     return DecoratedBox(
     decoration: const BoxDecoration(
@@ -91,7 +97,8 @@ class TxTerminalStatus extends StatelessWidget {
                       TxTerminalColors.primary)),
               ]),
             if (isSettling)
-              const Text('正在处理当前结算，未确认时间不会前进',
+              Text(pulse ? '正在同步真实盘口，未确认时间不会前进'
+                  : '正在处理当前结算，未确认时间不会前进',
                 maxLines: 1, overflow: TextOverflow.ellipsis,
                 style: TextStyle(fontSize: 10,
                   color: TxTerminalColors.primary)),

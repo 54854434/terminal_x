@@ -34,6 +34,9 @@ void main() {
     expect(TxRealtimeClock.gameDay(870, 0), 2);
     expect(TxRealtimeClock.hhmmss(1440, 0), '09:30:00');
     expect(TxRealtimeClock.gameDay(1440, 0), 2);
+    expect(TxRealtimeClock.gameMinuteOfDay(0, 0), 570);
+    expect(TxRealtimeClock.gameMinuteOfDay(870, 0), 0);
+    expect(TxRealtimeClock.gameMinuteOfDay(1440, 0), 570);
     expect(() => TxRealtimeClock.gameDay(-1, 0), throwsArgumentError);
     expect(() => TxRealtimeClock.hhmmss(1, 60), throwsArgumentError);
   });

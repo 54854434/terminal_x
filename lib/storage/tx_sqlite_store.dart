@@ -9,6 +9,8 @@ import 'package:drift/drift.dart';
 
 import '../engine/tx_session.dart';
 import '../market/tx_live_candles.dart';
+import '../market/tx_market_profiles.dart';
+import '../market/tx_market_runtime.dart';
 import 'tx_delta_codec.dart';
 
 // The previous committed snapshot must be re-hashed inside each write
@@ -280,6 +282,25 @@ class TxStoredSession {
   final int pendingOperations;
 }
 
+/// An independently persisted market runtime.
+///
+/// This is intentionally not a [TxStoredSession]. The A-share ledger keeps
+/// its revision chain in `snapshots`; non-A modes keep one checksummed,
+/// compare-and-swap protected envelope per market mode in
+/// `storage_metadata`. A damaged envelope is a hard restore failure, never a
+/// reason to silently start with a new account balance.
+class TxStoredMarketRuntime {
+  const TxStoredMarketRuntime({
+    required this.runtime,
+    required this.sequence,
+    required this.sha256,
+  });
+
+  final TxMarketRuntime runtime;
+  final int sequence;
+  final String sha256;
+}
+
 class TxSqliteStore extends GeneratedDatabase {
   TxSqliteStore(super.executor, {void Function(String)? testCheckpoint})
       : _testCheckpoint = testCheckpoint;
@@ -294,6 +315,7 @@ class TxSqliteStore extends GeneratedDatabase {
   static const int minAutomaticSaveMinutes = 1;
   static const int maxAutomaticSaveMinutes = 60;
   static const String _candleIndexKey = 'candle_index_v1';
+  static const String _marketRuntimeKeyPrefix = 'market_runtime_v1_';
   TxLiveCandles? _indexedCandles;
   int? _indexedRevision;
   TxStoredSession? _cachedCurrent;
@@ -378,6 +400,158 @@ class TxSqliteStore extends GeneratedDatabase {
   String _digest(String data) => sha256.convert(utf8.encode(data)).toString();
 
   String _utcNow() => DateTime.now().toUtc().toIso8601String();
+
+  String _marketRuntimeKey(TxMarketMode mode) =>
+      '$_marketRuntimeKeyPrefix${mode.name}';
+
+  String _marketRuntimeBody({
+    required TxMarketMode mode,
+    required int sequence,
+    required String runtimeJson,
+    required String runtimeSha256,
+  }) => jsonEncode(<String, dynamic>{
+        'version': 1,
+        'mode': mode.name,
+        'sequence': sequence,
+        'runtime': runtimeJson,
+        'runtimeSha256': runtimeSha256,
+      });
+
+  TxStoredMarketRuntime _decodeMarketRuntimeEnvelope(
+      TxMarketMode expectedMode, String encoded) {
+    try {
+      final source = jsonDecode(encoded);
+      if (source is! Map) throw const FormatException('Invalid market runtime envelope');
+      final data = Map<String, dynamic>.from(source);
+      if (data.length != 6 || data['version'] != 1 ||
+          data['mode'] is! String || data['sequence'] is! int ||
+          data['runtime'] is! String || data['runtimeSha256'] is! String ||
+          data['envelopeSha256'] is! String) {
+        throw const FormatException('Invalid market runtime envelope fields');
+      }
+      if (data['mode'] != expectedMode.name ||
+          (data['sequence'] as int) < 1) {
+        throw const FormatException('Market runtime mode or sequence mismatch');
+      }
+      final runtimeJson = data['runtime'] as String;
+      final runtimeSha = data['runtimeSha256'] as String;
+      if (_digest(runtimeJson) != runtimeSha) {
+        throw const FormatException('Market runtime checksum mismatch');
+      }
+      final body = _marketRuntimeBody(
+        mode: expectedMode,
+        sequence: data['sequence'] as int,
+        runtimeJson: runtimeJson,
+        runtimeSha256: runtimeSha,
+      );
+      if (_digest(body) != data['envelopeSha256']) {
+        throw const FormatException('Market runtime envelope checksum mismatch');
+      }
+      final runtime = TxMarketRuntime.fromJson(runtimeJson);
+      if (runtime.mode != expectedMode) {
+        throw const FormatException('Restored runtime mode mismatch');
+      }
+      return TxStoredMarketRuntime(
+        runtime: runtime,
+        sequence: data['sequence'] as int,
+        sha256: runtimeSha,
+      );
+    } on FormatException {
+      rethrow;
+    } catch (error) {
+      throw FormatException('Invalid market runtime envelope: $error');
+    }
+  }
+
+  /// Read one independently stored non-A runtime.
+  ///
+  /// The method is fail-closed: malformed JSON, a bad hash, a wrong mode or
+  /// a runtime invariant failure is surfaced to the caller. Returning null is
+  /// reserved for a genuinely absent market mode.
+  Future<TxStoredMarketRuntime?> readMarketRuntime(TxMarketMode mode) async {
+    final row = await customSelect('''
+      SELECT value FROM storage_metadata WHERE key = ?
+    ''', variables: [Variable.withString(_marketRuntimeKey(mode))])
+        .getSingleOrNull();
+    if (row == null) return null;
+    try {
+      return _decodeMarketRuntimeEnvelope(
+          mode, row.read<String>('value'));
+    } on FormatException catch (error) {
+      throw StateError('Corrupted independent ${mode.name} runtime: $error');
+    } catch (error) {
+      throw StateError('Corrupted independent ${mode.name} runtime: $error');
+    }
+  }
+
+  /// Atomically publish the next independent runtime sequence.
+  ///
+  /// [expectedSequence] is zero for a first write, otherwise it must equal
+  /// the sequence returned by the last verified read. The old value is fully
+  /// decoded and hashed inside the same SQLite transaction before it can be
+  /// replaced. This prevents a retry or a competing worker from overwriting
+  /// a newer runtime, and prevents a corrupt value from being "repaired" by
+  /// an unrelated save.
+  Future<TxStoredMarketRuntime> saveMarketRuntime(
+      TxMarketRuntime runtime, {required int expectedSequence}) async {
+    if (runtime.mode == TxMarketMode.aShare) {
+      throw ArgumentError('A股继续使用已连接现货账本');
+    }
+    if (expectedSequence < 0) {
+      throw ArgumentError.value(expectedSequence, 'expectedSequence');
+    }
+    runtime.venue.checkInvariants();
+    final mode = runtime.mode;
+    final runtimeJson = runtime.exportJson();
+    final runtimeSha = _digest(runtimeJson);
+    final nextSequence = expectedSequence + 1;
+    final body = _marketRuntimeBody(
+      mode: mode,
+      sequence: nextSequence,
+      runtimeJson: runtimeJson,
+      runtimeSha256: runtimeSha,
+    );
+    final envelope = jsonEncode(<String, dynamic>{
+      'version': 1,
+      'mode': mode.name,
+      'sequence': nextSequence,
+      'runtime': runtimeJson,
+      'runtimeSha256': runtimeSha,
+      'envelopeSha256': _digest(body),
+    });
+    await transaction(() async {
+      final row = await customSelect('''
+        SELECT value FROM storage_metadata WHERE key = ?
+      ''', variables: [Variable.withString(_marketRuntimeKey(mode))])
+          .getSingleOrNull();
+      if (row == null) {
+        if (expectedSequence != 0) {
+          throw StateError('Missing independent ${mode.name} runtime sequence');
+        }
+      } else {
+        late final TxStoredMarketRuntime current;
+        try {
+          current = _decodeMarketRuntimeEnvelope(
+              mode, row.read<String>('value'));
+        } catch (error) {
+          throw StateError(
+              'Corrupted independent ${mode.name} runtime: $error');
+        }
+        if (current.sequence != expectedSequence) {
+          throw StateError('Stale independent ${mode.name} runtime sequence');
+        }
+      }
+      await customStatement('''
+        INSERT INTO storage_metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      ''', <Object?>[_marketRuntimeKey(mode), envelope]);
+    });
+    return TxStoredMarketRuntime(
+      runtime: TxMarketRuntime.fromJson(runtimeJson),
+      sequence: nextSequence,
+      sha256: runtimeSha,
+    );
+  }
 
   /// This preference is saved in the existing schema-1 metadata table.
   /// A missing value means R27's original 32-revision behavior. It never

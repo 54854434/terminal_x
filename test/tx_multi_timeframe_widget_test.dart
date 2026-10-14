@@ -29,4 +29,30 @@ void main() {
     expect(find.textContaining('O:'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('every candle timeframe keeps a moving preview body',
+      (tester) async {
+    final source = List.generate(24, (i) => TxCandle(
+      step: i, openCents: 1000 + i, closeCents: 1001 + i,
+      highCents: 1003 + i, lowCents: 998 + i, volumeShares: i + 1));
+    await tester.pumpWidget(MaterialApp(home: Scaffold(
+      body: SingleChildScrollView(child: TxCandleChart(
+        candles: source,
+        // The source ends at the last committed step. The preview belongs
+        // to the next minute; this catches the old higher-timeframe
+        // "single moving dot" rebase at the minute boundary.
+        activeMinuteStep: 24,
+        indicativeFramePriceCents: 1024.5,
+        previewSeconds: 18,
+      )),
+    )));
+    for (final period in ['1分', '5分', '15分', '1时', '4时', '1日']) {
+      final chip = find.widgetWithText(ChoiceChip, period);
+      await tester.ensureVisible(chip);
+      await tester.tap(chip);
+      await tester.pump();
+      expect(find.text('实时预览'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    }
+  });
 }

@@ -91,6 +91,20 @@ void main() {
     }
   });
 
+  test('R45 pulse order IDs cannot collide with a future minute boundary', () {
+    final session = TxSession.freshWithAgents();
+    session.marketPulse(15);
+    // The old numeric seed made this exact path create NPC-L-79-0-B during
+    // the opening pulse and reuse it with different economics at minute 79.
+    session.step = 78;
+    expect(() => session.nextTick(), returnsNormally);
+    expect(session.engine.orders.keys,
+        contains('NPC-L-P-1-15-0-B'));
+    expect(session.engine.orders.keys,
+        contains('NPC-L-T-79-0-B'));
+    session.engine.checkInvariants();
+  });
+
   test('different market regimes appear during one 60-minute session', () {
     expect(TxSession.marketRegime(1, 0), 0);
     expect(TxSession.marketRegime(20, 0), 0);

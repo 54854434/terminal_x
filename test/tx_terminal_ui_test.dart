@@ -40,6 +40,19 @@ void main() {
     expect(sells, 1);
   });
 
+  testWidgets('connected market hero identifies the executable Rust core',
+      (tester) async {
+    final seconds = ValueNotifier<double>(0.0);
+    addTearDown(seconds.dispose);
+    await tester.pumpWidget(MaterialApp(theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxMarketHero(symbol: 'SIM-A01', step: 1,
+        committedPriceCents: 1000, seconds: seconds,
+        indicativeCents: (_) => 1000.0,
+        onBuy: () {}, onSell: () {}, coreConnected: true))));
+    expect(find.text('RUST · 已连接'), findsOneWidget);
+    expect(find.text('OFFLINE · SIM'), findsNothing);
+  });
+
   testWidgets('paused and running state strip updates only displayed time',
       (tester) async {
     final seconds = ValueNotifier<double>(0.0);
@@ -81,6 +94,32 @@ void main() {
     settling.value = false;
     await tester.pump();
     expect(find.text('正在处理当前结算，未确认时间不会前进'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('intraminute sync is distinguished from SQLite settlement',
+      (tester) async {
+    final seconds = ValueNotifier<double>(15.0);
+    final settling = ValueNotifier<bool>(true);
+    final pulse = ValueNotifier<bool>(true);
+    final phase = ValueNotifier<double>(.25);
+    addTearDown(seconds.dispose);
+    addTearDown(settling.dispose);
+    addTearDown(pulse.dispose);
+    addTearDown(phase.dispose);
+    await tester.pumpWidget(MaterialApp(theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxTerminalStatus(seconds: seconds,
+        step: 4, revision: 8, running: true, speed: 600, busy: true,
+        settling: settling, settlingPulse: pulse,
+        settlementPhase: phase))));
+    expect(find.text('正在同步真实盘口，未确认时间不会前进'), findsOneWidget);
+    expect(find.text('正在处理当前结算，未确认时间不会前进'), findsNothing);
+    pulse.value = false;
+    settling.value = false;
+    settling.value = true;
+    await tester.pump();
+    expect(find.text('正在同步真实盘口，未确认时间不会前进'), findsNothing);
+    expect(find.text('正在处理当前结算，未确认时间不会前进'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

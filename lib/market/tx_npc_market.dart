@@ -56,8 +56,8 @@ class TxNpcMarket {
 
   /// Market maker's skew reflects its OWN finite inventory, never knowledge
   /// of the player's future actions. Zero inventory cannot offer fake asks.
-  static void _placePassive(TxEngine engine, int minute, int index,
-      String symbol, int reference, int movement) {
+  static void _placePassive(TxEngine engine, int minute, String eventKey,
+      int index, String symbol, int reference, int movement) {
     final owner = engine.account('NPC_LIQ');
     final initialShares = index == 0 ? 4000 : 1400;
     final inventory = owner.sharesOf(symbol);
@@ -76,7 +76,7 @@ class TxNpcMarket {
       final qty = _min(base * bidScale, affordable);
       if (qty > 0) {
         engine.place(
-          id: 'NPC-L-$minute-$index-B', ownerId: 'NPC_LIQ',
+          id: 'NPC-L-$eventKey-$index-B', ownerId: 'NPC_LIQ',
           symbol: symbol, side: TxSide.buy, kind: TxKind.limit,
           quantity: qty, limitPriceCents: bid,
         );
@@ -86,7 +86,7 @@ class TxNpcMarket {
       final qty = _min(base * askScale, owner.availableSharesOf(symbol));
       if (qty > 0) {
         engine.place(
-          id: 'NPC-L-$minute-$index-S', ownerId: 'NPC_LIQ',
+          id: 'NPC-L-$eventKey-$index-S', ownerId: 'NPC_LIQ',
           symbol: symbol, side: TxSide.sell, kind: TxKind.limit,
           quantity: qty, limitPriceCents: ask,
         );
@@ -94,8 +94,9 @@ class TxNpcMarket {
     }
   }
 
-  static void _aggressive(TxEngine engine, int minute, int index,
-      String symbol, String agent, TxSide side, int salt, int movement) {
+  static void _aggressive(TxEngine engine, int minute, String eventKey,
+      int index, String symbol, String agent, TxSide side, int salt,
+      int movement) {
     final account = engine.account(agent);
     final opposing = engine.depth(symbol,
         side == TxSide.buy ? TxSide.sell : TxSide.buy, levels: 8);
@@ -136,7 +137,7 @@ class TxNpcMarket {
     }
     if (quantity <= 0) return;
     engine.place(
-      id: 'NPC-M-$minute-$index-$salt', ownerId: agent,
+      id: 'NPC-M-$eventKey-$index-$salt', ownerId: agent,
       symbol: symbol, side: side, kind: TxKind.limit,
       quantity: quantity, limitPriceCents: protectedPrice,
       timeInForce: TxTimeInForce.ioc,
@@ -146,23 +147,31 @@ class TxNpcMarket {
   /// Runs after funded LP quotes have been submitted. All changes are real
   /// order entries/cancels/matches, but V0.2.5 still uses one minute boundary.
   static void tradeMinute(TxEngine engine, int minute,
-      List<String> symbols, List<int> references, List<int> movements) {
+      List<String> symbols, List<int> references, List<int> movements,
+      {String? eventKey}) {
     if (!isEnabled(engine)) return; // Legacy session compatibility.
     if (symbols.length != references.length ||
         symbols.length != movements.length) {
       throw ArgumentError('Inconsistent NPC market symbol arrays');
     }
+    // A pulse and a minute boundary can have the same numeric seed (for
+    // example, game minute 0 at 15s produces 79, which used to collide with
+    // the future boundary order NPC-L-79-...).  Order IDs are immutable
+    // Rust commands, so reuse with different quantity/price is a hard error.
+    // Keep the deterministic numeric seed for pricing, but namespace the
+    // command IDs by event type and game minute.
+    final key = eventKey ?? 'T-$minute';
     for (var i = 0; i < symbols.length; i++) {
       final symbol = symbols[i];
       final move = movements[i];
-      _placePassive(engine, minute, i, symbol, references[i], move);
+      _placePassive(engine, minute, key, i, symbol, references[i], move);
       final trendSide = move >= 0 ? TxSide.buy : TxSide.sell;
-      _aggressive(engine, minute, i, symbol, 'NPC_TREND',
+      _aggressive(engine, minute, key, i, symbol, 'NPC_TREND',
           trendSide, 21, move);
-      _aggressive(engine, minute, i, symbol, 'NPC_VALUE',
+      _aggressive(engine, minute, key, i, symbol, 'NPC_VALUE',
           trendSide == TxSide.buy ? TxSide.sell : TxSide.buy, 22, move);
       final noiseSide = _mix(minute, i, 23).isEven ? TxSide.buy : TxSide.sell;
-      _aggressive(engine, minute, i, symbol, 'NPC_FLOW',
+      _aggressive(engine, minute, key, i, symbol, 'NPC_FLOW',
           noiseSide, 23, move);
     }
     // Every place/cancel validates all invariants. TxSession.nextTick also

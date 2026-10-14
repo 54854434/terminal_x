@@ -44,6 +44,12 @@ class TxRealtimeClock {
     return '${_two(hour)}:${_two(minute)}:${_two(second)}';
   }
 
+  /// Current simulated local minute used by market-session rules.
+  static int gameMinuteOfDay(int committedMinutes, int fractionalSeconds) {
+    final seconds = _secondsFromOrigin(committedMinutes, fractionalSeconds);
+    return (seconds ~/ 60) % 1440;
+  }
+
   static int _secondsFromOrigin(int committedMinutes, int fractionalSeconds) {
     if (committedMinutes < 0 || fractionalSeconds < 0 || fractionalSeconds >= 60) {
       throw ArgumentError('Invalid committed minute / fractional second');

@@ -146,6 +146,23 @@ class _TxCandleChartState extends State<TxCandleChart> {
             ? "模拟分时 · ${widget.pending ? '已保存/待保存' : '已提交'}分钟价格"
             : '模拟 K 线 · ${_period.label}',
             style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        if (preview != null) ...[
+          const SizedBox(width: 6),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+            decoration: BoxDecoration(
+              color: const Color(0xFF54CEE5).withAlpha(24),
+              borderRadius: BorderRadius.circular(7),
+              border: Border.all(
+                  color: const Color(0xFF54CEE5).withAlpha(130))),
+            child: const Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.bolt, size: 12, color: Color(0xFF54CEE5)),
+              SizedBox(width: 3),
+              Text('实时预览', style: TextStyle(
+                  fontSize: 10, color: Color(0xFF54CEE5))),
+            ]),
+          ),
+        ],
         if (widget.pending) ...[
           const SizedBox(width: 6),
           const Text('待保存', style: TextStyle(
@@ -225,12 +242,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 indicativeLowCents: projection?.lowCents,
                 indicativeOpenCents: projection?.openCents,
                 overlayLastCommitted: projection?.overlaysLastCommitted ?? false,
-                // A 1m bar is already the real committed OHLC bucket. Keep
-                // its body and wick visible while the cyan quote is painted
-                // over it; otherwise the provisional marker can make a real
-                // high/low appear to disappear at 600x or at second 0.
-                preferCommittedBody: _period == TxChartPeriod.oneMinute ||
-                    widget.activeMinuteStep != null,
+                // Every selected timeframe has a real committed aggregate
+                // underneath. Keep it visible while the translucent current
+                // bucket is painted over it; otherwise higher timeframes
+                // degrade to a single moving dot until the next 1m commit.
+                preferCommittedBody: true,
                 // Retain a dotted visual tail for the previous bucket,
                 // including 1h/4h/day rollovers; never change real OHLC.
                 previousIndicativeStep: _indicativeWick.previousGroupStep,
@@ -388,15 +404,30 @@ class _CandlePainter extends CustomPainter {
       final bottom=y(math.min(open,mark));
       final color = _directionColor(open, mark);
       final p=Paint()..color=color.withAlpha(175)..strokeWidth=1.6;
-      if (showIndicativeWick &&
-          !(overlayLastCommitted && preferCommittedBody)) {
+      if (showIndicativeWick) {
         final hi = y(indicativeHighCents!);
         final lo = y(indicativeLowCents!);
-        if (hi < top) canvas.drawLine(Offset(x, hi), Offset(x, top), p);
-        if (lo > bottom) canvas.drawLine(Offset(x, bottom), Offset(x, lo), p);
+        if (overlayLastCommitted && preferCommittedBody) {
+          // The one-minute real candle remains underneath. Draw the complete
+          // provisional envelope on top so the live mark cannot collapse to
+          // a single point and a true high/low cannot disappear at a rollover.
+          canvas.drawLine(Offset(x, hi), Offset(x, lo), p);
+        } else {
+          if (hi < top) canvas.drawLine(Offset(x, hi), Offset(x, top), p);
+          if (lo > bottom) canvas.drawLine(Offset(x, bottom), Offset(x, lo), p);
+        }
         // Filled for visual consistency, translucent for provisional status.
+        final alpha = overlayLastCommitted && preferCommittedBody ? 115 : 175;
+        final bodyPaint = Paint()..color = color.withAlpha(alpha)
+            ..style = PaintingStyle.fill;
         canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
-            math.max(2.0,bottom-top)),p);
+            math.max(3.0,bottom-top)),bodyPaint);
+        if (overlayLastCommitted && preferCommittedBody) {
+          canvas.drawRect(Rect.fromLTWH(x-body/2, top, body,
+              math.max(3.0, bottom-top)),
+            Paint()..color = const Color(0xFF54CEE5).withAlpha(210)
+              ..style = PaintingStyle.stroke..strokeWidth = 1.0);
+        }
       } else {
         canvas.drawCircle(Offset(x, y(mark)), 2.5, p);
       }

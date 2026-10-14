@@ -17,6 +17,7 @@ void main() {
     expect(quote.unfilledShares, 0);
     expect(quote.bestPriceCents, 1001);
     expect(quote.worstPriceCents, 1002);
+    expect(quote.levelsConsumed, 2);
     expect(quote.notionalCents, 100 * 1001 + 100 * 1002);
     expect(quote.vwapCents, 1001.5);
     expect(quote.slippageCentsPerShare, 0.5);
@@ -38,12 +39,26 @@ void main() {
     expect(quote.rejected, isFalse);
     expect(quote.executableShares, 1650);
     expect(quote.unfilledShares, 8350);
+    expect(quote.levelsConsumed, 5);
     final actual = session.placePlayer(symbol: 'SIM-A01',
         side: TxSide.buy, kind: TxKind.market, quantity: 10000);
     expect(actual.status, TxStatus.cancelled);
     expect(actual.filled, quote.executableShares);
     expect(session.engine.fills.fold<int>(0,
         (sum, fill) => sum + fill.notionalCents), quote.notionalCents);
+  });
+
+  test('market preview remains correct after historical orders accumulate', () {
+    final session = TxSession.fresh();
+    for (var i = 0; i < 20; i++) {
+      session.placePlayer(symbol: 'SIM-A01', side: TxSide.buy,
+          kind: TxKind.market, quantity: 1);
+    }
+    final quote = TxExecutionEstimate.estimate(session.engine,
+        ownerId: TxSession.playerId, symbol: 'SIM-A01', side: TxSide.buy,
+        quantity: 1);
+    expect(quote.rejected, isFalse);
+    expect(quote.executableShares, 1);
   });
 
   test('cash shortfall and self crossing fail closed before fake fills', () {

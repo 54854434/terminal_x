@@ -13,6 +13,7 @@ class TxExecutionEstimate {
     required this.notionalCents,
     required this.bestPriceCents,
     required this.worstPriceCents,
+    required this.levelsConsumed,
     required this.rejectReason,
   });
 
@@ -22,6 +23,7 @@ class TxExecutionEstimate {
   final int notionalCents;
   final int? bestPriceCents;
   final int? worstPriceCents;
+  final int levelsConsumed;
   final String? rejectReason;
 
   bool get rejected => rejectReason != null;
@@ -48,12 +50,10 @@ class TxExecutionEstimate {
     }
     final owner = engine.account(ownerId);
     final sellers = side == TxSide.buy;
-    final makers = engine.orders.values.where((o) =>
-        o.symbol == symbol && o.side != side && o.kind == TxKind.limit &&
-        o.timeInForce.canRest &&
-        o.remaining > 0 &&
-        (o.status == TxStatus.open ||
-            o.status == TxStatus.partiallyFilled)).toList()
+    // The engine's active-order index already excludes filled/cancelled
+    // history. A ticket preview must not become O(history) after a long game.
+    final makers = engine.activeOrders.where((o) =>
+        o.symbol == symbol && o.side != side).toList()
       ..sort((a, b) {
         final price = sellers
             ? a.limitPriceCents!.compareTo(b.limitPriceCents!)
@@ -64,6 +64,7 @@ class TxExecutionEstimate {
     var remaining = quantity;
     var notional = 0;
     var filled = 0;
+    var levelsConsumed = 0;
     int? best;
     int? worst;
     for (final maker in makers) {
@@ -81,6 +82,7 @@ class TxExecutionEstimate {
       best ??= price;
       worst = price;
       filled += take;
+      if (take > 0) levelsConsumed++;
       remaining -= take;
     }
     if (side == TxSide.buy && notional > owner.availableCashCents) {
@@ -93,6 +95,7 @@ class TxExecutionEstimate {
       requestedShares: quantity, executableShares: filled,
       notionalCents: notional, bestPriceCents: best,
       worstPriceCents: worst, rejectReason: null,
+      levelsConsumed: levelsConsumed,
       side: side,
     );
   }
@@ -100,5 +103,5 @@ class TxExecutionEstimate {
   static TxExecutionEstimate _rejected(int requested, TxSide side, String reason) =>
       TxExecutionEstimate(side: side, requestedShares: requested, executableShares: 0,
           notionalCents: 0, bestPriceCents: null,
-          worstPriceCents: null, rejectReason: reason);
+          worstPriceCents: null, levelsConsumed: 0, rejectReason: reason);
 }
