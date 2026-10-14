@@ -228,6 +228,9 @@ jobs:
       - name: Install Flutter dependencies
         run: flutter pub get
 
+      - name: Run Flutter unit and widget tests
+        run: flutter test --no-pub --reporter github
+
       - name: Compile real ARM64 Rust matching library
         shell: bash
         run: |
@@ -235,6 +238,7 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup override set 1.88.0
           rustup target add aarch64-linux-android
+          cargo test --locked --all-targets --manifest-path scripts/tx_native_core/Cargo.toml
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
           test -n "$SDK"
           MANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
@@ -354,78 +358,3 @@ jobs:
             for (const [name, group] of eligible) {
               group.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
               for (const a of group.slice(3)) {  // Always retain the latest 3 per version.
-                if (new Date(a.created_at).getTime() >= cutoff) continue;
-                if (removed >= 10) break;         // Cap deletions per batch.
-                await github.rest.actions.deleteArtifact({owner, repo, artifact_id: a.id});
-                core.info(`Removed old debug artifact ${name}, id=${a.id}`);
-                removed++;
-              }
-            }
-            await core.summary.addHeading('Preview artifact retention')
-              .addRaw(`Only debug APK artifacts: retained latest 3 per artifact name, removed ${removed} older than 14 days (max 10 per run).`)
-              .write();
-
-  cleanup-obsolete-workflow-files:
-    name: Remove disabled old workflow YAML files (best effort)
-    needs: verify-build-commit
-    if: needs.verify-build-commit.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-      actions: write
-    steps:
-      - name: Check out latest committed main
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          persist-credentials: true
-
-      - name: SHA-locked deletion of five disabled workflow files
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_INNER'
-          import hashlib
-          import subprocess
-          from pathlib import Path
-          expected = {'.github/workflows/build-apk.yml': '490734d4ad0b28c4466331fc9119d010b667f710e5ff07372b477e3ccaf2d87e', '.github/workflows/build-storage-probe.yml': '0a33030bc33e88d83e8297656957e6a8ad98d3de6954b5950c4377e983bfff30', '.github/workflows/build-v02-terminal.yml': '47f9cbaf956faaaf3f16a5f7381a058ed83c5b7469c87dc73c5c4f12374eb659', '.github/workflows/v01b-engine-validation.yml': '846b49782a92916499c38096a40842b2ca2384bfa8832fefaa0a853c87376f7', '.github/workflows/v01c-signature-audit.yml': '6c02be3ed6db9f6ed8044f36cfdb3ccbe80789c9ec7e9c02f78f6b0bd17c833d'}
-          changed = []
-          for name, sha in expected.items():
-              path = Path(name)
-              if not path.exists():
-                  continue  # Idempotent: already removed in a prior commit.
-              if not path.is_file() or path.is_symlink():
-                  raise SystemExit('Refusing unsafe workflow cleanup: ' + name)
-              if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
-                  raise SystemExit('Workflow content changed; refusing cleanup: ' + name)
-              changed.append(name)
-          if not changed:
-              print('No legacy workflow files remain; cleanup complete.')
-          else:
-              # Never stage or modify the current batch workflow itself.
-              subprocess.run(['git', 'rm', '--', *changed], check=True)
-              subprocess.run(['git','config','user.name','github-actions[bot]'],check=True)
-              subprocess.run(['git','config','user.email',
-                  '41898282+github-actions[bot]@users.noreply.github.com'],check=True)
-              subprocess.run(['git','commit','-m',
-                  'Remove five disabled legacy Terminal X workflows'],check=True)
-              # Token may lack Workflows:write even when contents:write is set.
-              # Never roll back the already tested and released source/APK.
-              outcome = subprocess.run(['git','push','origin','HEAD:main'],capture_output=True,text=True)
-              if outcome.returncode:
-                  print('WARNING: GitHub rejected workflow-file deletion; '
-                        'the signed APK and tested source are already committed.')
-                  print('To finish cleanup, delete only these five known '
-                        'disabled YAML files with the GitHub web UI.')
-                  print('Paths:', ', '.join(changed))
-                  with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:
-                      f.write('⚠️ Automatic workflow-file deletion was denied by '
-                              'GitHub permissions. Signed APK/source unaffected; '
-                              'delete the five disabled YAML files in Code via '
-                              'the GitHub website.\n')
-              else:
-                  print('Removed exactly', len(changed), 'old workflows.')
-                  with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:
-                      f.write('✅ Deleted exactly %d old disabled workflow files.\n' % len(changed))
-          PY_INNER
