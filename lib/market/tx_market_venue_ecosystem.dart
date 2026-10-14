@@ -94,8 +94,8 @@ class TxMarketVenueEcosystemSnapshot {
     final instrument = venue.profile.instruments.firstWhere(
         (item) => item.symbol == symbol,
         orElse: () => throw ArgumentError.value(symbol, 'symbol'));
-    final bids = venue.depth(symbol, TxSide.buy, levels: 5);
-    final asks = venue.depth(symbol, TxSide.sell, levels: 5);
+    final bids = venue.depth(symbol, TxSide.buy, levels: 10);
+    final asks = venue.depth(symbol, TxSide.sell, levels: 10);
     final spread = bids.isEmpty || asks.isEmpty
         ? null : asks.first.priceCents - bids.first.priceCents;
     var bookNotional = 0;

@@ -18,13 +18,16 @@ class TxMarketRiskRule {
     required this.tPlusOne,
     required this.initialMarginBps,
     required this.maintenanceMarginBps,
-      required this.shortBorrowBpsPerDay,
-      required this.fundingBpsPerDay,
-      required this.rolloverBpsPerDay,
+    required this.shortBorrowBpsPerDay,
+    this.financingBpsPerDay = 0,
+    required this.fundingBpsPerDay,
+    required this.rolloverBpsPerDay,
     required this.contractMultiplier,
     required this.lotSize,
     required this.tickSizeCents,
     required this.leverageLabel,
+    required this.maxLeverageMultiple,
+    required this.defaultLeverageMultiple,
   });
 
   final TxMarketMode mode;
@@ -34,12 +37,16 @@ class TxMarketRiskRule {
   final int initialMarginBps;
   final int maintenanceMarginBps;
   final int shortBorrowBpsPerDay;
+  /// Daily rate for the borrowed portion of a leveraged long position.
+  final int financingBpsPerDay;
   final int fundingBpsPerDay;
   final int rolloverBpsPerDay;
   final int contractMultiplier;
   final int lotSize;
   final int tickSizeCents;
   final String leverageLabel;
+  final int maxLeverageMultiple;
+  final int defaultLeverageMultiple;
 
   int notionalCents({required int priceCents, required int quantity}) {
     _validatePrice(priceCents);
@@ -104,6 +111,8 @@ class TxMarketRiskRules {
     lotSize: 1,
     tickSizeCents: 1,
     leverageLabel: '1×',
+    maxLeverageMultiple: 1,
+    defaultLeverageMultiple: 1,
   );
 
   static const usEquity = TxMarketRiskRule(
@@ -114,12 +123,15 @@ class TxMarketRiskRules {
     initialMarginBps: 5000,
     maintenanceMarginBps: 2500,
     shortBorrowBpsPerDay: 2,
+    financingBpsPerDay: 2,
     fundingBpsPerDay: 0,
     rolloverBpsPerDay: 0,
     contractMultiplier: 1,
     lotSize: 1,
     tickSizeCents: 1,
     leverageLabel: '2×',
+    maxLeverageMultiple: 2,
+    defaultLeverageMultiple: 2,
   );
 
   static const futures = TxMarketRiskRule(
@@ -136,6 +148,8 @@ class TxMarketRiskRules {
     lotSize: 1,
     tickSizeCents: 1,
     leverageLabel: '10×',
+    maxLeverageMultiple: 10,
+    defaultLeverageMultiple: 10,
   );
 
   static const crypto = TxMarketRiskRule(
@@ -152,6 +166,8 @@ class TxMarketRiskRules {
     lotSize: 1,
     tickSizeCents: 1,
     leverageLabel: '20×',
+    maxLeverageMultiple: 20,
+    defaultLeverageMultiple: 20,
   );
 
   static const forex = TxMarketRiskRule(
@@ -168,6 +184,8 @@ class TxMarketRiskRules {
     lotSize: 1,
     tickSizeCents: 1,
     leverageLabel: '约 30×',
+    maxLeverageMultiple: 30,
+    defaultLeverageMultiple: 30,
   );
 
   static const values = <TxMarketRiskRule>[
@@ -176,6 +194,18 @@ class TxMarketRiskRules {
 
   static TxMarketRiskRule forMode(TxMarketMode mode) => values.firstWhere(
       (rule) => rule.mode == mode);
+
+  static List<int> leverageOptions(TxMarketMode mode) {
+    final rule = forMode(mode);
+    if (!rule.usesMargin) return const [1];
+    return switch (mode) {
+      TxMarketMode.usEquity => const [1, 2],
+      TxMarketMode.futures => const [1, 2, 5, 10],
+      TxMarketMode.crypto => const [1, 2, 5, 10, 20],
+      TxMarketMode.forex => const [1, 2, 5, 10, 20, 30],
+      TxMarketMode.aShare => const [1],
+    };
+  }
 }
 
 /// Immutable position projection. [netQuantity] is signed: positive is long,
@@ -316,12 +346,16 @@ class TxMarketCore {
     required Map<String, int> initialMarks,
     this.gameDay = 1,
     Map<String, int>? initialLongPositions,
+    int? leverageMultiple,
   }) : cashCents = openingCashCents,
        rule = TxMarketRiskRules.forMode(profile.mode),
+       leverageMultiple = leverageMultiple ??
+           TxMarketRiskRules.forMode(profile.mode).defaultLeverageMultiple,
        _marks = Map<String, int>.from(initialMarks) {
     if (openingCashCents < 0 || gameDay < 1) {
       throw ArgumentError('Invalid opening cash or game day');
     }
+    _validateLeverageMultiple(this.leverageMultiple);
     final symbols = profile.instruments.map((item) => item.symbol).toSet();
     if (symbols.length != profile.instruments.length ||
         _marks.keys.length != symbols.length ||
@@ -350,6 +384,9 @@ class TxMarketCore {
   final TxMarketRiskRule rule;
   int cashCents;
   int gameDay;
+  /// Account-level leverage. It is persisted with the independent snapshot
+  /// and cannot be changed while a position is open.
+  int leverageMultiple;
   final Map<String, int> _marks;
   final Map<String, _MutablePosition> _positions = {};
   int _realizedPnlCents = 0;
@@ -359,16 +396,48 @@ class TxMarketCore {
     int openingCashCents = 100000000,
     int gameDay = 1,
     Map<String, int>? initialLongPositions,
+    int? leverageMultiple,
   }) => TxMarketCore(
         profile: profile,
         openingCashCents: openingCashCents,
         gameDay: gameDay,
         initialLongPositions: initialLongPositions,
+        leverageMultiple: leverageMultiple,
         initialMarks: {
           for (var i = 0; i < profile.instruments.length; i++)
             profile.instruments[i].symbol: _defaultMark(profile.mode, i),
         },
       );
+
+  int get maxLeverageMultiple => rule.maxLeverageMultiple;
+
+  /// Returns the effective rule for one instrument after the account's
+  /// selected leverage is applied.
+  TxMarketRiskRule riskRule(String symbol) => _ruleFor(symbol);
+
+  int requiredEntryCents({
+    required String symbol,
+    required int priceCents,
+    required int quantity,
+  }) {
+    final instrumentRule = _ruleFor(symbol);
+    return instrumentRule.usesMargin
+        ? instrumentRule.initialMarginCents(
+            priceCents: priceCents, quantity: quantity)
+        : instrumentRule.notionalCents(
+            priceCents: priceCents, quantity: quantity);
+  }
+
+  /// Changing leverage while exposed would retroactively alter the margin
+  /// regime. Require a flat account so the rule remains auditable.
+  void setLeverageMultiple(int value) {
+    _validateLeverageMultiple(value);
+    if (value == leverageMultiple) return;
+    if (snapshot().hasPositions) {
+      throw StateError('有持仓时不能调整杠杆，请先平仓');
+    }
+    leverageMultiple = value;
+  }
 
   int markPriceCents(String symbol) {
     _requireSymbol(symbol);
@@ -382,6 +451,58 @@ class TxMarketCore {
   TxMarketPosition position(String symbol) {
     _requireSymbol(symbol);
     return (_positions[symbol] ?? _MutablePosition(symbol: symbol)).freeze();
+  }
+
+  /// Estimates the first price at which this account would breach its
+  /// maintenance margin for [symbol]. This is a read-only price-axis aid for
+  /// the terminal: it never liquidates, moves a mark or changes cash.
+  ///
+  /// The threshold is searched against the same full-account snapshot used by
+  /// the risk gate, so it includes other open positions and the selected
+  /// leverage regime. A cash/spot position has no forced-liquidation line.
+  int? estimatedLiquidationPriceCents(String symbol) {
+    _requireSymbol(symbol);
+    final position = _positions[symbol];
+    final positionRule = _ruleFor(symbol);
+    if (position == null || position.netQuantity == 0 ||
+        !positionRule.usesMargin) return null;
+    final current = _marks[symbol]!;
+    final tick = positionRule.tickSizeCents;
+    final minPrice = tick;
+    final maxPrice = (TxEngine.maxPriceCents ~/ tick) * tick;
+    bool liquidating(int priceCents) => _snapshot(
+        cash: cashCents,
+        positions: _positions,
+        markOverrides: {symbol: priceCents}).liquidationRequired;
+    if (liquidating(current)) return current;
+    if (position.netQuantity > 0) {
+      if (!liquidating(minPrice)) return null;
+      var low = minPrice; // breached side
+      var high = current; // safe side
+      while (high - low > tick) {
+        final mid = (((low + high) ~/ 2) ~/ tick) * tick;
+        if (mid <= low || mid >= high) break;
+        if (liquidating(mid)) {
+          low = mid;
+        } else {
+          high = mid;
+        }
+      }
+      return high;
+    }
+    if (!liquidating(maxPrice)) return null;
+    var low = current; // safe side
+    var high = maxPrice; // breached side
+    while (high - low > tick) {
+      final mid = (((low + high) ~/ 2) ~/ tick) * tick;
+      if (mid <= low || mid >= high) break;
+      if (liquidating(mid)) {
+        high = mid;
+      } else {
+        low = mid;
+      }
+    }
+    return high;
   }
 
   void markToMarket({required String symbol, required int priceCents}) {
@@ -436,10 +557,16 @@ class TxMarketCore {
       }
       final notional = mark * position.netQuantity.abs() *
           positionRule.contractMultiplier;
+      var financingNotional = notional;
       var dailyBps = 0;
       var fundingSign = -1;
       if (profile.mode == TxMarketMode.usEquity && position.netQuantity < 0) {
         dailyBps = positionRule.shortBorrowBpsPerDay;
+      } else if (profile.mode == TxMarketMode.usEquity &&
+          position.netQuantity > 0 && leverageMultiple > 1) {
+        dailyBps = positionRule.financingBpsPerDay;
+        financingNotional = notional * (leverageMultiple - 1) ~/
+            leverageMultiple;
       } else if (profile.mode == TxMarketMode.crypto &&
           entry.key == 'SIM-BTCUSDT') {
         dailyBps = positionRule.fundingBpsPerDay;
@@ -450,7 +577,7 @@ class TxMarketCore {
       if (dailyBps > 0) {
         // Cash is stored in cents. Settle sub-cent fractions by truncating
         // them instead of charging an extra cent for a batched day jump.
-        final amount = notional * dailyBps * days ~/ 10000;
+        final amount = financingNotional * dailyBps * days ~/ 10000;
         final adjustment = amount * fundingSign;
         cashCents += adjustment;
         financing += adjustment;
@@ -480,6 +607,7 @@ class TxMarketCore {
         'mode': profile.mode.name,
         'cashCents': cashCents,
         'gameDay': gameDay,
+        'leverageMultiple': leverageMultiple,
         'marks': _marks,
         'realizedPnlCents': _realizedPnlCents,
         'positions': [
@@ -513,6 +641,10 @@ class TxMarketCore {
         (value) => value.name == data['mode'],
         orElse: () => throw const FormatException('Unknown market mode'));
     final profile = TxMarketProfile.of(mode);
+    final persistedLeverage = data['leverageMultiple'];
+    if (persistedLeverage != null && persistedLeverage is! int) {
+      throw const FormatException('Invalid market leverage');
+    }
     final marks = <String, int>{};
     for (final entry in (data['marks'] as Map).entries) {
       if (entry.key is! String || entry.value is! int) {
@@ -525,6 +657,7 @@ class TxMarketCore {
       openingCashCents: data['cashCents'] as int,
       initialMarks: marks,
       gameDay: data['gameDay'] as int,
+      leverageMultiple: persistedLeverage as int?,
     )
       ..cashCents = data['cashCents'] as int
       .._realizedPnlCents = data['realizedPnlCents'] as int;
@@ -573,6 +706,7 @@ class TxMarketCore {
       openingCashCents: cashCents,
       initialMarks: _marks,
       gameDay: gameDay,
+      leverageMultiple: leverageMultiple,
     )..cashCents = cashCents;
     copy._realizedPnlCents = _realizedPnlCents;
     for (final entry in _positions.entries) {
@@ -593,6 +727,7 @@ class TxMarketCore {
     }
     cashCents = fork.cashCents;
     gameDay = fork.gameDay;
+    leverageMultiple = fork.leverageMultiple;
     _marks
       ..clear()
       ..addAll(fork._marks);
@@ -956,21 +1091,39 @@ class TxMarketCore {
 
   TxMarketRiskRule _ruleFor(String symbol) {
     final instrument = _instrument(symbol);
+    final scaleMargin = (int base) {
+      if (!instrument.usesMargin) return base;
+      final scaled = (base * rule.defaultLeverageMultiple +
+              leverageMultiple - 1) ~/
+          leverageMultiple;
+      return scaled > 10000 ? 10000 : scaled;
+    };
     return TxMarketRiskRule(
       mode: rule.mode,
       usesMargin: instrument.usesMargin,
       supportsShort: instrument.supportsShort,
       tPlusOne: instrument.tPlusOne,
-      initialMarginBps: rule.initialMarginBps,
-      maintenanceMarginBps: rule.maintenanceMarginBps,
+      initialMarginBps: scaleMargin(rule.initialMarginBps),
+      maintenanceMarginBps: scaleMargin(rule.maintenanceMarginBps),
       shortBorrowBpsPerDay: rule.shortBorrowBpsPerDay,
+      financingBpsPerDay: rule.financingBpsPerDay,
       fundingBpsPerDay: rule.fundingBpsPerDay,
       rolloverBpsPerDay: rule.rolloverBpsPerDay,
       contractMultiplier: instrument.contractMultiplierUnits,
       lotSize: instrument.lotSize,
       tickSizeCents: rule.tickSizeCents,
       leverageLabel: rule.leverageLabel,
+      maxLeverageMultiple: rule.maxLeverageMultiple,
+      defaultLeverageMultiple: rule.defaultLeverageMultiple,
     );
+  }
+
+  void _validateLeverageMultiple(int value) {
+    if (value < 1 || value > rule.maxLeverageMultiple ||
+        !TxMarketRiskRules.leverageOptions(rule.mode).contains(value)) {
+      throw ArgumentError.value(value, 'leverageMultiple',
+          'Must be one of ${TxMarketRiskRules.leverageOptions(rule.mode)}');
+    }
   }
 
   static int _defaultMark(TxMarketMode mode, int index) => switch (mode) {

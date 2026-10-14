@@ -23,4 +23,39 @@ void main() {
     await tester.pump();
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('position guides paint as lines without an outlined preview box',
+      (tester) async {
+    final candles = List.generate(16, (i) => TxCandle(
+      step: i,
+      openCents: 1000 + i,
+      highCents: 1004 + i,
+      lowCents: 996 + i,
+      closeCents: 1002 + i,
+      volumeShares: i + 1,
+    ));
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body:
+      TxCandleChart(
+        candles: candles,
+        indicativePriceCents: 1022,
+        overlays: const [
+          TxChartOverlayLine(
+            valueCents: 1008,
+            label: '成本',
+            valueLabel: '¥10.08 · +¥1.00',
+            color: Colors.blue,
+            dashed: false,
+          ),
+          TxChartOverlayLine(
+            valueCents: 995,
+            label: '强平',
+            valueLabel: '¥9.95',
+            color: Colors.red,
+          ),
+        ],
+      ),
+    )));
+    expect(find.byType(TxCandleChart), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }

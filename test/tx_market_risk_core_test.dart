@@ -92,6 +92,24 @@ void main() {
     expect(core.snapshot().realizedPnlCents, -100000);
   });
 
+  test('liquidation guide is read-only and follows the selected position', () {
+    final core = TxMarketCore(
+      profile: TxMarketProfile.crypto,
+      openingCashCents: 100000,
+      initialMarks: {'SIM-BTCUSDT': 1000000, 'SIM-ETHUSDT': 300000},
+    );
+    core.applyExecution(
+      symbol: 'SIM-BTCUSDT', side: TxSide.buy, quantity: 1,
+      priceCents: 1000000, gameDay: 1, minuteOfDay: 0);
+    final before = core.snapshot();
+    final guide = core.estimatedLiquidationPriceCents('SIM-BTCUSDT');
+    expect(guide, isNotNull);
+    expect(guide!, lessThan(1000000));
+    expect(core.snapshot().cashCents, before.cashCents);
+    expect(core.position('SIM-BTCUSDT').netQuantity, 1);
+    expect(core.estimatedLiquidationPriceCents('SIM-ETHUSDT'), isNull);
+  });
+
   test('preview is read-only and weighted average stays deterministic', () {
     final core = TxMarketCore.seeded(profile: TxMarketProfile.forex);
     final before = core.snapshot();
@@ -144,6 +162,42 @@ void main() {
     expect(settlement.financingPnlCents, -40);
     expect(core.cashCents, 999960);
     expect(core.gameDay, 3);
+  });
+
+  test('selected leverage scales margin and persists in the account snapshot', () {
+    final core = TxMarketCore.seeded(
+      profile: TxMarketProfile.usEquity,
+      leverageMultiple: 1,
+    );
+    expect(core.riskRule('SIM-US01').initialMarginBps, 10000);
+    core.setLeverageMultiple(2);
+    expect(core.riskRule('SIM-US01').initialMarginBps, 5000);
+    final restored = TxMarketCore.fromJson(core.exportJson());
+    expect(restored.leverageMultiple, 2);
+    expect(restored.maxLeverageMultiple, 2);
+  });
+
+  test('leveraged US long charges financing only on the borrowed portion', () {
+    final core = TxMarketCore(
+      profile: TxMarketProfile.usEquity,
+      openingCashCents: 1000000,
+      initialMarks: {'SIM-US01': 10000, 'SIM-US02': 25000},
+      leverageMultiple: 2,
+    );
+    core.applyExecution(
+      symbol: 'SIM-US01', side: TxSide.buy, quantity: 10,
+      priceCents: 10000, gameDay: 1, minuteOfDay: 1320);
+    final settlement = core.settleDay(nextGameDay: 3);
+    expect(settlement.financingPnlCents, -20);
+    expect(core.cashCents, 999980);
+  });
+
+  test('leverage cannot change while the account is exposed', () {
+    final core = TxMarketCore.seeded(profile: TxMarketProfile.futures);
+    core.applyExecution(
+      symbol: 'SIM-FUT01', side: TxSide.buy, quantity: 1,
+      priceCents: 30000, gameDay: 1, minuteOfDay: 600);
+    expect(() => core.setLeverageMultiple(1), throwsStateError);
   });
 
   test('futures settlement realizes mark-to-market at the current mark', () {

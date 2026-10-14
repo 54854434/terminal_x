@@ -91,8 +91,8 @@ class TxMarketEcosystemSnapshot {
     final symbolIndex = TxSession.symbols.indexOf(symbol);
     if (symbolIndex < 0) throw ArgumentError.value(symbol, 'symbol');
 
-    final bids = session.engine.depth(symbol, TxSide.buy, levels: 5);
-    final asks = session.engine.depth(symbol, TxSide.sell, levels: 5);
+    final bids = session.engine.depth(symbol, TxSide.buy, levels: 10);
+    final asks = session.engine.depth(symbol, TxSide.sell, levels: 10);
     final insight = TxOrderBookInsight.fromLevels(bids: bids, asks: asks);
     final player = session.engine.account(TxSession.playerId);
     final buyQuantity = asks.isEmpty || player.availableCashCents <= 0

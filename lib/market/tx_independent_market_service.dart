@@ -34,10 +34,27 @@ class TxIndependentMarketState {
   TxMarketRuntime runtime;
   int sequence;
   final Map<String, List<TxCandle>> _candles = {};
+  // Venue fills are append-only. Keep the cursor so a CAS save can extend the
+  // display-only OHLC cache instead of scanning the complete fill journal.
+  int _candleFillCursor = 0;
+
+  // Process-local quote telemetry. It is intentionally not persisted with
+  // the economic snapshot: after a restart the first open must rebuild the
+  // visible ten-level book instead of trusting an old refresh boundary.
+  int _quoteRefreshCount = 0;
+  int? _lastQuoteRefreshStep;
 
   TxMarketCore get player => runtime.venue.account(playerId);
 
   TxMarketRiskSnapshot get playerRisk => player.snapshot();
+
+  int get playerLeverageMultiple => player.leverageMultiple;
+
+  int get quoteRefreshCount => _quoteRefreshCount;
+
+  int? get lastQuoteRefreshStep => _lastQuoteRefreshStep;
+
+  TxMarketVenueSettlement? lastSettlement;
 
   TxMarketSessionStatus get sessionStatus => profile.schedule.status(
         gameDay: runtime.gameDay,
@@ -52,8 +69,27 @@ class TxIndependentMarketState {
   void _rebuildCandles() {
     _candles.clear();
     for (final instrument in profile.instruments) {
+      _candles[instrument.symbol] = <TxCandle>[];
+    }
+    final fills = runtime.venue.fills;
+    for (final fill in fills) {
+      // Normal venue history is already in execution order. If an imported
+      // legacy snapshot violates that ordering, fall back to the sorted
+      // rebuild below rather than presenting a silently misordered chart.
+      if (!_appendFill(fill)) {
+        _rebuildCandlesSorted(fills);
+        _candleFillCursor = fills.length;
+        return;
+      }
+    }
+    _candleFillCursor = fills.length;
+  }
+
+  void _rebuildCandlesSorted(List<TxMarketVenueFill> fills) {
+    _candles.clear();
+    for (final instrument in profile.instruments) {
       final byStep = <int, _CandleDraft>{};
-      for (final fill in runtime.venue.fills.where(
+      for (final fill in fills.where(
           (item) => item.symbol == instrument.symbol)) {
         final step = (fill.gameDay - 1) * 1440 + fill.minuteOfDay;
         final draft = byStep.putIfAbsent(
@@ -80,6 +116,64 @@ class TxIndependentMarketState {
           : values.sublist(values.length - maxCandleCount);
     }
   }
+
+  bool _appendFill(TxMarketVenueFill fill) {
+    final values = _candles[fill.symbol];
+    if (values == null) return false;
+    final step = (fill.gameDay - 1) * 1440 + fill.minuteOfDay;
+    if (values.isEmpty) {
+      values.add(TxCandle(
+        step: step,
+        openCents: fill.priceCents,
+        highCents: fill.priceCents,
+        lowCents: fill.priceCents,
+        closeCents: fill.priceCents,
+        volumeShares: fill.quantity,
+      ));
+    } else {
+      final previous = values.last;
+      if (step == previous.step) {
+        values[values.length - 1] = TxCandle(
+          step: step,
+          openCents: previous.openCents,
+          highCents: math.max(previous.highCents, fill.priceCents),
+          lowCents: math.min(previous.lowCents, fill.priceCents),
+          closeCents: fill.priceCents,
+          volumeShares: previous.volumeShares + fill.quantity,
+        );
+      } else if (step > previous.step) {
+        values.add(TxCandle(
+          step: step,
+          openCents: fill.priceCents,
+          highCents: fill.priceCents,
+          lowCents: fill.priceCents,
+          closeCents: fill.priceCents,
+          volumeShares: fill.quantity,
+        ));
+      } else {
+        return false;
+      }
+    }
+    if (values.length > maxCandleCount) {
+      values.removeRange(0, values.length - maxCandleCount);
+    }
+    return true;
+  }
+
+  void _updateCandles() {
+    final fills = runtime.venue.fills;
+    if (_candleFillCursor > fills.length) {
+      _rebuildCandles();
+      return;
+    }
+    for (var index = _candleFillCursor; index < fills.length; index++) {
+      if (!_appendFill(fills[index])) {
+        _rebuildCandles();
+        return;
+      }
+    }
+    _candleFillCursor = fills.length;
+  }
 }
 
 /// Serialized adapter for all independent market modes.
@@ -89,6 +183,14 @@ class TxIndependentMarketState {
 /// racing one another when the user changes tabs or returns from background.
 class TxIndependentMarketService {
   TxIndependentMarketService(this.database);
+
+  static const prewarmCandleCount = 8;
+  static const quoteRefreshIntervalMinutes = 5;
+  static const _visibleQuoteLevels = 10;
+  // Keep a small real queue behind the ten displayed levels so normal FLOW
+  // and smart-trader executions do not make the visible book blink sparse
+  // between scheduled maker refreshes. The UI still exposes only ten levels.
+  static const _quoteReserveLevels = 10;
 
   final TxSqliteStore database;
   final Map<TxMarketMode, TxIndependentMarketState> _states = {};
@@ -112,39 +214,53 @@ class TxIndependentMarketService {
     required TxMarketMode mode,
     required int gameDay,
     required int minuteOfDay,
-  }) => _enqueue(() async {
-        _validateMode(mode);
-        final existing = _states[mode];
-        if (existing != null) {
-          await _syncUnlocked(existing, gameDay, minuteOfDay);
-          return existing;
-        }
+  }) => _enqueue(() => _openUnlocked(
+        mode: mode, gameDay: gameDay, minuteOfDay: minuteOfDay,
+        prewarmMinutes: prewarmCandleCount));
 
-        final stored = await database.readMarketRuntime(mode);
-        late final TxIndependentMarketState next;
-        if (stored == null) {
-          next = TxIndependentMarketState._(
-            mode: mode,
-            runtime: _freshRuntime(mode, gameDay, minuteOfDay),
-            sequence: 0,
-          );
-          _states[mode] = next;
-          try {
-            await _syncUnlocked(next, gameDay, minuteOfDay, force: true);
-          } catch (_) {
-            _states.remove(mode);
-            rethrow;
-          }
-        } else {
-          next = TxIndependentMarketState._(
-            mode: mode,
-            runtime: stored.runtime,
-            sequence: stored.sequence,
-          );
-          _states[mode] = next;
-          await _syncUnlocked(next, gameDay, minuteOfDay);
+  /// Keep every opened independent venue on the same deterministic game clock.
+  /// Opening one tab must not freeze another board that is already warm: each
+  /// venue still applies its own session schedule and therefore only open
+  /// boards create quotes, fills and candles. [openMissing] remains available
+  /// to deterministic callers that explicitly want all modes materialized;
+  /// the Flutter cold-start path uses the lazy form.
+  Future<Map<TxMarketMode, TxIndependentMarketState>> syncAll({
+    required int gameDay,
+    required int minuteOfDay,
+    bool openMissing = true,
+  }) => _enqueue(() async {
+        _validateClock(gameDay, minuteOfDay);
+        final states = <TxMarketMode, TxIndependentMarketState>{};
+        final modes = openMissing
+            ? TxMarketMode.values.where((mode) => mode != TxMarketMode.aShare)
+            : _states.keys.where((mode) => mode != TxMarketMode.aShare).toList();
+        for (final mode in modes) {
+          states[mode] = await _openUnlocked(
+              mode: mode, gameDay: gameDay, minuteOfDay: minuteOfDay);
         }
-        return next;
+        return states;
+      });
+
+  /// Open at most one missing board per queued operation. The UI uses this as
+  /// a low-priority prewarm after the first frame, yielding between markets so
+  /// a player tap can enter the queue without waiting behind four cold opens.
+  /// Once a board exists, normal clock sync continues to advance it; no
+  /// historical fills are discarded and no chart is rebuilt for other modes.
+  Future<TxMarketMode?> prewarmNext({
+    required int gameDay,
+    required int minuteOfDay,
+  }) => _enqueue(() async {
+        _validateClock(gameDay, minuteOfDay);
+        for (final mode in TxMarketMode.values) {
+          if (mode == TxMarketMode.aShare || _states.containsKey(mode)) {
+            continue;
+          }
+          await _openUnlocked(
+              mode: mode, gameDay: gameDay, minuteOfDay: minuteOfDay,
+              prewarmMinutes: prewarmCandleCount);
+          return mode;
+        }
+        return null;
       });
 
   /// Move an already opened market to the visible game clock. The independent
@@ -158,6 +274,39 @@ class TxIndependentMarketService {
         final current = _requireState(mode);
         await _syncUnlocked(current, gameDay, minuteOfDay);
         return current;
+      });
+
+  /// Skip only the empty part of the selected closed session. The runtime is
+  /// left at the last closed minute before the next opening boundary; the
+  /// following normal minute sync is still responsible for real quotes and
+  /// prints. Player GTC orders remain, while market-maker orders are withdrawn.
+  Future<TxIndependentMarketState> fastForwardClosed({
+    required TxMarketMode mode,
+  }) => _enqueue(() async {
+        final state = _requireState(mode);
+        if (state.sessionStatus.isOpen) return state;
+        final initial = (state.runtime.gameDay - 1) * 1440 +
+            state.runtime.minuteOfDay;
+        var nextOpen = initial + 1;
+        const maxSearchMinutes = 10080;
+        while (true) {
+          final day = nextOpen ~/ 1440 + 1;
+          final minute = nextOpen % 1440;
+          if (state.profile.schedule.status(
+              gameDay: day, minuteOfDay: minute).isOpen) break;
+          nextOpen++;
+          if (nextOpen - initial > maxSearchMinutes) {
+            throw StateError('No next market opening found within one game week');
+          }
+        }
+        final target = nextOpen - 1;
+        if (target <= initial) return state;
+        await _syncUnlocked(
+          state,
+          target ~/ 1440 + 1,
+          target % 1440,
+        );
+        return state;
       });
 
   Future<TxMarketVenueOrder> place({
@@ -191,6 +340,24 @@ class TxIndependentMarketService {
         );
         await _save(state);
         return order;
+      });
+
+  /// Change only the player's margin regime. The core rejects changes while
+  /// exposed; active player orders are also blocked so a pending order cannot
+  /// be executed under a different leverage after the UI selection.
+  Future<int> setPlayerLeverage({
+    required TxMarketMode mode,
+    required int multiple,
+  }) => _enqueue(() async {
+        final state = _requireState(mode);
+        final active = state.runtime.venue.activeOrders.where(
+            (order) => order.ownerId == TxIndependentMarketState.playerId);
+        if (active.isNotEmpty) {
+          throw StateError('请先撤销未成交委托，再调整杠杆');
+        }
+        state.player.setLeverageMultiple(multiple);
+        await _save(state);
+        return state.player.leverageMultiple;
       });
 
   Future<TxMarketVenueOrder> cancel({
@@ -242,33 +409,154 @@ class TxIndependentMarketService {
 
   Future<void> waitForIdle() => _tail;
 
+  Future<TxIndependentMarketState> _openUnlocked({
+    required TxMarketMode mode,
+    required int gameDay,
+    required int minuteOfDay,
+    int prewarmMinutes = 0,
+  }) async {
+    _validateMode(mode);
+    final existing = _states[mode];
+    if (existing != null) {
+      await _syncUnlocked(existing, gameDay, minuteOfDay);
+      return existing;
+    }
+
+    final stored = await database.readMarketRuntime(mode);
+    late final TxIndependentMarketState next;
+    if (stored == null) {
+      final targetStep = (gameDay - 1) * 1440 + minuteOfDay;
+      final warmupSteps = prewarmMinutes < 1
+          ? 0
+          : math.min(prewarmMinutes - 1, targetStep);
+      final startStep = targetStep - warmupSteps;
+      next = TxIndependentMarketState._(
+        mode: mode,
+        runtime: _freshRuntime(
+          mode,
+          startStep ~/ 1440 + 1,
+          startStep % 1440,
+        ),
+        sequence: 0,
+      );
+      _states[mode] = next;
+      try {
+        if (warmupSteps == 0) {
+          await _syncUnlocked(next, gameDay, minuteOfDay,
+              force: true, persist: false);
+        } else {
+          // Build a fixed-size first-look window in memory. Only the final
+          // runtime is written, so initial history is useful without doing a
+          // SQLite CAS and full JSON envelope for every warmup minute.
+          await _syncUnlocked(
+            next,
+            startStep ~/ 1440 + 1,
+            startStep % 1440,
+            force: true,
+            persist: false,
+          );
+          for (var step = startStep + 1;
+              step <= targetStep;
+              step++) {
+            await _syncUnlocked(
+              next,
+              step ~/ 1440 + 1,
+              step % 1440,
+              persist: false,
+            );
+          }
+        }
+        // Prewarm flow intentionally consumes real quotes to build the first
+        // look-back window. Rebuild the inside book once at the visible target
+        // minute so the first player preview starts from a fresh, finite BBO
+        // without replaying another minute of FLOW or smart traders.
+        if (next.sessionStatus.isOpen) {
+          _refreshQuotes(next, gameDay, minuteOfDay);
+          next._lastQuoteRefreshStep = targetStep;
+          next._quoteRefreshCount++;
+        }
+        await _save(next);
+      } catch (_) {
+        _states.remove(mode);
+        rethrow;
+      }
+    } else {
+      next = TxIndependentMarketState._(
+        mode: mode,
+        runtime: stored.runtime,
+        sequence: stored.sequence,
+      );
+      _states[mode] = next;
+      await _syncUnlocked(next, gameDay, minuteOfDay);
+    }
+    return next;
+  }
+
   Future<void> _syncUnlocked(TxIndependentMarketState state, int gameDay,
-      int minuteOfDay, {bool force = false}) async {
+      int minuteOfDay, {bool force = false, bool persist = true}) async {
     _validateClock(gameDay, minuteOfDay);
     final runtime = state.runtime;
     final moved = gameDay > runtime.gameDay ||
         (gameDay == runtime.gameDay && minuteOfDay > runtime.minuteOfDay);
-    if (!moved && !force) return;
-    if (moved) {
-      runtime.advanceClock(
-          nextGameDay: gameDay, nextMinuteOfDay: minuteOfDay);
-    }
+    final beforeRuntime = gameDay < runtime.gameDay ||
+        (gameDay == runtime.gameDay && minuteOfDay < runtime.minuteOfDay);
     final status = state.profile.schedule.status(
         gameDay: gameDay, minuteOfDay: minuteOfDay);
+    final participantsAdded = _ensureParticipantAccounts(state);
+    if (beforeRuntime) {
+      // A stale UI reopen may carry an older clock. Account migration is still
+      // safe to persist, but never replay that historical minute's quotes or
+      // participant orders just because the visible book needs more levels.
+      if (participantsAdded && persist) await _save(state);
+      return;
+    }
+    final currentStep = (gameDay - 1) * 1440 + minuteOfDay;
+    final quoteRefreshDue = status.isOpen &&
+        (state._lastQuoteRefreshStep == null ||
+            currentStep < state._lastQuoteRefreshStep! ||
+            currentStep - state._lastQuoteRefreshStep! >=
+                quoteRefreshIntervalMinutes);
+    if (!moved && !force && !participantsAdded && !quoteRefreshDue) return;
+    // A scheduled quote repair at the same clock position must not replay
+    // FLOW or smart traders. Only a real minute advance (or the explicit
+    // first warmup force) may create that minute's prints. Temporary depth
+    // thinning is allowed between scheduled refreshes so normal fills do not
+    // cause a cancel/repost storm every frame.
+    final shouldEmitMinute = moved || force;
+    if (moved) {
+      final transition = runtime.advanceClock(
+          nextGameDay: gameDay, nextMinuteOfDay: minuteOfDay);
+      state.lastSettlement = transition.settlement;
+    }
     if (status.isOpen) {
       for (var index = 0; index < state.profile.instruments.length; index++) {
         final instrument = state.profile.instruments[index];
         final price = _markFor(
             state.mode, index, instrument.symbol, gameDay, minuteOfDay,
             runtime.venue.account(TxIndependentMarketState.playerId));
-        runtime.markToMarket(symbol: instrument.symbol, priceCents: price);
+        // The enclosing CAS save audits the complete venue once. Avoid an
+        // O(history) invariant pass for every symbol in the same minute.
+        runtime.markToMarket(
+            symbol: instrument.symbol, priceCents: price,
+            validateAfter: false);
       }
-      _refreshQuotes(state, gameDay, minuteOfDay);
-      _emitSyntheticFlow(state, gameDay, minuteOfDay);
+      if (quoteRefreshDue) {
+        _refreshQuotes(state, gameDay, minuteOfDay);
+        state._lastQuoteRefreshStep = currentStep;
+        state._quoteRefreshCount++;
+      }
+      if (shouldEmitMinute) {
+        _emitSyntheticFlow(state, gameDay, minuteOfDay);
+        _emitSmartTraderFlow(state, gameDay, minuteOfDay);
+      }
     } else {
       _cancelMarketMakerOrders(state);
+      // A closed session withdraws displayed liquidity. Force a fresh quote
+      // cycle at the next open rather than carrying a stale cadence boundary
+      // across the break.
+      state._lastQuoteRefreshStep = null;
     }
-    await _save(state);
+    if (persist) await _save(state);
   }
 
   Future<void> _save(TxIndependentMarketState state) async {
@@ -276,7 +564,7 @@ class TxIndependentMarketService {
         expectedSequence: state.sequence);
     state.sequence = saved.sequence;
     state.runtime = saved.runtime;
-    state._rebuildCandles();
+    state._updateCandles();
   }
 
   void _refreshQuotes(TxIndependentMarketState state, int gameDay,
@@ -286,36 +574,67 @@ class TxIndependentMarketService {
     for (var index = 0; index < state.profile.instruments.length; index++) {
       final instrument = state.profile.instruments[index];
       final mark = state.player.markPriceCents(instrument.symbol);
-      final spread = math.max(rule.tickSizeCents * 2, mark ~/ 1000);
-      final quantity = switch (state.mode) {
-        TxMarketMode.futures => 2,
-        TxMarketMode.forex => 1,
-        TxMarketMode.crypto => 1,
-        _ => 10,
-      };
-      for (var level = 0; level < 3; level++) {
+      // The old fixed 10bp half-spread made a one-unit taker order look like
+      // a price shock even when it consumed only the best level. Keep a
+      // market-specific, finite spread while aligning it to the instrument
+      // tick size.
+      final spreadBps = _quoteSpreadBps(state.mode);
+      final spread = math.max(
+          rule.tickSizeCents * 2,
+          (mark * spreadBps + 9999) ~/ 10000);
+      final quantity = _makerQuoteBaseQuantity(state.mode);
+      for (var level = 0;
+          level < _visibleQuoteLevels + _quoteReserveLevels;
+          level++) {
         final distance = spread * (level + 1);
         final bid = math.max(rule.tickSizeCents, mark - distance);
         final ask = mark + distance;
+        // Both funded liquidity providers quote both sides. The first maker
+        // owns the inside level, so the autonomous buy+sell pair can recycle
+        // inventory through a real spread without exhausting one finite LP.
         state.runtime.place(
-          id: _nextOrderId(state, 'MM-B'),
+          id: _nextOrderId(state, 'MM-A-BID'),
+          ownerId: 'MM-A',
+          symbol: instrument.symbol,
+          side: TxSide.buy,
+          kind: TxKind.limit,
+          quantity: quantity + (level % 4),
+          limitPriceCents: bid,
+          timeInForce: TxTimeInForce.gtc,
+          validateAfter: false,
+        );
+        state.runtime.place(
+          id: _nextOrderId(state, 'MM-B-BID'),
           ownerId: 'MM-B',
           symbol: instrument.symbol,
           side: TxSide.buy,
           kind: TxKind.limit,
-          quantity: quantity + level,
+          quantity: quantity + (level % 4),
           limitPriceCents: bid,
           timeInForce: TxTimeInForce.gtc,
+          validateAfter: false,
         );
         state.runtime.place(
-          id: _nextOrderId(state, 'MM-A'),
+          id: _nextOrderId(state, 'MM-A-ASK'),
           ownerId: 'MM-A',
           symbol: instrument.symbol,
           side: TxSide.sell,
           kind: TxKind.limit,
-          quantity: quantity + level,
+          quantity: quantity + (level % 4),
           limitPriceCents: ask,
           timeInForce: TxTimeInForce.gtc,
+          validateAfter: false,
+        );
+        state.runtime.place(
+          id: _nextOrderId(state, 'MM-B-ASK'),
+          ownerId: 'MM-B',
+          symbol: instrument.symbol,
+          side: TxSide.sell,
+          kind: TxKind.limit,
+          quantity: quantity + (level % 4),
+          limitPriceCents: ask,
+          timeInForce: TxTimeInForce.gtc,
+          validateAfter: false,
         );
       }
     }
@@ -324,20 +643,114 @@ class TxIndependentMarketService {
   void _emitSyntheticFlow(TxIndependentMarketState state, int gameDay,
       int minuteOfDay) {
     final timeKey = (gameDay - 1) * 1440 + minuteOfDay;
-    if (state.runtime.venue.fills.isNotEmpty && timeKey % 3 != 0) return;
-    final index = timeKey.abs() % state.profile.instruments.length;
-    final instrument = state.profile.instruments[index];
-    final side = timeKey.isEven ? TxSide.buy : TxSide.sell;
-    state.runtime.place(
-      id: _nextOrderId(state, 'FLOW'),
-      ownerId: 'FLOW',
-      symbol: instrument.symbol,
-      side: side,
-      kind: TxKind.market,
-      quantity: 1,
-      limitPriceCents: null,
-      timeInForce: TxTimeInForce.gtc,
-    );
+    final quantity = _flowOrderQuantity(state.mode);
+    // Every open minute gets an auditable print for every instrument. The
+    // prior `timeKey % 3` gate made non-A boards appear frozen after the first
+    // few minutes, and rotating one symbol left the other symbol with no
+    // volume. The two opposite market orders below cross the funded inside
+    // quotes and net the FLOW account back to its starting inventory.
+    for (final instrument in state.profile.instruments) {
+      final buy = () => state.runtime.place(
+        id: _nextOrderId(state, 'FLOW-BUY'),
+        ownerId: 'FLOW',
+        symbol: instrument.symbol,
+        side: TxSide.buy,
+        kind: TxKind.market,
+        quantity: quantity,
+        limitPriceCents: null,
+        timeInForce: TxTimeInForce.gtc,
+        validateAfter: false,
+      );
+      final sell = () => state.runtime.place(
+        id: _nextOrderId(state, 'FLOW-SELL'),
+        ownerId: 'FLOW',
+        symbol: instrument.symbol,
+        side: TxSide.sell,
+        kind: TxKind.market,
+        quantity: quantity,
+        limitPriceCents: null,
+        timeInForce: TxTimeInForce.gtc,
+        validateAfter: false,
+      );
+      if (timeKey.isEven) {
+        buy();
+        sell();
+      } else {
+        sell();
+        buy();
+      }
+    }
+  }
+
+  /// Deterministic agent intents add prints and consume real maker depth. The
+  /// agents are funded accounts, not a hidden fill source: a rejected order
+  /// stays rejected and every successful print is stored by the venue.
+  void _emitSmartTraderFlow(TxIndependentMarketState state, int gameDay,
+      int minuteOfDay) {
+    final timeKey = (gameDay - 1) * 1440 + minuteOfDay;
+    const agents = <String>[
+      'SMART-TREND',
+      'SMART-MEAN',
+      'SMART-MOMENTUM',
+      'SMART-SCALPER',
+    ];
+    for (var index = 0; index < state.profile.instruments.length; index++) {
+      final instrument = state.profile.instruments[index];
+      final wave = ((gameDay * 97 + minuteOfDay * 7 + index * 31) % 41) - 20;
+      final intents = <TxSide>[
+        wave >= 0 ? TxSide.buy : TxSide.sell,
+        wave >= 0 ? TxSide.sell : TxSide.buy,
+        ((timeKey + index) % 6) < 3 ? TxSide.buy : TxSide.sell,
+        ((timeKey + index) % 2) == 0 ? TxSide.buy : TxSide.sell,
+      ];
+      final baseQuantity = _smartTraderBaseQuantity(state.mode);
+      final signalStrength = math.min(2, wave.abs() ~/ 8);
+      for (var agentIndex = 0; agentIndex < agents.length; agentIndex++) {
+        final ownerId = agents[agentIndex];
+        if (!state.runtime.venue.accounts.containsKey(ownerId)) continue;
+        final shouldTrade = switch (ownerId) {
+          'SMART-TREND' => signalStrength > 0,
+          'SMART-MEAN' => true,
+          'SMART-MOMENTUM' => (timeKey + index) % 4 != 3,
+          'SMART-SCALPER' => true,
+          _ => true,
+        };
+        if (!shouldTrade) continue;
+        final quantity = switch (ownerId) {
+          'SMART-TREND' => baseQuantity + signalStrength,
+          'SMART-MEAN' => baseQuantity + (signalStrength == 0 ? 1 : 0),
+          'SMART-MOMENTUM' => baseQuantity +
+              (((timeKey + index) % 4 == 0) ? 1 : 0),
+          'SMART-SCALPER' => math.max(1, baseQuantity ~/ 2),
+          _ => baseQuantity,
+        };
+        var side = intents[agentIndex];
+        final core = state.runtime.venue.account(ownerId);
+        final position = core.position(instrument.symbol);
+        if (side == TxSide.sell && !instrument.supportsShort &&
+            position.availableToClose < quantity) {
+          side = TxSide.buy;
+        }
+        try {
+          state.runtime.place(
+            id: _nextOrderId(state, '$ownerId-${side.name}'),
+            ownerId: ownerId,
+            symbol: instrument.symbol,
+            side: side,
+            kind: TxKind.market,
+            quantity: quantity,
+            limitPriceCents: null,
+            timeInForce: TxTimeInForce.gtc,
+            validateAfter: false,
+          );
+        } on StateError {
+          // A finite agent can run out of margin or inventory. That is a
+          // visible market outcome, not permission to mint a fill.
+        } on ArgumentError {
+          // Keep one malformed/unsupported intent from stopping all boards.
+        }
+      }
+    }
   }
 
   void _cancelMarketMakerOrders(TxIndependentMarketState state) {
@@ -345,8 +758,42 @@ class TxIndependentMarketService {
         .where((order) => order.ownerId == 'MM-A' || order.ownerId == 'MM-B')
         .toList();
     for (final order in active) {
-      state.runtime.cancel(order.id, ownerId: order.ownerId);
+      state.runtime.cancel(order.id, ownerId: order.ownerId,
+          validateAfter: false);
     }
+  }
+
+  bool _ensureParticipantAccounts(TxIndependentMarketState state) {
+    final profile = state.profile;
+    final inventory = {
+      for (final instrument in profile.instruments)
+        instrument.symbol: _makerInventory(state.mode),
+    };
+    const ids = <String>[
+      'MM-A',
+      'MM-B',
+      'FLOW',
+      'SMART-TREND',
+      'SMART-MEAN',
+      'SMART-MOMENTUM',
+      'SMART-SCALPER',
+    ];
+    var added = false;
+    final marks = <String, int>{
+      for (final instrument in profile.instruments)
+        instrument.symbol: state.player.markPriceCents(instrument.symbol),
+    };
+    for (final id in ids) {
+      final account = TxMarketCore(
+        profile: profile,
+        openingCashCents: _participantOpeningCashCents,
+        initialMarks: marks,
+        gameDay: state.runtime.gameDay,
+        initialLongPositions: inventory,
+      );
+      added = state.runtime.venue.ensureAccount(id, account) || added;
+    }
+    return added;
   }
 
   int _markFor(TxMarketMode mode, int index, String symbol, int gameDay,
@@ -390,13 +837,7 @@ class TxIndependentMarketService {
   static TxMarketRuntime _freshRuntime(
       TxMarketMode mode, int gameDay, int minuteOfDay) {
     final profile = TxMarketProfile.of(mode);
-    final makerInventory = switch (mode) {
-      TxMarketMode.usEquity => 1000,
-      TxMarketMode.futures => 10,
-      TxMarketMode.crypto => 10,
-      TxMarketMode.forex => 5,
-      TxMarketMode.aShare => 0,
-    };
+    final makerInventory = _makerInventory(mode);
     final inventory = {
       for (final instrument in profile.instruments)
         instrument.symbol: makerInventory,
@@ -406,12 +847,31 @@ class TxIndependentMarketService {
           TxMarketCore.seeded(profile: profile),
       'MM-A': TxMarketCore.seeded(
           profile: profile,
-          openingCashCents: 500000000,
+          openingCashCents: _participantOpeningCashCents,
           initialLongPositions: inventory),
-      'MM-B': TxMarketCore.seeded(profile: profile, openingCashCents: 500000000),
+      'MM-B': TxMarketCore.seeded(
+          profile: profile,
+          openingCashCents: _participantOpeningCashCents,
+          initialLongPositions: inventory),
       'FLOW': TxMarketCore.seeded(
           profile: profile,
-          openingCashCents: 500000000,
+          openingCashCents: _participantOpeningCashCents,
+          initialLongPositions: inventory),
+      'SMART-TREND': TxMarketCore.seeded(
+          profile: profile,
+          openingCashCents: _participantOpeningCashCents,
+          initialLongPositions: inventory),
+      'SMART-MEAN': TxMarketCore.seeded(
+          profile: profile,
+          openingCashCents: _participantOpeningCashCents,
+          initialLongPositions: inventory),
+      'SMART-MOMENTUM': TxMarketCore.seeded(
+          profile: profile,
+          openingCashCents: _participantOpeningCashCents,
+          initialLongPositions: inventory),
+      'SMART-SCALPER': TxMarketCore.seeded(
+          profile: profile,
+          openingCashCents: _participantOpeningCashCents,
           initialLongPositions: inventory),
     };
     return TxMarketRuntime(
@@ -420,6 +880,53 @@ class TxIndependentMarketService {
       minuteOfDay: minuteOfDay,
     );
   }
+
+  static const _participantOpeningCashCents = 3000000000;
+
+  static int _makerInventory(TxMarketMode mode) => switch (mode) {
+    TxMarketMode.usEquity => 2400,
+    TxMarketMode.futures => 240,
+    TxMarketMode.crypto => 240,
+    // One standard lot is a large notional in this model. Keep the finite
+    // seed inventory below the initial margin budget so the makers start
+    // healthy and can actually provide two-sided FX liquidity.
+    TxMarketMode.forex => 24,
+    TxMarketMode.aShare => 0,
+  };
+
+  static int _makerQuoteBaseQuantity(TxMarketMode mode) => switch (mode) {
+    TxMarketMode.usEquity => 24,
+    TxMarketMode.futures => 6,
+    // The first ten levels must survive the opening smart-flow pulse; a
+    // single small player order should not jump over the inside BTC quote.
+    TxMarketMode.crypto => 64,
+    TxMarketMode.forex => 4,
+    TxMarketMode.aShare => 0,
+  };
+
+  static int _flowOrderQuantity(TxMarketMode mode) => switch (mode) {
+    TxMarketMode.usEquity => 8,
+    TxMarketMode.futures => 2,
+    TxMarketMode.crypto => 2,
+    TxMarketMode.forex => 2,
+    TxMarketMode.aShare => 0,
+  };
+
+  static int _smartTraderBaseQuantity(TxMarketMode mode) => switch (mode) {
+    TxMarketMode.usEquity => 10,
+    TxMarketMode.futures => 2,
+    TxMarketMode.crypto => 3,
+    TxMarketMode.forex => 2,
+    TxMarketMode.aShare => 0,
+  };
+
+  static int _quoteSpreadBps(TxMarketMode mode) => switch (mode) {
+    TxMarketMode.usEquity => 2,
+    TxMarketMode.futures => 2,
+    TxMarketMode.crypto => 2,
+    TxMarketMode.forex => 2,
+    TxMarketMode.aShare => 0,
+  };
 
   static void _validateMode(TxMarketMode mode) {
     if (mode == TxMarketMode.aShare) {

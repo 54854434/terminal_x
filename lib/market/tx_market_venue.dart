@@ -374,6 +374,25 @@ class TxMarketVenue {
   Map<String, TxMarketCore> get accounts => Map.unmodifiable(_accounts);
   List<TxMarketVenueFill> get fills => List.unmodifiable(_fills);
 
+  /// Adds a finite participant to an existing local venue during a compatible
+  /// schema migration. Existing accounts, orders and fills are never changed;
+  /// callers must persist the runtime after a new account is added.
+  bool ensureAccount(String ownerId, TxMarketCore account) {
+    if (ownerId.trim().isEmpty || account.profile.mode != profile.mode) {
+      throw ArgumentError('Participant account does not match this venue');
+    }
+    final existing = _accounts[ownerId];
+    if (existing != null) {
+      if (existing.profile.mode != account.profile.mode) {
+        throw StateError('Participant account mode conflict');
+      }
+      return false;
+    }
+    _accounts[ownerId] = account;
+    checkInvariants();
+    return true;
+  }
+
   /// Current account risk views, all sourced from the same venue-owned cores.
   /// This is a read-only projection and never advances a mark or game day.
   Map<String, TxMarketRiskSnapshot> get riskSnapshots => Map.unmodifiable({
@@ -398,6 +417,7 @@ class TxMarketVenue {
   Map<String, TxMarketRiskSnapshot> markToMarket({
     required String symbol,
     required int priceCents,
+    bool validateAfter = true,
   }) {
     _instrument(symbol);
     TxMarketRiskRules.forMode(profile.mode).validatePrice(priceCents);
@@ -410,7 +430,7 @@ class TxMarketVenue {
     for (final entry in forks.entries) {
       _accounts[entry.key]!.commitFork(entry.value);
     }
-    checkInvariants();
+    if (validateAfter) checkInvariants();
     return riskSnapshots;
   }
 
@@ -752,6 +772,7 @@ class TxMarketVenue {
     required int gameDay,
     required int minuteOfDay,
     bool reduceOnly = false,
+    bool validateAfter = true,
   }) {
     final existing = _orders[id];
     if (existing != null) {
@@ -782,21 +803,25 @@ class TxMarketVenue {
     _touchBook();
 
     if (!status.isOpen) {
-      return _reject(candidate, '${status.label}，当前不可成交');
+      return _reject(candidate, '${status.label}，当前不可成交',
+          validateAfter: validateAfter);
     }
 
     final makers = _eligibleMakers(candidate);
     if (timeInForce == TxTimeInForce.postOnly && makers.isNotEmpty) {
-      return _reject(candidate, 'Post-only 委托会吃掉现有流动性');
+      return _reject(candidate, 'Post-only 委托会吃掉现有流动性',
+          validateAfter: validateAfter);
     }
     final simulation = _simulate(candidate, makers,
         gameDay: gameDay, minuteOfDay: minuteOfDay);
     if (simulation.reason != null) {
-      return _reject(candidate, simulation.reason!);
+      return _reject(candidate, simulation.reason!,
+          validateAfter: validateAfter);
     }
     if (timeInForce == TxTimeInForce.fok &&
         simulation.remaining != 0) {
-      return _reject(candidate, 'FOK 可成交深度不足，未产生任何成交');
+      return _reject(candidate, 'FOK 可成交深度不足，未产生任何成交',
+          validateAfter: validateAfter);
     }
 
     for (final entry in simulation.forks.entries) {
@@ -837,11 +862,14 @@ class TxMarketVenue {
       candidate.status = TxStatus.filled;
     }
     _touchBook();
-    checkInvariants();
+    if (validateAfter) checkInvariants();
     return candidate.freeze();
   }
 
-  TxMarketVenueOrder cancel(String id, {required String ownerId}) {
+  TxMarketVenueOrder cancel(String id, {
+    required String ownerId,
+    bool validateAfter = true,
+  }) {
     final target = _orders[id];
     if (target == null) throw ArgumentError.value(id, 'id');
     if (target.ownerId != ownerId) throw StateError('Order owner mismatch');
@@ -852,7 +880,7 @@ class TxMarketVenue {
     }
     target.status = TxStatus.cancelled;
     _touchBook();
-    checkInvariants();
+    if (validateAfter) checkInvariants();
     return target.freeze();
   }
 
@@ -1139,11 +1167,12 @@ class TxMarketVenue {
         forks: forks, trades: trades, remaining: remaining, reason: null);
   }
 
-  TxMarketVenueOrder _reject(_VenueOrder order, String reason) {
+  TxMarketVenueOrder _reject(_VenueOrder order, String reason,
+      {bool validateAfter = true}) {
     order.status = TxStatus.rejected;
     order.rejectReason = reason;
     order.remaining = order.quantity;
-    checkInvariants();
+    if (validateAfter) checkInvariants();
     return order.freeze();
   }
 

@@ -72,10 +72,12 @@ class TxMarketRuntime {
   Map<String, TxMarketRiskSnapshot> markToMarket({
     required String symbol,
     required int priceCents,
+    bool validateAfter = true,
   }) {
     final snapshots = venue.markToMarket(
       symbol: symbol,
       priceCents: priceCents,
+      validateAfter: validateAfter,
     );
     markRevision++;
     return snapshots;
@@ -92,6 +94,7 @@ class TxMarketRuntime {
     required int? limitPriceCents,
     required TxTimeInForce timeInForce,
     bool reduceOnly = false,
+    bool validateAfter = true,
   }) => venue.place(
         id: id,
         ownerId: ownerId,
@@ -104,10 +107,13 @@ class TxMarketRuntime {
         gameDay: gameDay,
         minuteOfDay: minuteOfDay,
         reduceOnly: reduceOnly,
+        validateAfter: validateAfter,
       );
 
-  TxMarketVenueOrder cancel(String id, {required String ownerId}) =>
-      venue.cancel(id, ownerId: ownerId);
+  TxMarketVenueOrder cancel(String id, {
+    required String ownerId,
+    bool validateAfter = true,
+  }) => venue.cancel(id, ownerId: ownerId, validateAfter: validateAfter);
 
   /// Move time monotonically and settle exactly once when the day changes.
   ///

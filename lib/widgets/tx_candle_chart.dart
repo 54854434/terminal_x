@@ -5,6 +5,24 @@ import '../market/tx_indicators.dart';
 import '../market/tx_timeframe.dart';
 import '../market/tx_frame_preview.dart';
 
+/// A read-only player-position guide painted on the same price axis as OHLC.
+/// It never changes candles, marks or account state.
+class TxChartOverlayLine {
+  const TxChartOverlayLine({
+    required this.valueCents,
+    required this.label,
+    required this.color,
+    this.valueLabel,
+    this.dashed = true,
+  });
+
+  final int valueCents;
+  final String label;
+  final Color color;
+  final String? valueLabel;
+  final bool dashed;
+}
+
 /// Simulated OHLC (real fills plus explicitly marked reference prices for
 /// no-trade periods) with a distinct indicative preview. The live chart can
 /// also contain real, explicitly labelled pending observations before SQLite
@@ -12,7 +30,8 @@ import '../market/tx_frame_preview.dart';
 class TxCandleChart extends StatefulWidget {
   const TxCandleChart({super.key, required this.candles,
       this.indicativePriceCents, this.indicativeFramePriceCents,
-      this.previewSeconds, this.activeMinuteStep, this.pending = false});
+      this.previewSeconds, this.activeMinuteStep, this.pending = false,
+      this.overlays = const <TxChartOverlayLine>[]});
   final List<TxCandle> candles;
   /// A live intraminute candle is already present in [candles].
   final int? activeMinuteStep;
@@ -20,6 +39,7 @@ class TxCandleChart extends StatefulWidget {
   final double? indicativeFramePriceCents;
   final double? previewSeconds;
   final bool pending;
+  final List<TxChartOverlayLine> overlays;
   @override
   State<TxCandleChart> createState() => _TxCandleChartState();
 }
@@ -107,6 +127,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
     required List<double?>? ma20,
     double? previewHighCents,
     double? previewLowCents,
+    List<TxChartOverlayLine> overlays = const <TxChartOverlayLine>[],
     int? previousIndicativeStep,
     double? previousIndicativeHighCents,
     double? previousIndicativeLowCents,
@@ -129,6 +150,12 @@ class _TxCandleChartState extends State<TxCandleChart> {
     if (previewHighCents != null && previewLowCents != null) {
       high = math.max(high, previewHighCents);
       low = math.min(low, previewLowCents);
+    }
+    for (final overlay in overlays) {
+      if (overlay.valueCents > 0) {
+        high = math.max(high, overlay.valueCents.toDouble());
+        low = math.min(low, overlay.valueCents.toDouble());
+      }
     }
     if (previousIndicativeStep != null &&
         previousIndicativeHighCents != null &&
@@ -172,20 +199,32 @@ class _TxCandleChartState extends State<TxCandleChart> {
   void didUpdateWidget(covariant TxCandleChart oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.candles, widget.candles)) {
-      // Switching symbols must discard the previous security's indicative
-      // extrema; otherwise the price axis shows a fictitious large wick.
-      _indicativeWick.reset();
-      _timelineTrace.reset();
+      final historyRebased = oldWidget.candles.isNotEmpty &&
+          widget.candles.isNotEmpty &&
+          (widget.candles.last.step < oldWidget.candles.last.step ||
+              widget.candles.first.step > oldWidget.candles.last.step);
+      // A new list is also produced when SQLite appends one real candle.
+      // Treat that as data refresh, not as a symbol switch: resetting the
+      // axis and wick memory on every save makes long timeframes jump or show
+      // a one-bar phantom. The parent supplies a ValueKey per board/symbol,
+      // so a real symbol switch receives a fresh State instead.
       _maLength = -1;
       _cachedPeriod = null;
-      _olderOffset = 0;
-      _inspectedStep = null;
-      _axisHighCents = null;
-      _axisLowCents = null;
-      _axisLastCommittedStep = -1;
-      _axisPeriod = null;
+      if (_olderOffset > _maxOffset) _olderOffset = _maxOffset;
+      if (historyRebased) {
+        // A recovery rewind or a non-overlapping history window is different
+        // from an append: discard optical memory so an old provisional wick
+        // cannot be painted on top of a newly authoritative history range.
+        _indicativeWick.reset();
+        _timelineTrace.reset();
+        _axisHighCents = null;
+        _axisLowCents = null;
+        _axisPeriod = null;
+        _axisLastCommittedStep = -1;
+        _olderOffset = 0;
+        _inspectedStep = null;
+      }
     }
-    if (_olderOffset > _maxOffset) _olderOffset = _maxOffset;
   }
 
   @override
@@ -229,6 +268,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
         ma20: visibleMa20,
         previewHighCents: projection?.highCents,
         previewLowCents: projection?.lowCents,
+        overlays: widget.overlays,
         previousIndicativeStep: _indicativeWick.previousGroupStep,
         previousIndicativeHighCents: _indicativeWick.previousHighCents,
         previousIndicativeLowCents: _indicativeWick.previousLowCents,
@@ -351,7 +391,8 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 previousIndicativeStep: _indicativeWick.previousGroupStep,
                 previousIndicativeHighCents: _indicativeWick.previousHighCents,
                 previousIndicativeLowCents: _indicativeWick.previousLowCents,
-                showIndicativeWick: true)),
+                showIndicativeWick: true,
+                overlays: widget.overlays)),
         )),
       )),
       if (inspected != null)
@@ -387,7 +428,8 @@ class _CandlePainter extends CustomPainter {
     this.indicativeLowCents, this.indicativeOpenCents,
     this.overlayLastCommitted = false, this.showIndicativeWick = true,
     this.preferCommittedBody = false, this.previousIndicativeStep, this.previousIndicativeHighCents,
-    this.previousIndicativeLowCents});
+    this.previousIndicativeLowCents,
+    this.overlays = const <TxChartOverlayLine>[]});
   final List<TxCandle> candles;
   final List<double?>? ma5, ma10, ma20;
   final double? axisHighCents, axisLowCents;
@@ -399,6 +441,7 @@ class _CandlePainter extends CustomPainter {
   final bool preferCommittedBody;
   final int? previousIndicativeStep;
   final double? previousIndicativeHighCents, previousIndicativeLowCents;
+  final List<TxChartOverlayLine> overlays;
   static const rise = Color(0xFF32D0A1), fall = Color(0xFFFF647C),
       flat = Color(0xFF9BA7BB);
   static const grid = Color(0xFF293448),
@@ -446,6 +489,12 @@ class _CandlePainter extends CustomPainter {
           if (v != null) {high = math.max(high, v); low = math.min(low, v);}
         }
       }
+      for (final overlay in overlays) {
+        if (overlay.valueCents > 0) {
+          high = math.max(high, overlay.valueCents.toDouble());
+          low = math.min(low, overlay.valueCents.toDouble());
+        }
+      }
     }
     final margin = math.max(2.0, (high-low)*.08);
     final priceTop = high + margin, span = math.max(1.0, high-low+2*margin);
@@ -456,6 +505,33 @@ class _CandlePainter extends CustomPainter {
           Paint()..color=grid..strokeWidth=.8);
       _label(canvas, ((priceTop-span*t/4)/100).toStringAsFixed(2),
           Offset(right+6,h-6));
+    }
+    for (final overlay in overlays) {
+      if (overlay.valueCents < 1) continue;
+      final yy = y(overlay.valueCents.toDouble())
+          .clamp(0.0, height).toDouble();
+      final linePaint = Paint()
+        ..color = overlay.color.withAlpha(190)
+        ..strokeWidth = 1.1;
+      if (overlay.dashed) {
+        for (double x = 0; x < right; x += 10) {
+          canvas.drawLine(Offset(x, yy),
+              Offset(math.min(x + 5, right), yy), linePaint);
+        }
+      } else {
+        canvas.drawLine(Offset(0, yy), Offset(right, yy), linePaint);
+      }
+      final label = '${overlay.label}${overlay.valueLabel == null
+          ? '' : ' ${overlay.valueLabel}'}';
+      final text = TextPainter(text: TextSpan(text: label,
+          style: TextStyle(color: overlay.color, fontSize: 9,
+              fontWeight: FontWeight.w700)),
+          textDirection: TextDirection.ltr)..layout(maxWidth: right - 8);
+      final labelY = (yy - text.height - 2).clamp(0.0, height - text.height)
+          .toDouble();
+      canvas.drawRect(Rect.fromLTWH(2, labelY, text.width + 7, text.height + 2),
+          Paint()..color = const Color(0xFF101C2B).withAlpha(215));
+      text.paint(canvas, Offset(5, labelY + 1));
     }
     // Fixed spare slot eliminates the horizontal jump at each minute boundary.
     final bar = right/(candles.length+1);
@@ -522,17 +598,11 @@ class _CandlePainter extends CustomPainter {
           if (lo > bottom) canvas.drawLine(Offset(x, bottom), Offset(x, lo), p);
         }
         // Filled for visual consistency, translucent for provisional status.
-        final alpha = overlayLastCommitted && preferCommittedBody ? 115 : 175;
+        final alpha = overlayLastCommitted && preferCommittedBody ? 190 : 175;
         final bodyPaint = Paint()..color = color.withAlpha(alpha)
             ..style = PaintingStyle.fill;
         canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
             math.max(3.0,bottom-top)),bodyPaint);
-        if (overlayLastCommitted && preferCommittedBody) {
-          canvas.drawRect(Rect.fromLTWH(x-body/2, top, body,
-              math.max(3.0, bottom-top)),
-            Paint()..color = const Color(0xFF54CEE5).withAlpha(210)
-              ..style = PaintingStyle.stroke..strokeWidth = 1.0);
-        }
       } else {
         canvas.drawCircle(Offset(x, y(mark)), 2.5, p);
       }
@@ -582,6 +652,16 @@ class _CandlePainter extends CustomPainter {
       previousIndicativeStep!=other.previousIndicativeStep ||
       previousIndicativeHighCents!=other.previousIndicativeHighCents ||
       previousIndicativeLowCents!=other.previousIndicativeLowCents ||
+      overlays.length != other.overlays.length ||
+      (overlays.isNotEmpty && overlays.asMap().entries.any((entry) {
+        final otherLine = entry.key < other.overlays.length
+            ? other.overlays[entry.key] : null;
+        final line = entry.value;
+        return otherLine == null || otherLine.valueCents != line.valueCents ||
+            otherLine.label != line.label || otherLine.color != line.color ||
+            otherLine.valueLabel != line.valueLabel ||
+            otherLine.dashed != line.dashed;
+      })) ||
       axisHighCents!=other.axisHighCents ||
       axisLowCents!=other.axisLowCents ||
       candles.length!=other.candles.length ||

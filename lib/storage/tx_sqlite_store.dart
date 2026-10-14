@@ -320,6 +320,12 @@ class TxSqliteStore extends GeneratedDatabase {
   int? _indexedRevision;
   TxStoredSession? _cachedCurrent;
   final void Function(String)? _testCheckpoint;
+  // The independent runtime CAS still compares the exact SQLite envelope on
+  // every save. When it is byte-for-byte the last envelope this connection
+  // already audited, parsing and re-auditing its growing order/fill journal
+  // adds no integrity value and is skipped.
+  final Map<TxMarketMode, String> _verifiedMarketEnvelopes = {};
+  final Map<TxMarketMode, int> _verifiedMarketSequences = {};
 
   // Only a successful audited read or a committed, validated write may
   // advance this cache. It is never persisted or accepted as a substitute
@@ -473,13 +479,24 @@ class TxSqliteStore extends GeneratedDatabase {
       SELECT value FROM storage_metadata WHERE key = ?
     ''', variables: [Variable.withString(_marketRuntimeKey(mode))])
         .getSingleOrNull();
-    if (row == null) return null;
+    if (row == null) {
+      _verifiedMarketEnvelopes.remove(mode);
+      _verifiedMarketSequences.remove(mode);
+      return null;
+    }
     try {
-      return _decodeMarketRuntimeEnvelope(
-          mode, row.read<String>('value'));
+      final encoded = row.read<String>('value');
+      final decoded = _decodeMarketRuntimeEnvelope(mode, encoded);
+      _verifiedMarketEnvelopes[mode] = encoded;
+      _verifiedMarketSequences[mode] = decoded.sequence;
+      return decoded;
     } on FormatException catch (error) {
+      _verifiedMarketEnvelopes.remove(mode);
+      _verifiedMarketSequences.remove(mode);
       throw StateError('Corrupted independent ${mode.name} runtime: $error');
     } catch (error) {
+      _verifiedMarketEnvelopes.remove(mode);
+      _verifiedMarketSequences.remove(mode);
       throw StateError('Corrupted independent ${mode.name} runtime: $error');
     }
   }
@@ -487,11 +504,12 @@ class TxSqliteStore extends GeneratedDatabase {
   /// Atomically publish the next independent runtime sequence.
   ///
   /// [expectedSequence] is zero for a first write, otherwise it must equal
-  /// the sequence returned by the last verified read. The old value is fully
-  /// decoded and hashed inside the same SQLite transaction before it can be
-  /// replaced. This prevents a retry or a competing worker from overwriting
-  /// a newer runtime, and prevents a corrupt value from being "repaired" by
-  /// an unrelated save.
+  /// the sequence returned by the last verified read. A changed old value is
+  /// fully decoded and hashed inside the same SQLite transaction; an exact
+  /// byte-for-byte match to the last audited envelope can reuse that audit.
+  /// This prevents a retry or a competing worker from overwriting a newer
+  /// runtime, and prevents a corrupt value from being "repaired" by an
+  /// unrelated save.
   Future<TxStoredMarketRuntime> saveMarketRuntime(
       TxMarketRuntime runtime, {required int expectedSequence}) async {
     if (runtime.mode == TxMarketMode.aShare) {
@@ -529,16 +547,22 @@ class TxSqliteStore extends GeneratedDatabase {
           throw StateError('Missing independent ${mode.name} runtime sequence');
         }
       } else {
-        late final TxStoredMarketRuntime current;
-        try {
-          current = _decodeMarketRuntimeEnvelope(
-              mode, row.read<String>('value'));
-        } catch (error) {
-          throw StateError(
-              'Corrupted independent ${mode.name} runtime: $error');
-        }
-        if (current.sequence != expectedSequence) {
-          throw StateError('Stale independent ${mode.name} runtime sequence');
+        final currentEncoded = row.read<String>('value');
+        if (currentEncoded == _verifiedMarketEnvelopes[mode]) {
+          if (_verifiedMarketSequences[mode] != expectedSequence) {
+            throw StateError('Stale independent ${mode.name} runtime sequence');
+          }
+        } else {
+          late final TxStoredMarketRuntime current;
+          try {
+            current = _decodeMarketRuntimeEnvelope(mode, currentEncoded);
+          } catch (error) {
+            throw StateError(
+                'Corrupted independent ${mode.name} runtime: $error');
+          }
+          if (current.sequence != expectedSequence) {
+            throw StateError('Stale independent ${mode.name} runtime sequence');
+          }
         }
       }
       await customStatement('''
@@ -546,8 +570,14 @@ class TxSqliteStore extends GeneratedDatabase {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       ''', <Object?>[_marketRuntimeKey(mode), envelope]);
     });
+    _verifiedMarketEnvelopes[mode] = envelope;
+    _verifiedMarketSequences[mode] = nextSequence;
     return TxStoredMarketRuntime(
-      runtime: TxMarketRuntime.fromJson(runtimeJson),
+      // [runtime] has already passed the same invariant audit and is the
+      // candidate whose exact JSON was committed. Reusing it avoids a second
+      // full venue materialization on every minute save; cold reads remain
+      // fully decoded and fail-closed above.
+      runtime: runtime,
       sequence: nextSequence,
       sha256: runtimeSha,
     );
