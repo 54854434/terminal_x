@@ -50,4 +50,32 @@ void main() {
     expect(session.currentMinuteFills, isNotEmpty);
     session.engine.checkInvariants();
   });
+
+  test('closed fast-forward stops before the next open without prints', () {
+    final session = TxSession.freshWithAgents();
+    final order = session.placePlayer(
+      symbol: TxSession.symbols.first,
+      side: TxSide.buy,
+      kind: TxKind.limit,
+      quantity: 1,
+      limitPriceCents: 800,
+    );
+    final beforeReference = List<int>.of(session.referenceCents);
+    session.step = 120;
+
+    final skipped = session.fastForwardClosed();
+
+    expect(skipped, 89);
+    expect(session.step, 209);
+    expect(session.marketSessionStatus.isOpen, isFalse);
+    expect(TxSession.marketSessionStatusAt(committedStep: 210).isOpen,
+        isTrue);
+    expect(session.referenceCents, beforeReference);
+    expect(session.currentMinuteFills, isEmpty);
+    expect(session.engine.order(order.id).status, TxStatus.open);
+    expect(session.engine.activeOrders.where((item) =>
+        item.ownerId.startsWith('NPC_') || item.ownerId.startsWith('LP_')),
+        isEmpty);
+    session.engine.checkInvariants();
+  });
 }

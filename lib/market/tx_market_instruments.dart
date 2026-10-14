@@ -38,5 +38,5 @@ class TxMarketInstrument {
 
   String get lotLabel => lotSize == 1 ? '1 $orderUnit' : '$lotSize $orderUnit';
 
-  String get connectionLabel => coreConnected ? '已接入核心' : '待接入核心';
+  String get connectionLabel => coreConnected ? '已接入 Rust 核心' : '已接入独立核心';
 }

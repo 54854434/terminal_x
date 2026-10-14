@@ -12,6 +12,7 @@ TxMarketVenue cryptoVenue() => TxMarketVenue(
       profile: TxMarketProfile.crypto,
       openingCashCents: 1000000,
       initialMarks: {'SIM-BTCUSDT': 100000, 'SIM-ETHUSDT': 30000},
+      initialLongPositions: {'SIM-ETHUSDT': 2},
     ),
     'TAKER': TxMarketCore(
       profile: TxMarketProfile.crypto,
@@ -164,7 +165,7 @@ void main() {
     restored.checkInvariants();
 
     final data = Map<String, dynamic>.from(venue.toJson());
-    data['schema'] = 3;
+    data['schema'] = 4;
     expect(() => TxMarketVenue.fromJsonMap(data), throwsFormatException);
 
     final invalid = Map<String, dynamic>.from(venue.toJson());

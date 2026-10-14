@@ -15,6 +15,11 @@ TxSession _advanceMinute(TxSession session) {
   return session;
 }
 
+TxSession _advanceClosedSession(TxSession session) {
+  session.fastForwardClosed();
+  return session;
+}
+
 TxSession _advancePulse(TxSession session, int second) {
   session.marketPulse(second);
   return session;
@@ -58,6 +63,10 @@ Future<_TradeProposal> _cancelDetached(TxSession source, String orderId) {
 
 Future<TxSession> _tickDetached(TxSession source) {
   return Isolate.run(() => _advanceMinute(source));
+}
+
+Future<TxSession> _fastForwardClosedDetached(TxSession source) {
+  return Isolate.run(() => _advanceClosedSession(source));
 }
 
 Future<TxSession> _pulseDetached(TxSession source, int second) {
@@ -303,6 +312,38 @@ class TxTradingService {
     return _nextTickNow(deferSave: false);
   }
 
+  /// Skip only the current closed/break interval. The candidate remains at
+  /// the last minute before the next open boundary; the following ordinary
+  /// minute still runs the real matching path.
+  Future<TxStoredSession> fastForwardClosed() async {
+    final tail = _automaticTail;
+    if (_automaticPending > 0 && tail != null) {
+      await tail.timeout(const Duration(seconds: 15));
+    }
+    _ensureReady();
+    if (current.session.marketSessionStatus.isOpen) return current;
+    _busy = true;
+    try {
+      final candidate = _worker != null
+          ? (await _worker!.fastForwardClosed()).session
+          : await _fastForwardClosedDetached(current.session);
+      if (candidate.step == current.session.step) return current;
+      await _commit(candidate);
+      await _ackWorkerCommit();
+      return current;
+    } catch (error) {
+      if (_worker != null) {
+        _worker!.close();
+        _worker = null;
+      }
+      _storageFault = true;
+      _lastStorageFailure = error.toString();
+      rethrow;
+    } finally {
+      _busy = false;
+    }
+  }
+
   Future<TxStoredSession> _nextTickNow({required bool deferSave}) async {
     _ensureReady(automatic: deferSave);
     _busy = true;
@@ -411,6 +452,25 @@ class TxTradingService {
     }
   }
 
+  /// A lifecycle recovery can arrive in the small window where the UI has
+  /// already stopped scheduling frames but the storage future is still
+  /// unwinding its final acknowledgement. Waiting here lets the recovery
+  /// adopt the durable head instead of turning that harmless race into a
+  /// permanent-looking "still settling" fault. The timeout remains fail
+  /// closed for a genuinely stuck SQLite/native operation.
+  Future<void> _waitForBusyToSettle({
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    while (_busy) {
+      if (stopwatch.elapsed >= timeout) {
+        throw StateError('Storage operation did not settle within '
+            '${timeout.inSeconds} seconds');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+
   /// Re-read and audit the durable SQLite head after an ambiguous failure.
   ///
   /// A failed save may have rolled back, or it may have committed just before
@@ -418,7 +478,16 @@ class TxTradingService {
   /// the only safe recovery operation: it adopts whichever revision is
   /// actually on disk and discards the uncommitted in-memory candidate.
   Future<TxStoredSession> reopenAndVerify() async {
-    if (_busy) throw StateError('Storage operation is still settling');
+    // A lifecycle transition can observe the service just before its final
+    // acknowledgement clears [_busy]. Give that in-flight operation a bounded
+    // chance to finish before restarting the worker. A queued automatic
+    // command is drained afterwards, when no command owns the worker.
+    await _waitForBusyToSettle();
+    final tail = _automaticTail;
+    if (_automaticPending > 0 && tail != null) {
+      await tail.timeout(const Duration(seconds: 15));
+    }
+    await _waitForBusyToSettle();
     _busy = true;
     _lastRecoveryPreservedPending = false;
     try {

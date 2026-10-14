@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'tx_premium_ui.dart';
 import 'tx_terminal_theme.dart';
 
 /// The player-facing settings centre.
@@ -83,6 +84,11 @@ class TxSettingsPage extends StatelessWidget {
     padding: const EdgeInsets.fromLTRB(14, 8, 14, 24),
     children: [
       _heroCard(),
+      const TxInfoStrip(
+        icon: Icons.dashboard_customize_outlined,
+        text: '页面分工：行情看价格与盘口，交易做委托，资产看风险与成本，记录看账本，设置管运行与存档。',
+        accent: TxTerminalColors.cyan,
+      ),
       _sectionTitle('运行控制', '把游戏节奏、实时盘口和已落盘状态放在同一处'),
       _runtimeCard(),
       _sectionTitle('实时盘口', '盘口更新频率独立于 SQLite 自动保存周期'),
@@ -95,74 +101,27 @@ class TxSettingsPage extends StatelessWidget {
     ],
   );
 
-  Widget _heroCard() => Card(
-    margin: const EdgeInsets.only(bottom: 6),
-    child: Container(
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        gradient: const LinearGradient(
-          colors: [Color(0xFF172A43), TxTerminalColors.surface],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-      ),
-      padding: const EdgeInsets.all(16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 48,
-            height: 48,
-            decoration: BoxDecoration(
-              color: TxTerminalColors.primary.withAlpha(41),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: const Icon(Icons.tune, color: TxTerminalColors.primary),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('设置中心', style: TextStyle(
-                  fontSize: 21, fontWeight: FontWeight.w800,
-                  letterSpacing: .2,
-                )),
-                const SizedBox(height: 4),
-                const Text('游玩、盘口、存档与诊断', style: TextStyle(
-                  color: TxTerminalColors.secondaryText,
-                )),
-                const SizedBox(height: 12),
-                Wrap(spacing: 8, runSpacing: 6, children: [
-                  _statusChip(
-                    ready ? '运行入口已就绪' : '等待存档校验',
-                    ready ? TxTerminalColors.buy : Colors.amberAccent,
-                    ready ? Icons.check_circle_outline : Icons.hourglass_top,
-                  ),
-                  _plainChip('v$appVersion', Icons.verified_outlined),
-                ]),
-              ],
-            ),
-          ),
-        ],
-      ),
-    ),
+  Widget _heroCard() => TxPageHeader(
+    icon: Icons.tune_rounded,
+    eyebrow: 'CONTROL CENTER',
+    title: '设置中心',
+    subtitle: '运行控制、盘口节奏、存档策略与诊断信息集中在这里。',
+    status: ready ? '运行入口已就绪 · v$appVersion' : '等待存档校验 · v$appVersion',
+    accent: ready ? TxTerminalColors.primary : TxTerminalColors.gold,
   );
 
-  Widget _sectionTitle(String title, String subtitle) => Padding(
-    padding: const EdgeInsets.fromLTRB(4, 14, 4, 5),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(title, style: const TextStyle(
-          fontSize: 17, fontWeight: FontWeight.w700, letterSpacing: .2,
-        )),
-        const SizedBox(height: 2),
-        Text(subtitle, style: const TextStyle(
-          fontSize: 12, color: TxTerminalColors.secondaryText,
-        )),
-      ],
-    ),
+  Widget _sectionTitle(String title, String subtitle) => TxSectionHeader(
+    title: title,
+    subtitle: subtitle,
+    icon: switch (title) {
+      '运行控制' => Icons.play_circle_outline,
+      '实时盘口' => Icons.show_chart_rounded,
+      '存档策略' => Icons.save_outlined,
+      _ => Icons.info_outline,
+    },
+    accent: title == '存档策略'
+        ? TxTerminalColors.gold
+        : TxTerminalColors.primary,
   );
 
   Widget _runtimeCard() => Card(
@@ -375,16 +334,15 @@ class TxSettingsPage extends StatelessWidget {
           ]),
           const SizedBox(height: 8),
           const Text(
-            '下一阶段将在真实交易核心之上增加市场事件、任务/成就、'
-            '更多模拟标的和可切换信息密度；当前这里只展示规划，尚未伪装成已实现功能。',
+            '平台以拟真交易为核心：真实订单簿负责成交，已发生的成交负责 K 线，'
+            '独立板块负责延长可交易时段，SQLite 负责恢复可信状态。平台不使用任务、成就或剧情驱动交易。',
             style: TextStyle(fontSize: 12, color: TxTerminalColors.secondaryText),
           ),
           const SizedBox(height: 11),
           Wrap(spacing: 7, runSpacing: 7, children: [
-            _plainChip('市场事件', Icons.bolt_outlined),
-            _plainChip('任务与成就', Icons.flag_outlined),
-            _plainChip('多市场看板', Icons.dashboard_outlined),
-            _plainChip('UI 动效', Icons.animation_outlined),
+            _plainChip('更多板块', Icons.public_outlined),
+            _plainChip('市场总览', Icons.dashboard_outlined),
+            _plainChip('信息密度', Icons.tune_outlined),
           ]),
         ],
       ),

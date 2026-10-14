@@ -1,7 +1,8 @@
-/// Terminal X 0.3.7 unified trading interface and market-structure analytics.
+/// Terminal X 0.3.8 unified trading interface and market-structure analytics.
 /// Existing V0.2 + V0.1 apps and backups are never accessed.
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
@@ -26,6 +27,9 @@ import 'market/tx_trade_journal.dart';
 import 'market/tx_portfolio_scenarios.dart';
 import 'market/tx_market_phase_timeline.dart';
 import 'market/tx_market_profiles.dart';
+import 'market/tx_market_session_schedule.dart';
+import 'market/tx_independent_market_service.dart';
+import 'market/tx_market_risk_core.dart';
 import 'market/tx_frame_render_gate.dart';
 import 'market/tx_storage_footprint.dart';
 import 'market/tx_market_tape_window.dart';
@@ -41,9 +45,9 @@ import 'widgets/tx_terminal_status.dart';
 import 'widgets/tx_market_radar.dart';
 import 'widgets/tx_market_ecosystem_card.dart';
 import 'widgets/tx_market_mode_selector.dart';
-import 'widgets/tx_market_mode_preview_card.dart';
 import 'widgets/tx_back_exit_guard.dart';
 import 'widgets/tx_settings_page.dart';
+import 'widgets/tx_premium_ui.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -72,10 +76,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const green = TxTerminalColors.buy;
   static const red = TxTerminalColors.sell;
-  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.7');
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.8');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
+  TxIndependentMarketService? _independentMarkets;
   TxLiveCandles? _candles;
   late final Ticker _playbackTicker;
   Duration? _previousFrame;
@@ -95,6 +100,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   int? _journalCacheRevision;
   TxTradeJournal? _journalCache;
   Future<void>? _operation;
+  Future<void>? _backgroundFlush;
   int _page = 0;
   int _symbol = 0;
   TxMarketMode _marketMode = TxMarketMode.aShare;
@@ -126,17 +132,75 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Future<void>? _candleWarmup;
   bool _serviceClosed = false;
   bool _recoveringStorage = false;
+  bool _independentLoading = false;
+  String? _independentFault;
 
   bool get _ready => !_loading && !_busy && _fault == null &&
       !_historyWarming &&
       _trader != null && !_trader!.blocked;
+  bool get _independentMode => _marketMode != TxMarketMode.aShare;
+  TxIndependentMarketState? get _independentState =>
+      _independentMarkets?.state(_marketMode);
   bool get _tradingReady => _ready &&
-      TxMarketProfile.of(_marketMode).isCoreConnected;
+      (!_independentMode && _marketMode == TxMarketMode.aShare ||
+          _independentMode && !_independentLoading &&
+              _independentState != null && _independentFault == null);
   String get _symbolName => TxSession.symbols[_symbol];
   String money(int cents) => (cents / 100).toStringAsFixed(2);
   String signedMoney(int cents) => '${cents >= 0 ? '+' : '-'}¥${money(cents.abs())}';
   double _indication(TxSession session, double seconds) => TxFrameQuote.cents(
       session.lastPrice(_symbolName), session.step, seconds, _symbol);
+
+  bool _marketPreviewAllowed(TxSession session, double seconds) {
+    final fractionalSeconds = seconds.floor().clamp(0, 59).toInt();
+    final status = TxSession.marketSessionStatusAt(
+        committedStep: session.step,
+        fractionalSeconds: fractionalSeconds);
+    // Above 60x, keep the committed chart/mark stable. The storage-backed
+    // clock may still run at the requested target, but a 19–58 second visual
+    // jump per frame makes the entire price axis appear to shake.
+    if (!status.isOpen || _speed > 60) return false;
+    return _auto || seconds > 0;
+  }
+
+  double _displayIndication(TxSession session, double seconds) =>
+      _marketPreviewAllowed(session, seconds)
+          ? _indication(session, seconds)
+          : session.lastPrice(_symbolName).toDouble();
+
+  int _clockGameDay(TxSession session) => TxRealtimeClock.gameDay(
+      session.step, _seconds.value.floor().clamp(0, 59).toInt());
+
+  int _clockMinuteOfDay(TxSession session) => TxRealtimeClock.gameMinuteOfDay(
+      session.step, _seconds.value.floor().clamp(0, 59).toInt());
+
+  TxMarketSessionStatus _selectedSessionStatus(TxSession session) {
+    final profile = TxMarketProfile.of(_marketMode);
+    return profile.schedule.status(
+        gameDay: _clockGameDay(session),
+        minuteOfDay: _clockMinuteOfDay(session));
+  }
+
+  int _independentTimeStep(TxIndependentMarketState state) =>
+      (state.runtime.gameDay - 1) * 1440 + state.runtime.minuteOfDay;
+
+  int _independentSessionStep(TxIndependentMarketState state) => math.max(
+      0, _independentTimeStep(state) - TxRealtimeClock.firstMinuteOfDay);
+
+  String _quotePrice(TxMarketProfile profile, int cents) {
+    final prefix = switch (profile.quoteCurrency) {
+      'CNY' => '¥',
+      'USD' => '\$',
+      'USDT' => '₮',
+      _ => '${profile.quoteCurrency} ',
+    };
+    final decimals = profile.mode == TxMarketMode.forex ? 4 : 2;
+    return '$prefix${(cents / 100).toStringAsFixed(decimals)}';
+  }
+
+  String _quoteAmount(TxMarketProfile profile, int cents) => cents < 0
+      ? '-${_quotePrice(profile, cents.abs())}'
+      : _quotePrice(profile, cents);
 
 
   @override
@@ -160,7 +224,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) {
       _pause();
-      unawaited(_flushPendingOnBackground());
+      // Android may emit inactive/hidden/paused as one transition. Reuse the
+      // first safety flush instead of starting competing SQLite flushes.
+      if (_backgroundFlush != null) return;
+      final task = _flushPendingOnBackground();
+      _backgroundFlush = task;
+      unawaited(task.then<void>((_) {
+        if (identical(_backgroundFlush, task)) _backgroundFlush = null;
+      }, onError: (Object _, StackTrace __) {
+        if (identical(_backgroundFlush, task)) _backgroundFlush = null;
+      }));
     }
   }
 
@@ -296,6 +369,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Future<void> _recoverStorage() async {
     final service = _trader;
     if (service == null || _recoveringStorage) return;
+    _pause();
     setState(() {
       _recoveringStorage = true;
       _historyWarming = true;
@@ -304,7 +378,39 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _notice = '正在读取真实 SQLite 修订；优先保留可安全补写的自动行情';
     });
     try {
-      final loaded = await service.reopenAndVerify();
+      final backgroundFlush = _backgroundFlush;
+      if (backgroundFlush != null) {
+        try {
+          await backgroundFlush.timeout(const Duration(seconds: 15));
+        } catch (error) {
+          if (error is TimeoutException) {
+            throw StateError('后台 SQLite 保存超过 15 秒仍未结束，请保持应用前台后重试');
+          }
+          // The background path already published the storage failure. The
+          // recovery read below is still the authoritative next operation.
+        }
+      }
+      final operation = _operation;
+      if (_busy && operation != null) {
+        try {
+          await operation.timeout(const Duration(seconds: 15));
+        } catch (error) {
+          if (error is TimeoutException) {
+            throw StateError('上一笔存储操作超过 15 秒仍未结束，请保持应用前台后重试');
+          }
+          // A failed operation is precisely the state this audit repairs.
+        }
+      }
+      if (_busy) {
+        throw StateError('上一笔存储操作仍在进行，暂不重复打开 SQLite');
+      }
+      await _independentMarkets?.waitForIdle();
+      final loaded = await service.reopenAndVerify()
+          .timeout(const Duration(seconds: 15));
+      // A lifecycle flush can fail before the frame clock marks its own
+      // pending boundary. Normalize that path into the same fail-closed flow
+      // state before applying the audited SQLite position.
+      if (!_flow.faulted) _flow.storageFailed();
       _flow.recoverAfterStorageAudit(
           pulseSecond: loaded.session.lastPulseSecond);
       _previousBookQty.clear();
@@ -312,22 +418,33 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _positionCacheRevision = null;
       _journalCache = null;
       _journalCacheRevision = null;
+      _independentMarkets?.clearInMemoryStates();
       final baseline = TxLiveCandles.fromVerifiedHistory(
           <TxStoredSession>[loaded]);
+      baseline.compactClosedFlatMinutes();
       if (!mounted) return;
       setState(() {
         _candles = baseline;
         _fault = null;
         _auto = false;
+        // The verified account is usable now. The OHLC index is a display
+        // read model and continues rebuilding in the background, so the
+        // recovery button cannot leave the whole terminal looking stuck.
+        _historyWarming = false;
         _seconds.value = loaded.session.lastPulseSecond.toDouble();
-        _startupStage = '存档已恢复，正在重建真实 K 线缓存';
-        _startupProgress = .78;
+        _startupStage = '存档已恢复，K 线缓存后台重建中';
+        _startupProgress = .82;
         _notice = service.lastRecoveryPreservedPending
             ? '已校验 SQLite；未落盘的自动行情已安全补写，游戏时间未回退'
             : '已恢复最后安全落盘状态；未确认的玩家操作不会自动重试';
       });
+      if (_marketMode != TxMarketMode.aShare && mounted) {
+        unawaited(_selectMarketMode(_marketMode, loaded.session));
+      }
       _candleWarmup = _warmCandleHistory(service, loaded);
-      await _candleWarmup;
+      // SQLite account recovery is authoritative. Rebuilding the display-only
+      // candle index must not keep the recovery action in a loading state.
+      unawaited(_candleWarmup!);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -352,9 +469,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         _setStartupStage('缓存缺失，后台重建真实 OHLC 历史', .84);
         final recent = await service.database.readHistory(limit: 64);
         candles = TxLiveCandles.fromVerifiedHistory(recent);
+        candles.compactClosedFlatMinutes();
         _setStartupStage('正在安全写入 K 线索引', .94);
         await service.database.seedCandleIndex(initial, candles);
       }
+      candles!.compactClosedFlatMinutes();
       final readyCandles = candles!;
       if (!mounted) {
         await _closeService(service);
@@ -421,6 +540,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _serviceClosed = false;
       setState(() {
         _trader = service;
+        _independentMarkets = TxIndependentMarketService(service!.database);
         _candles = candles;
         _historyWarming = true;
         _checkpointInterval = checkpointInterval;
@@ -448,6 +568,76 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     }
   }
 
+  Future<void> _syncIndependentMarket(TxSession session) async {
+    final service = _independentMarkets;
+    final mode = _marketMode;
+    if (service == null || mode == TxMarketMode.aShare) return;
+    final state = await service.sync(
+      mode: mode,
+      gameDay: _clockGameDay(session),
+      minuteOfDay: _clockMinuteOfDay(session),
+    );
+    if (mounted && _marketMode == mode) {
+      _independentFault = null;
+      _marketRepaint.value++;
+      // The trading/assets/records pages are not all under the market
+      // ValueListenableBuilder, so publish the new book to the whole screen.
+      setState(() {});
+    }
+    // Keep the local variable in this method: it makes a failed CAS visibly
+    // tied to the selected board rather than silently falling back to A-share.
+    state.runtime.venue.checkInvariants();
+  }
+
+  Future<void> _selectMarketMode(TxMarketMode mode, TxSession session) async {
+    if (mode == _marketMode &&
+        (mode == TxMarketMode.aShare || _independentState != null)) return;
+    if (!_ready || _busy) return;
+    if (_auto) _pause();
+    if (mode == TxMarketMode.aShare) {
+      setState(() {
+        _marketMode = mode;
+        _symbol = _symbol.clamp(0, TxSession.symbols.length - 1).toInt();
+        _independentLoading = false;
+        _independentFault = null;
+        _price.text = money(_trader!.current.session.lastPrice(_symbolName));
+      });
+      return;
+    }
+    final service = _independentMarkets;
+    if (service == null) return;
+    setState(() {
+      _marketMode = mode;
+      _symbol = 0;
+      _independentLoading = true;
+      _independentFault = null;
+    });
+    try {
+      final state = await service.open(
+        mode: mode,
+        gameDay: _clockGameDay(session),
+        minuteOfDay: _clockMinuteOfDay(session),
+      );
+      if (!mounted || _marketMode != mode) return;
+      setState(() {
+        _independentLoading = false;
+        _price.text = (state.profile.instruments.isEmpty)
+            ? '' : (state.markPriceCents(
+                    state.profile.instruments.first.symbol) / 100)
+                .toStringAsFixed(2);
+        _notice = '${state.profile.label} 独立撮合核心已连接 · SQLite CAS r${state.sequence}';
+      });
+      _marketRepaint.value++;
+    } catch (error) {
+      if (!mounted || _marketMode != mode) return;
+      setState(() {
+        _independentLoading = false;
+        _independentFault = '独立${TxMarketProfile.of(mode).label}市场打开失败：$error';
+        _notice = '未切换到不可验证的市场状态';
+      });
+    }
+  }
+
   void _operate(Future<String> Function(TxTradingService) work,
       {bool automated = false, bool pulse = false}) {
     if (!_ready) return;
@@ -466,7 +656,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _settlementPhase.value = 0.0;
       _busy = true;
     }
-    _operation = _perform(work, automated: automated, pulse: pulse);
+    final operation = _perform(work, automated: automated, pulse: pulse);
+    _operation = operation;
+    unawaited(operation.then<void>((_) {
+      if (identical(_operation, operation)) _operation = null;
+    }, onError: (Object _, StackTrace __) {
+      if (identical(_operation, operation)) _operation = null;
+    }));
   }
 
   Future<void> _perform(Future<String> Function(TxTradingService) work,
@@ -490,10 +686,20 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
               _currentDepthQuantities(before.session, symbol);
         }
         _candles!.addObservation(before.session, after.session);
+        // Closed, no-print minutes are time gaps in the chart. This also
+        // compacts v0.3.7 caches after the first verified refresh.
+        _candles!.compactClosedFlatMinutes();
         // Keep the market page's session projection in step with the mutable
         // live candle cache. The per-frame preview still uses [_seconds], so
         // this notifier only fires after a real Rust candidate completes.
         if (mounted) _marketRepaint.value++;
+      }
+      // A non-A-share board follows the same visible game clock, but owns its
+      // venue/accounts/SQLite CAS envelope. It advances even while the A-share
+      // automatic candidate is pending: the ledgers are separate, and a
+      // closed independent session still produces no quote or print.
+      if (_independentMode && _independentState != null && changed) {
+        await _syncIndependentMarket(after.session);
       }
       if (automated) {
         // The isolated candidate finished computing. If the save cadence is
@@ -587,6 +793,18 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     }, automated: automatic);
   }
 
+  void _fastForwardClosed() {
+    if (!_ready) return;
+    _operate((service) async {
+      final before = service.current.session.step;
+      final next = await service.fastForwardClosed();
+      final skipped = next.session.step - before;
+      return skipped > 0
+          ? '已快进 $skipped 个休市分钟；停在下一次开盘前，下一分钟恢复真实撮合'
+          : '下一交易时段将在下一分钟开始，未跳过任何分钟';
+    });
+  }
+
   int? _cents(String raw) {
     if (!RegExp(r'^\d{1,10}(\.\d{1,2})?$').hasMatch(raw.trim())) return null;
     final p = raw.trim().split('.');
@@ -599,7 +817,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
 
   void _trade(TxSide side) {
     if (!_tradingReady) {
-      setState(() => _notice = '当前市场模式仅规则预览，切回 A 股后才可提交订单');
+      setState(() => _notice = '当前交易核心尚未就绪，请等待市场校验完成后重试');
       return;
     }
     final sessionStatus = TxSession.marketSessionStatusAt(
@@ -682,16 +900,25 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     });
   }
 
-  Widget _title(String t, {String? sub}) => Padding(
-    padding: const EdgeInsets.fromLTRB(4, 17, 4, 8),
-    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text(t, style: const TextStyle(fontSize: 17,
-          letterSpacing: 0.2, fontWeight: FontWeight.w700)),
-      if (sub != null) Padding(
-        padding: const EdgeInsets.only(top: 3),
-        child: Text(sub, style: const TextStyle(fontSize: 12,
-          color: TxTerminalColors.secondaryText))),
-    ]),
+  Widget _title(String t, {String? sub}) => TxSectionHeader(
+    title: t,
+    subtitle: sub,
+  );
+
+  Widget _pageHeader({
+    required IconData icon,
+    required String eyebrow,
+    required String title,
+    required String subtitle,
+    required String status,
+    Color accent = TxTerminalColors.primary,
+  }) => TxPageHeader(
+    icon: icon,
+    eyebrow: eyebrow,
+    title: title,
+    subtitle: subtitle,
+    status: status,
+    accent: accent,
   );
 
   Widget _metric(String label, String value) =>
@@ -902,22 +1129,109 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final profile = TxMarketProfile.of(_marketMode);
     Widget modeSelector() => ValueListenableBuilder<double>(
       valueListenable: _seconds,
-      builder: (context, seconds, child) => TxMarketModeSelector(
-        selected: _marketMode,
-        gameDay: TxRealtimeClock.gameDay(session.step, seconds.floor()),
-        minuteOfDay: TxRealtimeClock.gameMinuteOfDay(
-            session.step, seconds.floor()),
-        onSelected: (mode) => setState(() => _marketMode = mode),
-      ),
+      builder: (context, seconds, child) {
+        final independent = _independentState;
+        final gameDay = independent == null
+            ? TxRealtimeClock.gameDay(session.step, seconds.floor())
+            : independent.runtime.gameDay;
+        final minuteOfDay = independent == null
+            ? TxRealtimeClock.gameMinuteOfDay(
+                session.step, seconds.floor())
+            : independent.runtime.minuteOfDay;
+        return TxMarketModeSelector(
+          selected: _marketMode,
+          gameDay: gameDay,
+          minuteOfDay: minuteOfDay,
+          onSelected: (mode) => unawaited(_selectMarketMode(mode, session)),
+        );
+      },
     );
-    if (!profile.isCoreConnected) {
-      return ListView(padding: const EdgeInsets.all(14), children: [
-        modeSelector(),
-        TxMarketModePreviewCard(profile: profile,
-          onReturnToConnected: () => setState(() {
-            _marketMode = TxMarketMode.aShare;
-          })),
-      ]);
+    Widget sessionCard() => ValueListenableBuilder<double>(
+      valueListenable: _seconds,
+      builder: (context, seconds, child) {
+        final status = TxSession.marketSessionStatusAt(
+          committedStep: session.step,
+          fractionalSeconds: seconds.floor().clamp(0, 59).toInt(),
+        );
+        final gameDay = TxRealtimeClock.gameDay(
+            session.step, seconds.floor());
+        final minuteOfDay = TxRealtimeClock.gameMinuteOfDay(
+            session.step, seconds.floor());
+        final openAlternatives = TxMarketProfile.values.where((item) {
+          if (item.mode == TxMarketMode.aShare) return false;
+          return item.schedule.status(
+              gameDay: gameDay, minuteOfDay: minuteOfDay).isOpen;
+        }).toList();
+        final minutes = status.minutesToTransition;
+        return Card(child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                Icon(
+                  status.isOpen
+                      ? Icons.wb_sunny_outlined
+                      : Icons.nightlight_outlined,
+                  size: 18,
+                  color: status.isOpen
+                      ? TxTerminalColors.buy
+                      : TxTerminalColors.primary,
+                ),
+                const SizedBox(width: 7),
+                Expanded(child: Text('市场时段 · ${status.label}',
+                    style: const TextStyle(fontWeight: FontWeight.w700))),
+                if (minutes != null)
+                  Text('约 $minutes 分钟',
+                      style: const TextStyle(
+                          fontSize: 10,
+                          color: TxTerminalColors.secondaryText)),
+              ]),
+              const SizedBox(height: 5),
+              Text(
+                status.isOpen
+                    ? '开市中：成交与 K 线只来自真实撮合'
+                    : '休市中：无成交、无临时 K 线波动；可切换到当前开市的其他板块',
+                style: const TextStyle(
+                    fontSize: 10, color: TxTerminalColors.secondaryText),
+              ),
+              if (!status.isOpen) ...[
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: _ready ? _fastForwardClosed : null,
+                    icon: const Icon(Icons.fast_forward, size: 17),
+                    label: const Text('快进到下次开盘前'),
+                  ),
+                ),
+                if (openAlternatives.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  const Text('当前开市的其他板块', style: TextStyle(
+                      fontSize: 11, fontWeight: FontWeight.w700,
+                      color: TxTerminalColors.cyan)),
+                  const SizedBox(height: 4),
+                  Wrap(spacing: 6, runSpacing: 4, children: [
+                    for (final alternative in openAlternatives)
+                      OutlinedButton.icon(
+                        onPressed: _ready && !_busy
+                            ? () => unawaited(_selectMarketMode(
+                                alternative.mode, session))
+                            : null,
+                        icon: const Icon(Icons.swap_horiz, size: 15),
+                        label: Text('${alternative.label} · '
+                            '${alternative.instruments.first.symbol}'),
+                      ),
+                  ]),
+                ],
+              ],
+            ],
+          ),
+        ));
+      },
+    );
+    if (_independentMode) {
+      return _independentMarketContent(session, profile, modeSelector());
     }
     final minuteFills = session.currentMinuteFills
         .where((f) => f.symbol == _symbolName).toList();
@@ -925,7 +1239,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final durablePrice = _trader!.durableCurrent.session.lastPrice(_symbolName);
     final candles = _candles!.forSymbol(_symbolName);
     return ListView(padding: const EdgeInsets.all(14), children: [
+      _pageHeader(
+        icon: Icons.candlestick_chart_rounded,
+        eyebrow: 'MARKET DESK',
+        title: '${profile.label}行情',
+        subtitle: '价格、成交、盘口与市场结构；只把真实撮合结果写入 K 线与资产。',
+        status: '主市场 · Rust 真实撮合',
+        accent: TxTerminalColors.cyan,
+      ),
       modeSelector(),
+      sessionCard(),
       TxMarketRadar(quotes: [
         for (var i=0;i<TxSession.symbols.length;i++)
           TxRadarQuote(symbol:TxSession.symbols[i],
@@ -939,7 +1262,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         step: session.step, seconds: _seconds,
         quoteCurrency: profile.quoteCurrency,
         coreConnected: _tradingReady,
-        indicativeCents: (seconds) => _indication(session, seconds),
+        indicativeCents: (seconds) => _displayIndication(session, seconds),
         pending: _trader!.current.pending,
         onBuy: profile.isCoreConnected
             ? () => _openTradeTicket(TxSide.buy) : null,
@@ -951,23 +1274,27 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         padding: const EdgeInsets.all(12),
         child: ValueListenableBuilder<double>(
           valueListenable: _seconds,
-          builder: (context, seconds, child) => TxCandleChart(
-            candles: candles,
-            pending: _trader!.current.pending,
-            // Higher timeframes need the next minute bucket from the first
-            // provisional frame, not only after the first Rust pulse. Without
-            // this, 5m/15m/1h previews briefly rebase onto the last committed
-            // bar and look like one dot moving in place.
-            activeMinuteStep: (_auto || seconds > 0)
-                ? session.step + 1
-                : (session.lastPulseSecond > 0
-                    ? session.marketTimeStep : null),
-            // At exactly 0 seconds of an automatically running minute,
-            // retain the cyan display-only price marker. Otherwise it
-            // vanishes for one frame after *every* durable SQLite commit.
-            indicativeFramePriceCents: (_auto || seconds > 0)
-                ? _indication(session, seconds) : null,
-            previewSeconds: (_auto || seconds > 0) ? seconds : null))))),
+          builder: (context, seconds, child) {
+            final showPreview = _marketPreviewAllowed(session, seconds);
+            return TxCandleChart(
+              candles: candles,
+              pending: _trader!.current.pending,
+              // Higher timeframes need the next minute bucket from the first
+              // provisional frame, not only after the first Rust pulse.
+              activeMinuteStep: showPreview
+                  ? session.step + 1
+                  : (session.lastPulseSecond > 0
+                      ? session.marketTimeStep : null),
+              // At exactly 0 seconds of an automatically running minute,
+              // retain the cyan display-only price marker. Otherwise it
+              // vanishes for one frame after every durable SQLite commit.
+              indicativeFramePriceCents: showPreview
+                  ? _indication(session, seconds) : null,
+              previewSeconds: showPreview ? seconds : null,
+            );
+          },
+        ),
+      ))),
       Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(
         crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('模拟市场参与者', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -1091,18 +1418,211 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ]);
   }
 
+  Widget _independentMarketContent(TxSession session,
+      TxMarketProfile profile, Widget selector) {
+    final state = _independentState;
+    if (_independentLoading || state == null) {
+      return ListView(padding: const EdgeInsets.all(14), children: [
+        selector,
+        Card(child: Padding(
+          padding: const EdgeInsets.all(18),
+          child: Row(children: [
+            const SizedBox(width: 18, height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2)),
+            const SizedBox(width: 10),
+            Expanded(child: Text('正在打开${profile.label}独立账户、订单簿与 SQLite 快照')),
+          ]),
+        )),
+        if (_independentFault != null)
+          SelectableText(_independentFault!,
+              style: const TextStyle(color: red)),
+      ]);
+    }
+    final index = _symbol.clamp(0, profile.instruments.length - 1).toInt();
+    final instrument = profile.instruments[index];
+    final symbol = instrument.symbol;
+    final status = state.sessionStatus;
+    final mark = state.markPriceCents(symbol);
+    final candles = state.candlesFor(symbol);
+    final canTrade = _tradingReady && status.isOpen;
+    return ListView(padding: const EdgeInsets.all(14), children: [
+      _pageHeader(
+        icon: Icons.public_rounded,
+        eyebrow: 'ALTERNATIVE VENUE',
+        title: '${profile.label}行情',
+        subtitle: '独立现金、持仓、订单簿和历史；休市时冻结本板块并提示可用的其他开市市场。',
+        status: '独立账户 · CAS 快照',
+        accent: TxTerminalColors.gold,
+      ),
+      selector,
+      Card(child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(children: [
+          Icon(status.isOpen ? Icons.radio_button_checked : Icons.pause_circle,
+              size: 18,
+              color: status.isOpen ? TxTerminalColors.buy :
+                  Colors.amberAccent),
+          const SizedBox(width: 7),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+            Text('${profile.label} · ${status.label}',
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+            Text(status.isOpen
+                ? '独立账户和订单簿已连接；成交、OHLCV、资金和持仓只接受真实撮合'
+                : '当前板块休市；没有成交或临时 K 线波动，可切换到其他开市板块',
+                style: const TextStyle(fontSize: 10,
+                    color: TxTerminalColors.secondaryText)),
+          ])),
+          Text('CAS r${state.sequence}', style: const TextStyle(
+              fontSize: 10, color: TxTerminalColors.secondaryText)),
+        ]),
+      )),
+      TxMarketRadar(
+        quotes: [
+          for (final item in profile.instruments)
+            TxRadarQuote(
+              symbol: item.symbol,
+              priceCents: state.markPriceCents(item.symbol),
+              regime: '独立订单簿 · ${status.label}',
+            ),
+        ],
+        selectedIndex: index,
+        quoteCurrency: profile.quoteCurrency,
+        onSelect: (value) => setState(() {
+          _symbol = value;
+          _price.text = (state.markPriceCents(
+                  profile.instruments[value].symbol) / 100).toStringAsFixed(2);
+        }),
+      ),
+      TxMarketHero(
+        symbol: symbol,
+        committedPriceCents: mark,
+        step: _independentSessionStep(state),
+        seconds: _seconds,
+        quoteCurrency: profile.quoteCurrency,
+        coreConnected: true,
+        connectionLabel: 'DART · 独立已连接',
+        committedOnly: true,
+        indicativeCents: (_) => mark.toDouble(),
+        pending: false,
+        onBuy: canTrade ? () => _openTradeTicket(TxSide.buy) : null,
+        onSell: canTrade ? () => _openTradeTicket(TxSide.sell) : null,
+      ),
+      Card(child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Text('真实成交 K 线', style: TextStyle(fontWeight: FontWeight.w700)),
+            const Spacer(),
+            Text('${candles.length} 根 · ${state.runtime.venue.fills.length} 笔市场成交',
+                style: const TextStyle(fontSize: 10,
+                    color: TxTerminalColors.secondaryText)),
+          ]),
+          const SizedBox(height: 5),
+          const Text('独立市场只用已发生的成交构造 OHLCV；无成交时保留时间缺口，盘口报价不会伪造 K 线。',
+              style: TextStyle(fontSize: 10, color: TxTerminalColors.secondaryText)),
+          const SizedBox(height: 8),
+          TxCandleChart(
+            candles: candles,
+            activeMinuteStep: _independentTimeStep(state),
+          ),
+        ]),
+      )),
+      _independentDepth(state, symbol),
+      Card(child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('独立市场账户', style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          Text('权益 ${_quoteAmount(profile, state.playerRisk.equityCents)} · '
+              '现金 ${_quoteAmount(profile, state.playerRisk.cashCents)} · '
+              '可用保证金 ${_quoteAmount(profile, state.playerRisk.freeMarginCents)}'),
+          Text('持仓 ${state.playerRisk.positions.values
+              .where((position) => !position.isFlat).length} 个 · '
+              '已实现 ${_quoteAmount(profile, state.playerRisk.realizedPnlCents)}',
+              style: const TextStyle(fontSize: 11, color: Colors.white70)),
+          const SizedBox(height: 4),
+          const Text('这是与 A 股现货完全隔离的单机市场账户；切换板块不会改写另一市场的现金或持仓。',
+              style: TextStyle(fontSize: 10, color: Colors.white54)),
+        ]),
+      )),
+    ]);
+  }
+
+  Widget _independentDepth(TxIndependentMarketState state, String symbol,
+      {bool allowTicket = false}) {
+    final bids = state.runtime.venue.depth(symbol, TxSide.buy);
+    final asks = state.runtime.venue.depth(symbol, TxSide.sell);
+    final insight = TxOrderBookInsight.fromLevels(bids: bids, asks: asks);
+    final maxQty = [...bids.map((level) => level.quantity),
+        ...asks.map((level) => level.quantity), 1]
+      .reduce((a, b) => a > b ? a : b);
+    String price(int cents) => _quotePrice(state.profile, cents);
+    Widget levels(String title, List<TxBookLevel> values, Color color,
+        TxSide side) => Expanded(child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: TextStyle(color: color,
+                fontSize: 11, fontWeight: FontWeight.w700)),
+            if (values.isEmpty) const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('暂无挂单', style: TextStyle(fontSize: 11))),
+            for (final level in values.take(5)) InkWell(
+              onTap: allowTicket && _ready ? () => setState(() {
+                _limit = true;
+                _ticketSide = side == TxSide.buy ? TxSide.sell : TxSide.buy;
+                _timeInForce = TxTimeInForce.gtc;
+                _price.text = (level.priceCents / 100).toStringAsFixed(2);
+              }) : null,
+              child: Padding(padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Row(children: [
+                  Expanded(child: Text(price(level.priceCents),
+                      style: TextStyle(fontSize: 11, color: color))),
+                  Text('${level.quantity}', style: const TextStyle(fontSize: 11)),
+                  const SizedBox(width: 6),
+                  SizedBox(width: 42, child: LinearProgressIndicator(
+                      value: level.quantity / maxQty, minHeight: 4,
+                      color: color, backgroundColor: Colors.white12)),
+                ])),
+            ),
+          ],
+        ));
+    final spread = insight.spreadCents == null
+        ? '—' : price(insight.spreadCents!);
+    return Card(child: Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Text('真实订单簿', style: TextStyle(fontWeight: FontWeight.w700)),
+          const Spacer(),
+          Text('价差 $spread', style: const TextStyle(fontSize: 10,
+              color: TxTerminalColors.secondaryText)),
+        ]),
+        const SizedBox(height: 7),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          levels('买盘 Bids', bids, green, TxSide.buy),
+          const SizedBox(width: 14),
+          levels('卖盘 Asks', asks, red, TxSide.sell),
+        ]),
+        const SizedBox(height: 5),
+        const Text('订单簿是当前本地参与者可见的快照；点击价位只填入限价，不会绕过确认和风险校验。',
+            style: TextStyle(fontSize: 10, color: Colors.white54)),
+      ]),
+    ));
+  }
+
   Widget _phaseTimeline(int committedMinute) {
     final events = TxMarketPhaseTimeline.recent(currentStep: committedMinute);
     return Card(child: Padding(padding: const EdgeInsets.all(12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('模拟市场阶段记录',
+        const Text('市场阶段与流动性环境',
           style: TextStyle(fontWeight: FontWeight.w700)),
         const SizedBox(height: 5),
-        const Text('脚本市场环境切换，不是外部新闻或真实成交。',
+        const Text('由本地撮合规则决定的市场状态，不是外部新闻或真实成交。',
           style: TextStyle(fontSize: 11, color: Colors.white60)),
         if (events.isEmpty) const Padding(
           padding: EdgeInsets.symmetric(vertical: 6),
-          child: Text('当前游戏阶段尚无已发生的切换记录',
+          child: Text('当前时段尚无已发生的状态切换记录',
             style: TextStyle(fontSize: 12, color: Colors.white70))),
         for (final event in events) Padding(
           padding: const EdgeInsets.symmetric(vertical: 5),
@@ -1120,6 +1640,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   void _showMarketEstimate(TxSide side) {
+    if (_independentMode) {
+      final state = _independentState;
+      if (state != null) _showIndependentMarketEstimate(state, side);
+      return;
+    }
     if (!_tradingReady || _limit) return;
     final quantity = int.tryParse(_qty.text.trim());
     if (quantity == null || quantity < 1 || quantity > TxEngine.maxQuantity) {
@@ -1181,6 +1706,11 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   // buy side uses the displayed best ask/limit price as a conservative UI
   // reference, not as a promise of executable market depth or final VWAP.
   void _applyTicketPercent(TxSession session, int percent) {
+    if (_independentMode) {
+      final state = _independentState;
+      if (state != null) _applyIndependentTicketPercent(state, percent);
+      return;
+    }
     if (!_tradingReady) return;
     final account = session.engine.account(TxSession.playerId);
     int maximum;
@@ -1202,6 +1732,93 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _qty.text = '$amount';
     if (amount == 0) setState(() =>
         _notice = '可用额度不足 1 股，已填入 0 股；不会自动提交');
+  }
+
+  void _applyIndependentTicketPercent(
+      TxIndependentMarketState state, int percent) {
+    final profile = state.profile;
+    final symbol = profile.instruments[_symbol
+        .clamp(0, profile.instruments.length - 1).toInt()].symbol;
+    final risk = state.playerRisk;
+    final position = risk.positions[symbol];
+    int maximum;
+    if (_ticketSide == TxSide.sell && position != null &&
+        position.availableToClose > 0) {
+      maximum = position.availableToClose;
+    } else if (_ticketSide == TxSide.sell && !profile.supportsShort) {
+      maximum = 0;
+    } else {
+      final asks = state.runtime.venue.depth(symbol, TxSide.sell);
+      final reference = _limit ? _cents(_price.text) :
+          (asks.isEmpty ? null : asks.first.priceCents);
+      final multiplier = profile.instruments
+          .firstWhere((item) => item.symbol == symbol)
+          .contractMultiplierUnits;
+      maximum = reference == null ? 0 :
+          (risk.freeMarginCents ~/ math.max(1, reference * multiplier));
+    }
+    maximum = maximum.clamp(0, TxEngine.maxQuantity).toInt();
+    if (maximum == 0) {
+      setState(() => _notice = '当前独立账户缺少可用保证金、对手盘或可平仓数量');
+      return;
+    }
+    final amount = (maximum * percent ~/ 100).clamp(1, maximum).toInt();
+    _qty.text = '$amount';
+  }
+
+  void _showIndependentMarketEstimate(
+      TxIndependentMarketState state, TxSide side) {
+    if (_limit) return;
+    final quantity = int.tryParse(_qty.text.trim());
+    if (quantity == null || quantity < 1 || quantity > TxEngine.maxQuantity) {
+      setState(() => _notice = '请先输入有效的独立市场委托数量');
+      return;
+    }
+    final profile = state.profile;
+    final symbol = profile.instruments[_symbol
+        .clamp(0, profile.instruments.length - 1).toInt()].symbol;
+    final preview = _independentMarkets!.preview(
+      mode: state.mode,
+      symbol: symbol,
+      side: side,
+      kind: TxKind.market,
+      quantity: quantity,
+      limitPriceCents: null,
+      timeInForce: TxTimeInForce.gtc,
+      gameDay: state.runtime.gameDay,
+      minuteOfDay: state.runtime.minuteOfDay,
+    );
+    final average = preview.vwapCents == null ? '—' :
+        _quotePrice(profile, preview.vwapCents!.round());
+    final best = preview.bestPriceCents == null ? '—' :
+        _quotePrice(profile, preview.bestPriceCents!);
+    final worst = preview.worstPriceCents == null ? '—' :
+        _quotePrice(profile, preview.worstPriceCents!);
+    showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
+      title: Text('${side == TxSide.buy ? '买入' : '卖出'}市价试算 · $symbol'),
+      content: SingleChildScrollView(child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('独立订单簿 CAS r${state.sequence}',
+              style: const TextStyle(color: Colors.white70, fontSize: 12)),
+          const SizedBox(height: 8),
+          Text('申请 $quantity · 预计成交 ${preview.executableQuantity}'),
+          Text('预计剩余 ${preview.remainingQuantity} · 消耗 ${preview.levelsConsumed} 档'),
+          Text('预计 VWAP $average · 最优 $best · 最差 $worst'),
+          if (!preview.accepted || !preview.fullyExecutable)
+            Text('执行提示：${preview.reason ?? '可见深度不足，可能部分成交'}',
+                style: const TextStyle(color: Colors.amberAccent)),
+          const SizedBox(height: 8),
+          const Text('只读试算，不冻结资金、不修改订单簿；确认时会重新执行风险和深度校验。',
+              style: TextStyle(color: Colors.white54, fontSize: 12)),
+        ],
+      )),
+      actions: [TextButton(
+        onPressed: () => Navigator.of(dialogContext).pop(),
+        child: const Text('关闭试算'),
+      )],
+    ));
   }
 
   // The compact, tap-to-fill order book is read from verified resting bids
@@ -1287,11 +1904,136 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ));
   }
 
+  void _confirmIndependentTicket() {
+    final state = _independentState;
+    if (state == null || !_tradingReady) return;
+    final status = state.sessionStatus;
+    if (!status.isOpen) {
+      setState(() => _notice = '${state.profile.label}${status.label}，交易入口已锁定');
+      return;
+    }
+    final profile = state.profile;
+    final symbol = profile.instruments[_symbol
+        .clamp(0, profile.instruments.length - 1).toInt()].symbol;
+    final quantityText = _qty.text.trim();
+    final quantity = int.tryParse(quantityText);
+    final limit = _limit ? _cents(_price.text.trim()) : null;
+    if (quantity == null || quantity < 1 || quantity > TxEngine.maxQuantity ||
+        (_limit && limit == null)) {
+      setState(() => _notice = '请检查独立市场委托数量和限价');
+      return;
+    }
+    if (_auto) _pause();
+    FocusManager.instance.primaryFocus?.unfocus();
+    final side = _ticketSide;
+    final sequence = state.sequence;
+    showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
+      title: Text('确认${side == TxSide.buy ? '买入' : '卖出'} · $symbol'),
+      content: Column(mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('市场：${profile.label} · 独立账户'),
+        Text('类型：${_limit ? '限价 ${_quotePrice(profile, limit!)}' : '市价'}'),
+        Text('数量：$quantity · TIF：${_limit ? _timeInForce.label : 'GTC'}'),
+        Text('订单簿修订：CAS r$sequence'),
+        const SizedBox(height: 8),
+        const Text('确认后会以当前本地订单簿重新撮合；余额、保证金、手续费和成交记录原子写入独立市场快照。',
+            style: TextStyle(color: Colors.white70, fontSize: 12)),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消')),
+        FilledButton(onPressed: () {
+          Navigator.of(dialogContext).pop();
+          if (!mounted) return;
+          final current = _independentState;
+          if (current == null || current.sequence != sequence ||
+              _marketMode != current.mode || _ticketSide != side ||
+              _qty.text.trim() != quantityText ||
+              (_limit ? _cents(_price.text.trim()) : null) != limit) {
+            setState(() => _notice = '独立市场快照或委托参数已变化，请重新检查');
+            return;
+          }
+          _independentTrade(side);
+        }, child: Text('确认${side == TxSide.buy ? '买入' : '卖出'}')),
+      ],
+    ));
+  }
+
+  void _independentTrade(TxSide side) {
+    final service = _independentMarkets;
+    final state = _independentState;
+    if (service == null || state == null || !_tradingReady) return;
+    final quantity = int.tryParse(_qty.text.trim());
+    final limit = _limit ? _cents(_price.text.trim()) : null;
+    if (quantity == null || quantity < 1 || quantity > TxEngine.maxQuantity ||
+        (_limit && limit == null)) return;
+    _independentOperate(() async {
+      final order = await service.place(
+        mode: state.mode,
+        symbol: state.profile.instruments[_symbol
+            .clamp(0, state.profile.instruments.length - 1).toInt()].symbol,
+        side: side,
+        kind: _limit ? TxKind.limit : TxKind.market,
+        quantity: quantity,
+        limitPriceCents: limit,
+        timeInForce: _limit ? _timeInForce : TxTimeInForce.gtc,
+        gameDay: state.runtime.gameDay,
+        minuteOfDay: state.runtime.minuteOfDay,
+      );
+      _marketRepaint.value++;
+      return '${order.id} · 成交${order.filled} · 余量${order.remaining} · '
+          '${order.status.name} · CAS r${state.sequence}';
+    });
+  }
+
+  void _cancelIndependent(String orderId) {
+    final service = _independentMarkets;
+    final state = _independentState;
+    if (service == null || state == null) return;
+    _independentOperate(() async {
+      final order = await service.cancel(mode: state.mode, orderId: orderId);
+      _marketRepaint.value++;
+      return '$orderId 已撤销 · ${order.status.name} · CAS r${state.sequence}';
+    });
+  }
+
+  void _independentOperate(Future<String> Function() operation) {
+    if (!_ready || _busy || _independentMarkets == null) return;
+    if (_auto) _pause();
+    setState(() => _busy = true);
+    final task = _performIndependent(operation);
+    _operation = task;
+    unawaited(task.then<void>((_) {
+      if (identical(_operation, task)) _operation = null;
+    }, onError: (Object _, StackTrace __) {
+      if (identical(_operation, task)) _operation = null;
+    }));
+  }
+
+  Future<void> _performIndependent(Future<String> Function() operation) async {
+    try {
+      final notice = await operation();
+      if (mounted) setState(() => _notice = notice);
+    } catch (error) {
+      _pause();
+      if (mounted) setState(() {
+        _independentFault = '独立市场操作失败，已停止运行：$error';
+        _fault = _independentFault;
+      });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   /// A review is separate from an order. Entering review pauses the visual
   /// clock, and revision + input fields must still match at confirmation.
   void _confirmTicket() {
+    if (_independentMode) {
+      _confirmIndependentTicket();
+      return;
+    }
     if (!_tradingReady) {
-      setState(() => _notice = '当前市场模式仅规则预览，切回 A 股后才可提交订单');
+      setState(() => _notice = '当前交易核心尚未就绪，请等待市场校验完成后重试');
       return;
     }
     final sessionStatus = TxSession.marketSessionStatusAt(
@@ -1367,25 +2109,225 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ));
   }
 
+  Widget _chooseIndependentSymbol(TxIndependentMarketState state) {
+    final profile = state.profile;
+    final selected = _symbol.clamp(0, profile.instruments.length - 1).toInt();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: SegmentedButton<int>(
+          segments: [
+            for (var i = 0; i < profile.instruments.length; i++)
+              ButtonSegment<int>(
+                value: i,
+                label: Text(profile.instruments[i].symbol),
+              ),
+          ],
+          selected: {selected},
+          onSelectionChanged: (values) => setState(() {
+            _symbol = values.first;
+            _price.text = (state.markPriceCents(
+                    profile.instruments[_symbol].symbol) / 100)
+                .toStringAsFixed(2);
+          }),
+        ),
+      ),
+    );
+  }
+
+  Widget _independentTrading(TxSession session) {
+    final state = _independentState;
+    if (_independentLoading || state == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final profile = state.profile;
+    final index = _symbol.clamp(0, profile.instruments.length - 1).toInt();
+    final instrument = profile.instruments[index];
+    final symbol = instrument.symbol;
+    final status = state.sessionStatus;
+    final canTrade = _tradingReady && status.isOpen;
+    final risk = state.playerRisk;
+    final asks = state.runtime.venue.depth(symbol, TxSide.sell);
+    final bids = state.runtime.venue.depth(symbol, TxSide.buy);
+    final active = state.runtime.venue.activeOrders
+        .where((order) => order.ownerId == TxIndependentMarketState.playerId)
+        .toList();
+    final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
+    Widget reviewButton() => TxTicketSubmitBar(
+        side: _ticketSide,
+        isLimit: _limit,
+        timeInForce: _timeInForce,
+        enabled: canTrade,
+        onReview: _confirmTicket,
+      );
+    return Column(children: [
+      Expanded(child: ListView(
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 14),
+        children: [
+          _pageHeader(
+            icon: Icons.swap_horiz_rounded,
+            eyebrow: 'ORDER DESK',
+            title: '交易委托',
+            subtitle: '${profile.label} · 独立账户 · ${profile.quoteCurrency} · 先看盘口，再确认订单。',
+            status: canTrade ? '可下单 · 真实订单簿' : '休市 · 入口锁定',
+            accent: canTrade ? TxTerminalColors.buy : TxTerminalColors.gold,
+          ),
+          if (!status.isOpen)
+            Card(child: ListTile(
+              dense: true,
+              leading: Icon(status.isBreak ? Icons.pause_circle_outline :
+                  Icons.event_busy, color: Colors.amberAccent),
+              title: Text('当前${status.label}'),
+              subtitle: const Text('订单入口已锁定；未成交 GTC 委托保留到下一开市边界。'),
+            )),
+          _chooseIndependentSymbol(state),
+          _title('订单参数', sub: '选择方向、订单类型、数量和有效方式；确认前不会冻结资金。'),
+          Card(child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(children: [
+              SizedBox(width: double.infinity,
+                child: SegmentedButton<TxSide>(
+                  segments: const [
+                    ButtonSegment(value: TxSide.buy, label: Text('买入 Buy'),
+                        icon: Icon(Icons.trending_up)),
+                    ButtonSegment(value: TxSide.sell, label: Text('卖出 Sell'),
+                        icon: Icon(Icons.trending_down)),
+                  ],
+                  selected: {_ticketSide},
+                  onSelectionChanged: !canTrade ? null :
+                      (values) => setState(() => _ticketSide = values.first),
+                )),
+              const SizedBox(height: 12),
+              Wrap(children: [
+                _metric('现金', _quoteAmount(profile, risk.cashCents)),
+                _metric('可用保证金', _quoteAmount(profile, risk.freeMarginCents)),
+                _metric('卖一', asks.isEmpty ? '—' :
+                    _quotePrice(profile, asks.first.priceCents)),
+                _metric('买一', bids.isEmpty ? '—' :
+                    _quotePrice(profile, bids.first.priceCents)),
+              ]),
+              const SizedBox(height: 6),
+              SizedBox(width: double.infinity,
+                child: SegmentedButton<bool>(
+                  segments: const [
+                    ButtonSegment(value: false, label: Text('市价 Market'),
+                        icon: Icon(Icons.bolt_outlined)),
+                    ButtonSegment(value: true, label: Text('限价 Limit'),
+                        icon: Icon(Icons.tune)),
+                  ],
+                  selected: {_limit},
+                  onSelectionChanged: !canTrade ? null : (values) => setState(() {
+                    _limit = values.first;
+                    if (!_limit) _timeInForce = TxTimeInForce.gtc;
+                  }),
+                )),
+              if (_limit) ...[
+                const SizedBox(height: 8),
+                SingleChildScrollView(scrollDirection: Axis.horizontal,
+                  child: SegmentedButton<TxTimeInForce>(
+                    segments: const [
+                      ButtonSegment(value: TxTimeInForce.gtc, label: Text('GTC')),
+                      ButtonSegment(value: TxTimeInForce.postOnly,
+                          label: Text('Post Only')),
+                      ButtonSegment(value: TxTimeInForce.ioc, label: Text('IOC')),
+                      ButtonSegment(value: TxTimeInForce.fok, label: Text('FOK')),
+                    ],
+                    selected: {_timeInForce},
+                    onSelectionChanged: !canTrade ? null :
+                        (values) => setState(() => _timeInForce = values.first),
+                  )),
+                const SizedBox(height: 4),
+                Text(
+                  switch (_timeInForce) {
+                    TxTimeInForce.gtc => 'GTC：剩余数量留在本地订单簿。',
+                    TxTimeInForce.postOnly => 'Post Only：会吃掉对手盘时整单拒绝。',
+                    TxTimeInForce.ioc => 'IOC：允许部分成交，剩余立即撤销。',
+                    TxTimeInForce.fok => 'FOK：深度不足时整单取消。',
+                  },
+                  style: const TextStyle(fontSize: 11, color: Colors.white60),
+                ),
+              ],
+              if (_limit) Wrap(spacing: 6, children: [
+                ActionChip(label: const Text('卖一'), onPressed: asks.isEmpty ||
+                    !canTrade ? null : () => _price.text =
+                    (asks.first.priceCents / 100).toStringAsFixed(2)),
+                ActionChip(label: const Text('买一'), onPressed: bids.isEmpty ||
+                    !canTrade ? null : () => _price.text =
+                    (bids.first.priceCents / 100).toStringAsFixed(2)),
+              ]),
+              const Align(alignment: Alignment.centerLeft,
+                  child: Text('快捷数量', style: TextStyle(color: Colors.white70))),
+              Wrap(spacing: 5, children: [
+                for (final amount in const [1, 10, 100, 500])
+                  ActionChip(label: Text('$amount ${instrument.orderUnit}'),
+                      onPressed: canTrade ? () => _qty.text = '$amount' : null),
+              ]),
+              const SizedBox(height: 5),
+              Wrap(spacing: 5, children: [
+                for (final percent in const [25, 50, 75, 100])
+                  ActionChip(label: Text('$percent%'),
+                      onPressed: canTrade ? () =>
+                          _applyIndependentTicketPercent(state, percent) : null),
+              ]),
+              const SizedBox(height: 6),
+              TextField(controller: _qty, enabled: canTrade,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                    labelText: '委托数量（${instrument.orderUnit}）',
+                    border: const OutlineInputBorder())),
+              if (_limit) ...[
+                const SizedBox(height: 10),
+                TextField(controller: _price, enabled: canTrade,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: InputDecoration(
+                      labelText: '限价（${profile.quoteCurrency}）',
+                      border: const OutlineInputBorder())),
+              ],
+              const SizedBox(height: 9),
+              if (!_limit) Row(children: [
+                Expanded(child: OutlinedButton.icon(
+                  onPressed: canTrade ? () =>
+                      _showIndependentMarketEstimate(state, TxSide.buy) : null,
+                  icon: const Icon(Icons.calculate_outlined, size: 17),
+                  label: const Text('试算买入'))),
+                const SizedBox(width: 8),
+                Expanded(child: OutlinedButton.icon(
+                  onPressed: canTrade ? () =>
+                      _showIndependentMarketEstimate(state, TxSide.sell) : null,
+                  icon: const Icon(Icons.calculate_outlined, size: 17),
+                  label: const Text('试算卖出'))),
+              ]),
+              if (keyboardOpen) reviewButton(),
+            ]),
+          )),
+          if (active.isNotEmpty) Card(child: ExpansionTile(
+            title: Text('活动委托（${active.length}）'),
+            subtitle: const Text('独立市场未成交委托；点击撤单只影响当前板块'),
+            children: [for (final order in active) ListTile(
+              dense: true,
+              title: Text('${order.symbol} · ${order.side == TxSide.buy ? '买' : '卖'} '
+                  '${order.remaining}/${order.quantity}'),
+              subtitle: Text('${order.id} · ${order.timeInForce.label}'),
+              trailing: IconButton(
+                tooltip: '撤单',
+                icon: const Icon(Icons.close),
+                onPressed: _ready ? () => _cancelIndependent(order.id) : null,
+              ),
+            )],
+          )),
+          _independentDepth(state, symbol, allowTicket: true),
+        ],
+      )),
+      if (!keyboardOpen) reviewButton(),
+    ]);
+  }
+
   Widget _trading(TxSession session) {
+    if (_independentMode) return _independentTrading(session);
     final profile = TxMarketProfile.of(_marketMode);
     final canTrade = _tradingReady && session.marketSessionStatus.isOpen;
-    if (!profile.isCoreConnected) {
-      return Column(children: [
-        Expanded(child: ListView(
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 14),
-          children: [
-            _title('交易委托', sub: '${profile.label} · 规则预览'),
-            TxMarketModePreviewCard(profile: profile,
-              onReturnToConnected: () => setState(() {
-                _marketMode = TxMarketMode.aShare;
-              })),
-            const Text('下单入口已锁定，不会把现货订单误投到其他市场。',
-                style: TextStyle(fontSize: 11, color: Colors.white60)),
-          ],
-        )),
-      ]);
-    }
     final account = session.engine.account(TxSession.playerId);
     final ask = session.engine.depth(_symbolName, TxSide.sell);
     final bid = session.engine.depth(_symbolName, TxSide.buy);
@@ -1401,7 +2343,14 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       Expanded(child: ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.fromLTRB(12, 4, 12, 14), children: [
-      _title('交易委托', sub: '${profile.label} · 市价可能跨档滑点；真实资金/库存限制'),
+      _pageHeader(
+        icon: Icons.swap_horiz_rounded,
+        eyebrow: 'ORDER DESK',
+        title: '交易委托',
+        subtitle: '${profile.label} · 先核对可用资金、盘口和滑点，再提交真实订单。',
+        status: canTrade ? '可下单 · 真实订单簿' : '休市 · 入口锁定',
+        accent: canTrade ? TxTerminalColors.buy : TxTerminalColors.gold,
+      ),
       if (!session.marketSessionStatus.isOpen)
         Card(child: ListTile(
           dense: true,
@@ -1412,6 +2361,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           subtitle: const Text('交易入口已锁定；玩家 GTC 委托保留，开市后再参与撮合。'),
         )),
       _chooseSymbol(session),
+      _title('订单参数', sub: '选择方向、订单类型、数量和有效方式；确认前不会冻结资金。'),
       Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(children: [
         SizedBox(width: double.infinity, child: SegmentedButton<TxSide>(
           segments: const [
@@ -1593,6 +2543,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   );
 
   Widget _assets(TxSession session, TxStoredSession saved) {
+    if (_independentMode) return _independentAssets();
     final account = session.engine.account(TxSession.playerId);
     final holdings = _positionsForRevision(session, saved.revision);
     // Concentration/liquidity diagnostics are intentionally anchored to the
@@ -1606,11 +2557,21 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     Widget pnlValue(String label, int amount) =>
       _metric(label, signedMoney(amount));
     return ListView(padding: const EdgeInsets.all(14), children: [
-      _title('资金与资产', sub: '估值随分时指示价连续变动；现金与已实现收益只按真实成交结算'),
+      _pageHeader(
+        icon: Icons.account_balance_wallet_rounded,
+        eyebrow: 'PORTFOLIO',
+        title: '资金与资产',
+        subtitle: '先看权益与现金，再看风险、压力测试和每个标的的成本收益。',
+        status: saved.pending ? '有待保存状态' : 'SQLite 已落盘',
+        accent: saved.pending ? TxTerminalColors.gold : TxTerminalColors.primary,
+      ),
+      _title('账户总览', sub: '开市低倍率时估值随指示价变动；现金与已实现收益只按真实成交结算'),
       ValueListenableBuilder<double>(valueListenable: _seconds,
         builder: (context, seconds, _) {
+          final valuationSeconds = _marketPreviewAllowed(session, seconds)
+              ? seconds : 0.0;
           final mark = TxLivePortfolioValuation.evaluate(
-              session, holdings, seconds);
+              session, holdings, valuationSeconds);
           return Card(child: Padding(padding: const EdgeInsets.all(12),
             child: Wrap(children: [
               _metric('实时预估总资产', '¥${money(mark.totalAssetsCents)}'),
@@ -1683,8 +2644,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                 '· 持仓成本 ¥${money(holdings[symbol]!.costBasisCents)}'),
             ValueListenableBuilder<double>(valueListenable: _seconds,
               builder: (context, seconds, _) {
+                final valuationSeconds = _marketPreviewAllowed(session, seconds)
+                    ? seconds : 0.0;
                 final mark = TxLivePortfolioValuation.evaluate(
-                    session, holdings, seconds);
+                    session, holdings, valuationSeconds);
                 final market = mark.marketValuesCents[symbol]!;
                 final basis = holdings[symbol]!.costBasisCents;
                 final floatPnl = market - basis;
@@ -1821,6 +2784,105 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ]);
   }
 
+  Widget _independentAssets() {
+    final state = _independentState;
+    if (_independentLoading || state == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final profile = state.profile;
+    final risk = state.playerRisk;
+    return ListView(padding: const EdgeInsets.all(14), children: [
+      _pageHeader(
+        icon: Icons.account_balance_wallet_rounded,
+        eyebrow: 'PORTFOLIO',
+        title: '资金与资产',
+        subtitle: '${profile.label} · 独立账户与 A 股完全隔离，风险只按本板块真实成交计算。',
+        status: '独立账户 · CAS r${state.sequence}',
+        accent: TxTerminalColors.gold,
+      ),
+      _title('账户总览', sub: '现金、保证金、持仓与已实现收益按本市场单独统计'),
+      Card(child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Wrap(children: [
+          _metric('权益', _quoteAmount(profile, risk.equityCents)),
+          _metric('现金', _quoteAmount(profile, risk.cashCents)),
+          _metric('可用保证金', _quoteAmount(profile, risk.freeMarginCents)),
+          _metric('已用保证金', _quoteAmount(profile, risk.usedMarginCents)),
+          _metric('未实现盈亏', _quoteAmount(profile, risk.unrealizedPnlCents)),
+          _metric('已实现盈亏', _quoteAmount(profile, risk.realizedPnlCents)),
+        ]),
+      )),
+      Card(child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('保证金风险', style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          if (risk.marginRatio == null)
+            const Text('当前无保证金持仓', style: TextStyle(color: Colors.white70))
+          else ...[
+            Text('维持保证金率 ${(risk.marginRatio! * 100).toStringAsFixed(1)}%'),
+            LinearProgressIndicator(
+                value: (risk.marginRatio! / 4).clamp(0.0, 1.0).toDouble(),
+                minHeight: 5),
+          ],
+          if (risk.liquidationRequired)
+            const Text('保证金不足：只允许通过真实对手盘减仓或强平',
+                style: TextStyle(color: red)),
+          const SizedBox(height: 4),
+          const Text('估值只使用独立市场已保存标记；不会把指示价当成成交或现金。',
+              style: TextStyle(fontSize: 10, color: Colors.white54)),
+        ]),
+      )),
+      _title('独立市场持仓', sub: '移动加权成本 · 真实成交费用已计入账户核心'),
+      for (final instrument in profile.instruments)
+        _independentPositionCard(state, instrument.symbol),
+    ]);
+  }
+
+  Widget _independentPositionCard(TxIndependentMarketState state,
+      String symbol) {
+    final position = state.playerRisk.positions[symbol];
+    final profile = state.profile;
+    final mark = state.markPriceCents(symbol);
+    final instrument = profile.instruments.firstWhere(
+        (item) => item.symbol == symbol);
+    final quantity = position?.netQuantity ?? 0;
+    final unrealized = position == null || position.isFlat
+        ? 0
+        : (mark - position.averageEntryCents) * position.netQuantity *
+            instrument.contractMultiplierUnits;
+    return Card(child: Padding(
+      padding: const EdgeInsets.all(14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(symbol,
+              style: const TextStyle(fontWeight: FontWeight.w700))),
+          Text(_quotePrice(profile, mark)),
+        ]),
+        const SizedBox(height: 5),
+        Text('净仓 $quantity ${instrument.orderUnit} · '
+            '可平 ${position?.availableToClose ?? 0} ${instrument.orderUnit}'),
+        if (position != null && !position.isFlat) ...[
+          Text('平均成本 ${_quotePrice(profile, position.averageEntryCents)} · '
+              '浮动 ${_quoteAmount(profile, unrealized)}'),
+          Text('已实现 ${_quoteAmount(profile, position.realizedPnlCents)}'),
+        ] else
+          const Text('当前无持仓', style: TextStyle(color: Colors.white54)),
+        Align(alignment: Alignment.centerRight,
+          child: TextButton(onPressed: () {
+            final index = profile.instruments.indexWhere(
+                (item) => item.symbol == symbol);
+            if (index < 0) return;
+            setState(() {
+              _symbol = index;
+              _page = 1;
+              _price.text = (mark / 100).toStringAsFixed(2);
+            });
+          }, child: const Text('交易此标的 →'))),
+      ]),
+    ));
+  }
+
   Widget _settings(TxStoredSession saved) {
     final footprint = _storageFootprint;
     final measuredSpeed = _committedSpeed.sampleCount < 2
@@ -1885,6 +2947,14 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       Padding(padding: const EdgeInsets.fromLTRB(14, 14, 14, 4),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            _pageHeader(
+              icon: Icons.receipt_long_rounded,
+              eyebrow: 'TAPE & REVIEW',
+              title: '市场真实逐笔',
+              subtitle: '逐笔成交只展示已发生的撮合；订单、成交和复盘分开浏览。',
+              status: '最近 $shown / $total 笔',
+              accent: TxTerminalColors.cyan,
+            ),
             _title('市场真实逐笔', sub: '默认最新 24 条，按需显示；历史成交及资金账本永久保留'),
             SingleChildScrollView(scrollDirection: Axis.horizontal,
               child: SegmentedButton<int>(segments: const [
@@ -1925,6 +2995,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   }
 
   Widget _records(TxSession session) {
+    if (_independentMode) return _independentRecords();
     if (_recordMode == 2) return _marketTape(session);
     // Only prepare the visible tab. In particular, opening the orders tab
     // must not walk the entire ever-growing market fill history.
@@ -1935,7 +3006,15 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final journal = _recordMode == 3
         ? _journalForRevision(session,_trader!.current.revision) : null;
     return ListView(padding: const EdgeInsets.all(14), children: [
-      _title('真实成交与交易复盘', sub: '委托与逐笔展示最近 100 条；复盘汇总全部已提交成交'),
+      _pageHeader(
+        icon: Icons.receipt_long_rounded,
+        eyebrow: 'TAPE & REVIEW',
+        title: '真实成交与交易复盘',
+        subtitle: '把我的委托、我的成交、市场逐笔和成本复盘分成四个独立视图。',
+        status: '只读账本 · 最近 100 条',
+        accent: TxTerminalColors.cyan,
+      ),
+      _title('记录分类', sub: '委托与逐笔展示最近 100 条；复盘汇总全部已提交成交'),
       SingleChildScrollView(scrollDirection:Axis.horizontal,
         child:SegmentedButton<int>(segments: const [
         ButtonSegment(value: 0, label: Text('我的委托')),
@@ -1995,6 +3074,68 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ]);
   }
 
+  Widget _independentRecords() {
+    final state = _independentState;
+    if (_independentLoading || state == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final profile = state.profile;
+    final fills = state.runtime.venue.fills.reversed.where((fill) {
+      final buy = state.runtime.venue.order(fill.buyOrderId).ownerId;
+      final sell = state.runtime.venue.order(fill.sellOrderId).ownerId;
+      return buy == TxIndependentMarketState.playerId ||
+          sell == TxIndependentMarketState.playerId;
+    }).take(100).toList();
+    final orders = state.runtime.venue.orders.reversed.where(
+        (order) => order.ownerId == TxIndependentMarketState.playerId)
+        .take(100).toList();
+    return ListView(padding: const EdgeInsets.all(14), children: [
+      _pageHeader(
+        icon: Icons.receipt_long_rounded,
+        eyebrow: 'TAPE & REVIEW',
+        title: '真实成交与订单',
+        subtitle: '${profile.label} · 订单、成交与 CAS 版本分开核对，不混入其他市场。',
+        status: '独立账本 · 最近 100 条',
+        accent: TxTerminalColors.gold,
+      ),
+      _title('记录分类', sub: '未成交委托可撤单；成交记录只来自本板块订单簿'),
+      Card(child: ListTile(
+        title: Text('市场成交 ${state.runtime.venue.fills.length} 笔 · '
+            '我的成交 ${fills.length} 笔'),
+        subtitle: Text('个人委托 ${orders.length} 笔 · CAS r${state.sequence}'),
+      )),
+      if (orders.isNotEmpty) ...[
+        const Text('最近委托', style: TextStyle(fontWeight: FontWeight.w700)),
+        for (final order in orders) Card(child: ListTile(
+          dense: true,
+          title: Text('${order.symbol} · ${order.side == TxSide.buy ? '买' : '卖'} '
+              '成交${order.filled}/${order.quantity}'),
+          subtitle: Text('${order.id} · ${order.timeInForce.label} · '
+              '${order.status.name}${order.rejectReason == null ? '' :
+                ' · ${order.rejectReason}'}'),
+          trailing: order.remaining > 0 &&
+                  (order.status == TxStatus.open ||
+                      order.status == TxStatus.partiallyFilled)
+              ? IconButton(icon: const Icon(Icons.close),
+                  onPressed: _ready ? () => _cancelIndependent(order.id) : null)
+              : null,
+        )),
+      ],
+      if (fills.isEmpty)
+        const ListTile(title: Text('当前独立账户暂无成交')),
+      for (final fill in fills)
+        Card(child: ListTile(
+          dense: true,
+          title: Text('${fill.symbol} · ${fill.quantity} · '
+              '${_quotePrice(profile, fill.priceCents)}'),
+          subtitle: Text('第 ${fill.gameDay} 天 '
+              '${fill.minuteOfDay ~/ 60}:${(fill.minuteOfDay % 60).toString().padLeft(2, '0')} · '
+              '${fill.id}'),
+          trailing: Text(fill.buyOrderId.startsWith('PLAYER') ? '买入' : '卖出'),
+        )),
+    ]);
+  }
+
   /// Android system Back: return to the market tab, then request explicit
   /// confirmation before exiting. If an atomic trade is in flight, refusing
   /// the exit preserves the single-writer transaction boundary.
@@ -2047,6 +3188,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Future<void> _closeTrader() async {
     final trader = _trader;
     if (trader == null) return;
+    try {
+      await _independentMarkets?.waitForIdle();
+    } catch (_) {
+      // The independent adapter is fail-closed; the primary SQLite close
+      // still runs so an already committed A-share state is not stranded.
+    }
     final warmup = _candleWarmup;
     if (warmup != null) {
       try {
@@ -2186,11 +3333,26 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         ? null : NavigationBar(selectedIndex: _page,
         onDestinationSelected: (i) => setState(() => _page=i),
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.candlestick_chart), label: '行情'),
-          NavigationDestination(icon: Icon(Icons.swap_horiz), label: '交易'),
-          NavigationDestination(icon: Icon(Icons.account_balance_wallet), label: '资产'),
-          NavigationDestination(icon: Icon(Icons.receipt_long), label: '记录'),
-          NavigationDestination(icon: Icon(Icons.settings_outlined), label: '设置'),
+          NavigationDestination(
+            icon: Icon(Icons.show_chart),
+            selectedIcon: Icon(Icons.candlestick_chart),
+            label: '行情'),
+          NavigationDestination(
+            icon: Icon(Icons.swap_horiz_outlined),
+            selectedIcon: Icon(Icons.swap_horiz),
+            label: '交易'),
+          NavigationDestination(
+            icon: Icon(Icons.account_balance_wallet_outlined),
+            selectedIcon: Icon(Icons.account_balance_wallet),
+            label: '资产'),
+          NavigationDestination(
+            icon: Icon(Icons.receipt_long_outlined),
+            selectedIcon: Icon(Icons.receipt_long),
+            label: '记录'),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: '设置'),
         ]),
     );
   }

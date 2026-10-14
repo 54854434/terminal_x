@@ -43,6 +43,10 @@ class TxMarketProfile {
 
   bool get isCoreConnected => mode == TxMarketMode.aShare;
 
+  /// Non-A-share modes use the independent Dart/SQLite venue once the UI
+  /// opens them. This is deliberately separate from the Rust A-share flag.
+  bool get hasIndependentRuntime => mode != TxMarketMode.aShare;
+
   static const aShare = TxMarketProfile(
     mode: TxMarketMode.aShare,
     label: 'A股',
@@ -86,8 +90,8 @@ class TxMarketProfile {
     tickSize: '\$0.01',
     maxLeverage: '2× 预览',
     supportsShort: true,
-    coreStatus: '规则层、风控、撮合、快照、费率、行情标记、原子日结与运行时协议已接入 · SQLite 独立快照边界已完成 · Flutter/Rust 接线开发中',
-    independentCoreProgress: 0.92,
+    coreStatus: '独立 Dart 撮合、风控、盘口、成交、行情标记与 SQLite CAS 运行时已连接 · 与 A 股现货账本隔离',
+    independentCoreProgress: 1.0,
     schedule: TxMarketSessionSchedules.usEquity,
     instruments: [
       TxMarketInstrument(
@@ -118,8 +122,8 @@ class TxMarketProfile {
     tickSize: '合约最小变动',
     maxLeverage: '10× 预览',
     supportsShort: true,
-    coreStatus: '规则层、风控、撮合、快照、费率、行情标记、原子日结与运行时协议已接入 · SQLite 独立快照边界已完成 · Flutter/Rust 接线开发中',
-    independentCoreProgress: 0.92,
+    coreStatus: '独立 Dart 撮合、风控、盘口、成交、行情标记与 SQLite CAS 运行时已连接 · 与 A 股现货账本隔离',
+    independentCoreProgress: 1.0,
     schedule: TxMarketSessionSchedules.futures,
     instruments: [
       TxMarketInstrument(
@@ -150,8 +154,8 @@ class TxMarketProfile {
     tickSize: '按交易对配置',
     maxLeverage: '20× 预览',
     supportsShort: true,
-    coreStatus: '规则层、风控、撮合、快照、费率、行情标记、原子日结与运行时协议已接入 · SQLite 独立快照边界已完成 · Flutter/Rust 接线开发中',
-    independentCoreProgress: 0.92,
+    coreStatus: '独立 Dart 撮合、风控、盘口、成交、行情标记与 SQLite CAS 运行时已连接 · 与 A 股现货账本隔离',
+    independentCoreProgress: 1.0,
     schedule: TxMarketSessionSchedules.crypto,
     instruments: [
       TxMarketInstrument(
@@ -182,8 +186,8 @@ class TxMarketProfile {
     tickSize: '点/小数位配置',
     maxLeverage: '30× 预览',
     supportsShort: true,
-    coreStatus: '规则层、风控、撮合、快照、费率、行情标记、原子日结与运行时协议已接入 · SQLite 独立快照边界已完成 · Flutter/Rust 接线开发中',
-    independentCoreProgress: 0.92,
+    coreStatus: '独立 Dart 撮合、风控、盘口、成交、行情标记与 SQLite CAS 运行时已连接 · 与 A 股现货账本隔离',
+    independentCoreProgress: 1.0,
     schedule: TxMarketSessionSchedules.forex,
     instruments: [
       TxMarketInstrument(

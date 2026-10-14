@@ -36,7 +36,7 @@ void main() {
         TxMarketEcosystemCard(session: TxSession.freshWithAgents(),
             symbol: 'SIM-A01', profile: TxMarketProfile.crypto))));
 
-    expect(find.text('虚拟货币 · 规则预览'), findsOneWidget);
+    expect(find.text('虚拟货币 · 独立核心'), findsOneWidget);
     expect(find.textContaining('不会复用 A 股现货账本'), findsOneWidget);
     expect(find.text('₮'), findsNothing);
     expect(tester.takeException(), isNull);

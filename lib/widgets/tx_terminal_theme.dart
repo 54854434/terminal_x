@@ -7,12 +7,15 @@ class TxTerminalColors {
   const TxTerminalColors._();
   static const background = Color(0xFF090F19);
   static const surface = Color(0xFF121D2B);
+  static const surfaceElevated = Color(0xFF17263A);
   static const raised = Color(0xFF19283A);
   static const border = Color(0xFF2A3A4E);
   static const primary = Color(0xFF81ACFF);
   static const cyan = Color(0xFF63DEEE);
+  static const gold = Color(0xFFE6C675);
   static const buy = Color(0xFF3DD3A5);
   static const sell = Color(0xFFFF707A);
+  static const textPrimary = Color(0xFFE7EDF6);
   static const secondaryText = Color(0xFFA6B5C9);
 }
 
@@ -33,19 +36,33 @@ class TxTerminalTheme {
           primary: TxTerminalColors.primary,
           surface: TxTerminalColors.surface,
           error: TxTerminalColors.sell),
+      textTheme: base.textTheme.apply(
+        bodyColor: TxTerminalColors.textPrimary,
+        displayColor: TxTerminalColors.textPrimary,
+      ),
       appBarTheme: const AppBarTheme(
         backgroundColor: TxTerminalColors.background,
         surfaceTintColor: Colors.transparent,
         elevation: 0,
-        centerTitle: false),
+        centerTitle: false,
+        titleSpacing: 16),
       cardTheme: const CardThemeData(
         color: TxTerminalColors.surface, shape: rounded,
-        elevation: 0, margin: EdgeInsets.symmetric(vertical: 5)),
-      dividerColor: TxTerminalColors.border,
+        elevation: 0, margin: EdgeInsets.symmetric(vertical: 6),
+        clipBehavior: Clip.antiAlias),
+      dividerTheme: const DividerThemeData(
+        color: TxTerminalColors.border,
+        thickness: 1,
+        space: 1),
+      listTileTheme: const ListTileThemeData(
+        contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+        iconColor: TxTerminalColors.secondaryText),
       navigationBarTheme: const NavigationBarThemeData(
         backgroundColor: TxTerminalColors.surface,
         indicatorColor: TxTerminalColors.raised,
-        height: 68),
+        height: 74,
+        elevation: 8,
+        surfaceTintColor: Colors.transparent),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           minimumSize: const Size(0, 46),
@@ -69,6 +86,10 @@ class TxTerminalTheme {
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.all(Radius.circular(12)),
           borderSide: BorderSide(color: TxTerminalColors.primary, width: 1.5))),
+      snackBarTheme: const SnackBarThemeData(
+        backgroundColor: TxTerminalColors.surfaceElevated,
+        contentTextStyle: TextStyle(color: TxTerminalColors.textPrimary),
+        behavior: SnackBarBehavior.floating),
     );
   }
 }

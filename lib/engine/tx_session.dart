@@ -23,9 +23,9 @@ class TxSession {
   static const oldSaveKey = 'terminal_state';
   static const schemaVersion = 1;
 
-  /// The connected core is an A-share spot book. Its session rule is enforced
-  /// at order and minute boundaries; other market profiles stay isolated
-  /// previews until they receive their own ledger/core.
+  /// The connected Rust core is the A-share spot book. Its session rule is
+  /// enforced at order and minute boundaries; other market profiles are
+  /// handled by their own isolated venue/runtime at the terminal boundary.
   static TxMarketSessionStatus marketSessionStatusAt({
     required int committedStep,
     int fractionalSeconds = 0,
@@ -245,6 +245,49 @@ class TxSession {
         engine, step, symbols, referenceCents, movements,
         eventKey: 'T-$step');
     });
+  }
+
+  /// Skip only the empty part of the current closed session.
+  ///
+  /// The returned session stops at the last minute before the next opening
+  /// boundary. The following ordinary [nextTick] still performs the real
+  /// participant quotes/trades for that opening minute. No price, fill or
+  /// reference mark is fabricated while time is skipped.
+  int fastForwardClosed() {
+    if (marketSessionStatus.isOpen) return 0;
+    final initialStep = step;
+    var nextOpenStep = step + 1;
+    const maxSearchMinutes = 10080;
+    while (!marketSessionStatusAt(committedStep: nextOpenStep).isOpen) {
+      nextOpenStep++;
+      if (nextOpenStep - initialStep > maxSearchMinutes) {
+        throw StateError('No next market opening found within one game week');
+      }
+    }
+    final targetStep = nextOpenStep - 1;
+    if (targetStep <= step) return 0;
+
+    // A normal closed-minute tick withdraws participant liquidity first. Do
+    // the same in this atomic shortcut so a Rust-backed worker never jumps
+    // over a live maker order without sending its cancellation through the
+    // native gate. Player GTC orders remain reserved for the next open.
+    engine.runCheckedMinute(() {
+      TxNpcMarket.cancelResting(engine);
+      final restingMakerOrders = engine.activeOrders.where((order) =>
+          order.ownerId.startsWith('LP_')).toList()
+        ..sort((a, b) => a.sequence.compareTo(b.sequence));
+      for (final order in restingMakerOrders) {
+        engine.cancel(order.id, ownerId: order.ownerId);
+      }
+    });
+    step = targetStep;
+    lastPulseSecond = 0;
+    _quoteFillStart = engine.fillCount;
+    _lastPriceCursor = -1;
+    _lastPriceCursorStart = -1;
+    _minuteLastFillPrice.clear();
+    engine.checkInvariants();
+    return targetStep - initialStep;
   }
 
   void _quoteMakers() {

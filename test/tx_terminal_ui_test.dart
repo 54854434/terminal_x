@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../lib/widgets/tx_market_hero.dart';
+import '../lib/widgets/tx_premium_ui.dart';
 import '../lib/widgets/tx_terminal_status.dart';
 import '../lib/widgets/tx_terminal_theme.dart';
 import '../lib/widgets/tx_settings_page.dart';
@@ -196,6 +197,37 @@ void main() {
     await tester.pump();
     expect(find.text('自动保存周期'), findsOneWidget);
     expect(find.textContaining('当前有 3 项待保存'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('premium workspace primitives keep hierarchy and explanation',
+      (tester) async {
+    await tester.pumpWidget(MaterialApp(
+      theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: ListView(children: const [
+        TxPageHeader(
+          icon: Icons.candlestick_chart,
+          eyebrow: 'MARKET DESK',
+          title: '行情',
+          subtitle: '价格、盘口与成交',
+          status: '真实撮合',
+        ),
+        TxSectionHeader(
+          title: '盘口',
+          subtitle: '只读可见挂单',
+          icon: Icons.info_outline,
+        ),
+        TxInfoStrip(
+          icon: Icons.info_outline,
+          text: '说明文字',
+        ),
+      ])),
+    ));
+    expect(find.text('MARKET DESK'), findsOneWidget);
+    expect(find.text('行情'), findsOneWidget);
+    expect(find.text('真实撮合'), findsOneWidget);
+    expect(find.text('只读可见挂单'), findsOneWidget);
+    expect(find.text('说明文字'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

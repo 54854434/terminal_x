@@ -38,6 +38,12 @@ class _TxCandleChartState extends State<TxCandleChart> {
   List<double?>? _ma5, _ma10, _ma20;
   final TxIndicativeWickMemory _indicativeWick = TxIndicativeWickMemory();
   final TxTimelinePreviewTrace _timelineTrace = TxTimelinePreviewTrace();
+  double? _axisHighCents;
+  double? _axisLowCents;
+  int _axisWindow = -1;
+  int _axisOffset = -1;
+  int _axisLastCommittedStep = -1;
+  TxChartPeriod? _axisPeriod;
   int get _maxOffset => math.max(0, _activeBars.length -
       math.min(_window, _activeBars.length));
 
@@ -94,6 +100,74 @@ class _TxCandleChartState extends State<TxCandleChart> {
     }
   }
 
+  void _updateStableAxis({
+    required List<TxCandle> visible,
+    required List<double?>? ma5,
+    required List<double?>? ma10,
+    required List<double?>? ma20,
+    double? previewHighCents,
+    double? previewLowCents,
+    int? previousIndicativeStep,
+    double? previousIndicativeHighCents,
+    double? previousIndicativeLowCents,
+  }) {
+    if (visible.isEmpty) return;
+    var high = visible.first.highCents.toDouble();
+    var low = visible.first.lowCents.toDouble();
+    for (final candle in visible) {
+      high = math.max(high, candle.highCents.toDouble());
+      low = math.min(low, candle.lowCents.toDouble());
+    }
+    for (final series in <List<double?>?>[ma5, ma10, ma20]) {
+      if (series == null) continue;
+      for (final value in series) {
+        if (value == null) continue;
+        high = math.max(high, value);
+        low = math.min(low, value);
+      }
+    }
+    if (previewHighCents != null && previewLowCents != null) {
+      high = math.max(high, previewHighCents);
+      low = math.min(low, previewLowCents);
+    }
+    if (previousIndicativeStep != null &&
+        previousIndicativeHighCents != null &&
+        previousIndicativeLowCents != null &&
+        visible.any((candle) => candle.step == previousIndicativeStep)) {
+      high = math.max(high, previousIndicativeHighCents);
+      low = math.min(low, previousIndicativeLowCents);
+    }
+    final hasNewCommittedStep = _axisLastCommittedStep != visible.last.step;
+    final visibleRange = math.max(1.0, high - low);
+    final stableRange = _axisHighCents == null || _axisLowCents == null
+        ? 0.0 : _axisHighCents! - _axisLowCents!;
+    // After an old outlier leaves the rolling window, recenter only when the
+    // retained envelope is clearly too wide. The new-bucket guard prevents a
+    // high-multiplier frame from repeatedly moving the viewport.
+    final envelopeTooWide = stableRange > math.max(20.0, visibleRange * 3.0);
+    final rebase = _axisHighCents == null || _axisLowCents == null ||
+        _axisPeriod != _period || _axisWindow != _window ||
+        _axisOffset != _olderOffset ||
+        (hasNewCommittedStep && envelopeTooWide);
+    if (rebase) {
+      _axisHighCents = high;
+      _axisLowCents = low;
+      _axisPeriod = _period;
+      _axisWindow = _window;
+      _axisOffset = _olderOffset;
+      _axisLastCommittedStep = visible.last.step;
+    } else {
+      // Preview extrema and newly committed candles may expand the envelope,
+      // but they never shrink or rebase the axis on every minute. A high
+      // playback multiplier therefore moves the last candle inside a stable
+      // viewport instead of making the entire chart jump vertically. A new
+      // symbol, period, zoom or history view explicitly rebases it above.
+      _axisHighCents = math.max(_axisHighCents!, high);
+      _axisLowCents = math.min(_axisLowCents!, low);
+      _axisLastCommittedStep = visible.last.step;
+    }
+  }
+
   @override
   void didUpdateWidget(covariant TxCandleChart oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -106,6 +180,10 @@ class _TxCandleChartState extends State<TxCandleChart> {
       _cachedPeriod = null;
       _olderOffset = 0;
       _inspectedStep = null;
+      _axisHighCents = null;
+      _axisLowCents = null;
+      _axisLastCommittedStep = -1;
+      _axisPeriod = null;
     }
     if (_olderOffset > _maxOffset) _olderOffset = _maxOffset;
   }
@@ -140,6 +218,22 @@ class _TxCandleChartState extends State<TxCandleChart> {
             // mark keeps the chart paint-safe and never invents a wick.
             previewHighCents: _indicativeWick.highCents ?? preview,
             previewLowCents: _indicativeWick.lowCents ?? preview);
+    final visibleMa5 = _showMA ? _ma5!.sublist(start, end) : null;
+    final visibleMa10 = _showMA ? _ma10!.sublist(start, end) : null;
+    final visibleMa20 = _showMA ? _ma20!.sublist(start, end) : null;
+    if (_period != TxChartPeriod.timeline) {
+      _updateStableAxis(
+        visible: visible,
+        ma5: visibleMa5,
+        ma10: visibleMa10,
+        ma20: visibleMa20,
+        previewHighCents: projection?.highCents,
+        previewLowCents: projection?.lowCents,
+        previousIndicativeStep: _indicativeWick.previousGroupStep,
+        previousIndicativeHighCents: _indicativeWick.previousHighCents,
+        previousIndicativeLowCents: _indicativeWick.previousLowCents,
+      );
+    }
     return Column(children: [
       Row(children: [
         Text(_period == TxChartPeriod.timeline
@@ -186,6 +280,9 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 _inspectedStep = null;
                 _cachedPeriod = null;
                 _indicativeWick.reset();
+                _axisHighCents = null;
+                _axisLowCents = null;
+                _axisLastCommittedStep = -1;
               }),
             )),
         ],
@@ -234,9 +331,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
                     math.max(1.0, constraints.maxWidth - 55) /
                     (visible.length + 1)))
             : _CandlePainter(visible,
-                ma5: _showMA ? _ma5!.sublist(start, end) : null,
-                ma10: _showMA ? _ma10!.sublist(start, end) : null,
-                ma20: _showMA ? _ma20!.sublist(start, end) : null,
+                ma5: visibleMa5,
+                ma10: visibleMa10,
+                ma20: visibleMa20,
+                axisHighCents: _axisHighCents,
+                axisLowCents: _axisLowCents,
                 indicativePriceCents: projection?.closeCents,
                 indicativeHighCents: projection?.highCents,
                 indicativeLowCents: projection?.lowCents,
@@ -283,6 +382,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
 
 class _CandlePainter extends CustomPainter {
   _CandlePainter(this.candles, {this.ma5, this.ma10, this.ma20,
+    this.axisHighCents, this.axisLowCents,
     this.indicativePriceCents, this.indicativeHighCents,
     this.indicativeLowCents, this.indicativeOpenCents,
     this.overlayLastCommitted = false, this.showIndicativeWick = true,
@@ -290,6 +390,7 @@ class _CandlePainter extends CustomPainter {
     this.previousIndicativeLowCents});
   final List<TxCandle> candles;
   final List<double?>? ma5, ma10, ma20;
+  final double? axisHighCents, axisLowCents;
   final double? indicativePriceCents, indicativeHighCents,
       indicativeLowCents, indicativeOpenCents;
   final bool overlayLastCommitted;
@@ -315,31 +416,35 @@ class _CandlePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (candles.isEmpty || size.width < 80 || size.height < 100) return;
     final right = size.width - 55, height = size.height - 52;
-    double high = candles.first.highCents.toDouble();
-    double low = candles.first.lowCents.toDouble();
+    double high = axisHighCents ?? candles.first.highCents.toDouble();
+    double low = axisLowCents ?? candles.first.lowCents.toDouble();
     var maxVolume = 0;
     for (final c in candles) {
-      high = math.max(high, c.highCents.toDouble());
-      low = math.min(low, c.lowCents.toDouble());
       maxVolume = math.max(maxVolume, c.volumeShares);
     }
-    if (indicativePriceCents != null) {
-      high = math.max(high, showIndicativeWick
-          ? indicativeHighCents!.toDouble() : indicativePriceCents!);
-      low = math.min(low, showIndicativeWick
-          ? indicativeLowCents!.toDouble() : indicativePriceCents!);
-    }
-    if (candles.any((c) => c.step == previousIndicativeStep) &&
-        previousIndicativeHighCents != null &&
-        previousIndicativeLowCents != null) {
-      // The ghost wick is separately labelled, never treated as an OHLC.
-      high = math.max(high, previousIndicativeHighCents!);
-      low = math.min(low, previousIndicativeLowCents!);
-    }
-    for (final series in [ma5, ma10, ma20]) {
-      if (series == null) continue;
-      for (final v in series) {
-        if (v != null) {high = math.max(high, v); low = math.min(low, v);}
+    if (axisHighCents == null || axisLowCents == null) {
+      for (final c in candles) {
+        high = math.max(high, c.highCents.toDouble());
+        low = math.min(low, c.lowCents.toDouble());
+      }
+      if (indicativePriceCents != null) {
+        high = math.max(high, showIndicativeWick
+            ? indicativeHighCents!.toDouble() : indicativePriceCents!);
+        low = math.min(low, showIndicativeWick
+            ? indicativeLowCents!.toDouble() : indicativePriceCents!);
+      }
+      if (candles.any((c) => c.step == previousIndicativeStep) &&
+          previousIndicativeHighCents != null &&
+          previousIndicativeLowCents != null) {
+        // The ghost wick is separately labelled, never treated as an OHLC.
+        high = math.max(high, previousIndicativeHighCents!);
+        low = math.min(low, previousIndicativeLowCents!);
+      }
+      for (final series in [ma5, ma10, ma20]) {
+        if (series == null) continue;
+        for (final v in series) {
+          if (v != null) {high = math.max(high, v); low = math.min(low, v);}
+        }
       }
     }
     final margin = math.max(2.0, (high-low)*.08);
@@ -477,6 +582,8 @@ class _CandlePainter extends CustomPainter {
       previousIndicativeStep!=other.previousIndicativeStep ||
       previousIndicativeHighCents!=other.previousIndicativeHighCents ||
       previousIndicativeLowCents!=other.previousIndicativeLowCents ||
+      axisHighCents!=other.axisHighCents ||
+      axisLowCents!=other.axisLowCents ||
       candles.length!=other.candles.length ||
       (ma5==null)!=(other.ma5==null) ||
       (candles.isNotEmpty && (candles.first.step!=other.candles.first.step ||

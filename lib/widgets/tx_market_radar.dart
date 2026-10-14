@@ -13,10 +13,23 @@ class TxRadarQuote {
 
 class TxMarketRadar extends StatelessWidget {
   const TxMarketRadar({super.key,required this.quotes,
-    required this.selectedIndex,required this.onSelect});
+    required this.selectedIndex,required this.onSelect,
+    this.quoteCurrency = 'CNY'});
   final List<TxRadarQuote> quotes;
   final int selectedIndex;
   final ValueChanged<int> onSelect;
+  final String quoteCurrency;
+
+  String _price(int cents) {
+    final prefix = switch (quoteCurrency) {
+      'CNY' => '¥',
+      'USD' => '\$',
+      'USDT' => '₮',
+      _ => '$quoteCurrency ',
+    };
+    final decimals = quoteCurrency == 'USD' ? 2 : 2;
+    return '$prefix${(cents / 100).toStringAsFixed(decimals)}';
+  }
 
   @override
   Widget build(BuildContext context) => Card(child: Padding(
@@ -47,7 +60,7 @@ class TxMarketRadar extends StatelessWidget {
                 fontWeight:FontWeight.w700,fontSize:13)),
                 Text(quotes[i].regime,style:const TextStyle(
                   fontSize:10,color:TxTerminalColors.secondaryText))])),
-            Text('¥${(quotes[i].priceCents/100).toStringAsFixed(2)}',
+            Text(_price(quotes[i].priceCents),
               style:const TextStyle(fontSize:15,fontWeight:FontWeight.w700)),
           ]))),
     ]),

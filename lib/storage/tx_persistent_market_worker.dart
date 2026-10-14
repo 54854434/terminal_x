@@ -95,6 +95,9 @@ class TxPersistentMarketWorker {
 
   Future<TxMarketProposal> tick() => _request('tick', const <dynamic>[]);
 
+  Future<TxMarketProposal> fastForwardClosed() =>
+      _request('fast_forward_closed', const <dynamic>[]);
+
   Future<TxMarketProposal> pulse(int second) =>
       _request('pulse', <dynamic>[second]);
 
@@ -167,6 +170,8 @@ void _runMarketWorker(List<dynamic> launch) {
       }
       if (command == 'tick') {
         working.nextTick();
+      } else if (command == 'fast_forward_closed') {
+        working.fastForwardClosed();
       } else if (command == 'pulse') {
         working.marketPulse(args[0] as int);
       } else if (command == 'place') {

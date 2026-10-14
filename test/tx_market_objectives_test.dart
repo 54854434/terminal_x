@@ -35,6 +35,19 @@ void main() {
     expect(task.complete, isFalse);
   });
 
+  test('closed-market research prompt is contextual and does not mutate state',
+      () {
+    final session = TxSession.freshWithAgents()..step = 120;
+    final before = session.exportJson();
+    final prompt = TxMarketObjectives.researchPrompt(session, 'SIM-A01');
+
+    expect(prompt.id, contains('breakTime'));
+    expect(prompt.options, hasLength(3));
+    expect(prompt.correctIndex, inInclusiveRange(0, 2));
+    expect(prompt.explanation, isNotEmpty);
+    expect(session.exportJson(), before);
+  });
+
   testWidgets('strategy card exposes visible progress and market briefing',
       (tester) async {
     await tester.pumpWidget(MaterialApp(
@@ -49,6 +62,27 @@ void main() {
     expect(find.text('限价博弈'), findsOneWidget);
     expect(find.textContaining('市场解读'), findsOneWidget);
     expect(find.byType(LinearProgressIndicator), findsNWidgets(3));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('closed strategy card exposes a non-economic research challenge',
+      (tester) async {
+    final session = TxSession.freshWithAgents()..step = 120;
+    final prompt = TxMarketObjectives.researchPrompt(session, 'SIM-A01');
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: TxMarketObjectivesCard(
+          session: session,
+          symbol: 'SIM-A01',
+        ),
+      ),
+    ));
+
+    expect(find.text('盘后研究挑战'), findsOneWidget);
+    await tester.tap(find.text(
+        '${prompt.correctIndex + 1}. ${prompt.options[prompt.correctIndex]}'));
+    await tester.pump();
+    expect(find.textContaining('回答正确'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }

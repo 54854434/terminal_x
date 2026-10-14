@@ -4,8 +4,9 @@ import '../market/tx_market_profiles.dart';
 import '../market/tx_market_session_schedule.dart';
 import 'tx_terminal_theme.dart';
 
-/// A visible market-mode switch. Only the A-share spot profile is connected
-/// to the current matching core; other profiles are honest rule previews.
+/// A visible market-mode switch. A-share uses the Rust spot core; the other
+/// profiles use an isolated Dart/SQLite venue and never reuse the A-share
+/// ledger.
 class TxMarketModeSelector extends StatelessWidget {
   const TxMarketModeSelector({
     super.key,
@@ -85,14 +86,15 @@ class TxMarketModeSelector extends StatelessWidget {
           ]),
           const SizedBox(height: 3),
           Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Icon(profile.isCoreConnected ? Icons.check_circle_outline
-                : Icons.construction_outlined, size: 15,
-                color: profile.isCoreConnected
+            Icon(profile.isCoreConnected || profile.hasIndependentRuntime
+                ? Icons.check_circle_outline : Icons.construction_outlined,
+                size: 15,
+                color: profile.isCoreConnected || profile.hasIndependentRuntime
                     ? TxTerminalColors.buy : Colors.amberAccent),
             const SizedBox(width: 5),
             Expanded(child: Text(profile.coreStatus,
                 style: TextStyle(fontSize: 10,
-                    color: profile.isCoreConnected
+                    color: profile.isCoreConnected || profile.hasIndependentRuntime
                         ? TxTerminalColors.buy : Colors.amberAccent))),
           ]),
         ]),

@@ -55,6 +55,8 @@ class TxMarketVenueFill {
     required this.sellOrderId,
     required this.quantity,
     required this.priceCents,
+    this.gameDay = 1,
+    this.minuteOfDay = 0,
     this.contractMultiplierUnits = 1,
     this.makerFeeCents = 0,
     this.takerFeeCents = 0,
@@ -66,6 +68,11 @@ class TxMarketVenueFill {
   final String sellOrderId;
   final int quantity;
   final int priceCents;
+  /// Game-time location of the print. Keeping the timestamp on the fill lets
+  /// an independent market rebuild trade-only OHLCV after a restart without
+  /// inventing bars from marks or resting quotes.
+  final int gameDay;
+  final int minuteOfDay;
   final int contractMultiplierUnits;
   final int makerFeeCents;
   final int takerFeeCents;
@@ -80,6 +87,8 @@ class TxMarketVenueFill {
         'sellOrderId': sellOrderId,
         'quantity': quantity,
         'priceCents': priceCents,
+        'gameDay': gameDay,
+        'minuteOfDay': minuteOfDay,
         'contractMultiplierUnits': contractMultiplierUnits,
         'makerFeeCents': makerFeeCents,
         'takerFeeCents': takerFeeCents,
@@ -96,8 +105,15 @@ class TxMarketVenueFill {
     final makerFee = data['makerFeeCents'];
     final takerFee = data['takerFeeCents'];
     final multiplier = data['contractMultiplierUnits'];
+    // Venue schema 2 snapshots did not carry print timestamps. Treat those
+    // legacy fills as day 1/minute 0; they remain auditable and new fills are
+    // fully timestamped by the current venue.
+    final gameDay = data['gameDay'] ?? 1;
+    final minuteOfDay = data['minuteOfDay'] ?? 0;
     if (multiplier is! int || multiplier < 1 || makerFee is! int ||
-        takerFee is! int || makerFee < 0 || takerFee < 0) {
+        takerFee is! int || makerFee < 0 || takerFee < 0 ||
+        gameDay is! int || gameDay < 1 || minuteOfDay is! int ||
+        minuteOfDay < 0 || minuteOfDay >= 1440) {
       throw const FormatException('Invalid venue fill fee');
     }
     return TxMarketVenueFill(
@@ -107,6 +123,8 @@ class TxMarketVenueFill {
       sellOrderId: data['sellOrderId'] as String,
       quantity: data['quantity'] as int,
       priceCents: data['priceCents'] as int,
+      gameDay: gameDay,
+      minuteOfDay: minuteOfDay,
       contractMultiplierUnits: multiplier as int,
       makerFeeCents: makerFee as int,
       takerFeeCents: takerFee as int,
@@ -316,7 +334,7 @@ class TxMarketVenueOrder {
 /// FOK rejects atomically. Account updates are committed only after every
 /// simulated leg passes its own risk gate.
 class TxMarketVenue {
-  static const snapshotSchema = 2;
+  static const snapshotSchema = 3;
 
   TxMarketVenue({
     required this.profile,
@@ -452,7 +470,8 @@ class TxMarketVenue {
   }
 
   static TxMarketVenue fromJsonMap(Map<String, dynamic> data) {
-    if (data['schema'] != snapshotSchema || data['mode'] is! String ||
+    if ((data['schema'] != 2 && data['schema'] != snapshotSchema) ||
+        data['mode'] is! String ||
         data['accounts'] is! Map || data['orders'] is! List ||
         data['fills'] is! List || data['nextSequence'] is! int ||
         data['nextFill'] is! int) {
@@ -540,6 +559,13 @@ class TxMarketVenue {
       }
     }
   }
+
+  /// Complete immutable order history for account/record views. The venue
+  /// keeps this separate from [activeOrders] so a filled, cancelled or
+  /// rejected order remains auditable after it leaves the visible book.
+  List<TxMarketVenueOrder> get orders => List.unmodifiable([
+        for (final order in _orders.values) order.freeze(),
+      ]);
 
   TxMarketVenueOrder order(String id) {
     final result = _orders[id];
@@ -787,6 +813,8 @@ class TxMarketVenue {
         sellOrderId: candidate.side == TxSide.sell ? candidate.id : maker.id,
         quantity: trade.quantity,
         priceCents: trade.priceCents,
+        gameDay: gameDay,
+        minuteOfDay: minuteOfDay,
         contractMultiplierUnits: profile.instruments
             .firstWhere((item) => item.symbol == candidate.symbol)
             .contractMultiplierUnits,
@@ -796,7 +824,11 @@ class TxMarketVenue {
       _fills.add(fill);
     }
     candidate.remaining = simulation.remaining;
-    if (candidate.remaining > 0 && candidate.timeInForce.canRest) {
+    // A market order may sweep several levels, but its remainder can never
+    // become a resting book order even when the caller supplies venue-default
+    // GTC.
+    if (candidate.remaining > 0 && candidate.kind == TxKind.limit &&
+        candidate.timeInForce.canRest) {
       candidate.status = candidate.filled == 0
           ? TxStatus.open : TxStatus.partiallyFilled;
     } else if (candidate.remaining > 0) {
@@ -935,6 +967,10 @@ class TxMarketVenue {
           .firstWhere((item) => item.symbol == fill.symbol);
       if (fill.contractMultiplierUnits != instrument.contractMultiplierUnits) {
         throw StateError('Venue fill multiplier mismatch');
+      }
+      if (fill.gameDay < 1 || fill.minuteOfDay < 0 ||
+          fill.minuteOfDay >= 1440) {
+        throw StateError('Venue fill has an invalid game timestamp');
       }
       if (fill.quantity % instrument.lotSize != 0) {
         throw StateError('Venue fill quantity violates lot size');

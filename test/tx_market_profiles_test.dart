@@ -18,7 +18,7 @@ void main() {
       expect(profile.coreStatus, isNotEmpty);
       expect(profile.independentCoreProgress, inInclusiveRange(0.0, 1.0));
       if (!profile.isCoreConnected) {
-        expect(profile.independentCoreProgress, 0.92);
+        expect(profile.independentCoreProgress, 1.0);
       }
       expect(profile.instruments, isNotEmpty);
       expect(profile.instruments.map((item) => item.symbol).toSet().length,
@@ -52,7 +52,7 @@ void main() {
     await tester.tap(find.text('期货'));
     await tester.pump();
     expect(selected, TxMarketMode.futures);
-    expect(find.textContaining('规则层、风控、撮合、快照、费率'), findsOneWidget);
+    expect(find.textContaining('独立 Dart 撮合'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -61,9 +61,9 @@ void main() {
     await tester.pumpWidget(MaterialApp(home: Scaffold(body:
         TxMarketModePreviewCard(profile: TxMarketProfile.futures))));
 
-    expect(find.text('期货 · 规则预览'), findsOneWidget);
+    expect(find.text('期货 · 独立核心'), findsOneWidget);
     expect(find.textContaining('不会复用 A 股现货账本'), findsOneWidget);
-    expect(find.text('未接入'), findsOneWidget);
+    expect(find.text('已接入独立核心'), findsNWidgets(2));
     expect(find.textContaining('SIM-FUT01'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

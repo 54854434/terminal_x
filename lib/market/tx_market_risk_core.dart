@@ -315,6 +315,7 @@ class TxMarketCore {
     required int openingCashCents,
     required Map<String, int> initialMarks,
     this.gameDay = 1,
+    Map<String, int>? initialLongPositions,
   }) : cashCents = openingCashCents,
        rule = TxMarketRiskRules.forMode(profile.mode),
        _marks = Map<String, int>.from(initialMarks) {
@@ -330,6 +331,19 @@ class TxMarketCore {
     for (final entry in _marks.entries) {
       _ruleFor(entry.key).validatePrice(entry.value);
     }
+    for (final entry in (initialLongPositions ?? const <String, int>{}).entries) {
+      _requireSymbol(entry.key);
+      final quantity = entry.value;
+      final positionRule = _ruleFor(entry.key);
+      positionRule.validateQuantity(quantity);
+      if (quantity < 1 || quantity > TxEngine.maxQuantity) {
+        throw ArgumentError.value(quantity, 'initialLongPositions');
+      }
+      _positions[entry.key] = _MutablePosition(symbol: entry.key)
+        ..netQuantity = quantity
+        ..averageEntryCents = _marks[entry.key]!
+        ..unsettledLongQuantity = positionRule.tPlusOne ? quantity : 0;
+    }
   }
 
   final TxMarketProfile profile;
@@ -344,10 +358,12 @@ class TxMarketCore {
     required TxMarketProfile profile,
     int openingCashCents = 100000000,
     int gameDay = 1,
+    Map<String, int>? initialLongPositions,
   }) => TxMarketCore(
         profile: profile,
         openingCashCents: openingCashCents,
         gameDay: gameDay,
+        initialLongPositions: initialLongPositions,
         initialMarks: {
           for (var i = 0; i < profile.instruments.length; i++)
             profile.instruments[i].symbol: _defaultMark(profile.mode, i),
@@ -432,7 +448,9 @@ class TxMarketCore {
         dailyBps = positionRule.rolloverBpsPerDay;
       }
       if (dailyBps > 0) {
-        final amount = (notional * dailyBps * days + 9999) ~/ 10000;
+        // Cash is stored in cents. Settle sub-cent fractions by truncating
+        // them instead of charging an extra cent for a batched day jump.
+        final amount = notional * dailyBps * days ~/ 10000;
         final adjustment = amount * fundingSign;
         cashCents += adjustment;
         financing += adjustment;
@@ -738,9 +756,13 @@ class TxMarketCore {
     final signedDelta = side == TxSide.buy ? quantity : -quantity;
     if (!tradeRule.supportsShort && signedDelta < 0 &&
         quantity > current.availableToClose) {
+      final available = current.availableToClose;
+      if (reduceOnly) {
+        return fallback.withReason('只减仓数量不足：可用 $available');
+      }
       return fallback.withReason(tradeRule.tPlusOne
-          ? 'T+1 可卖数量不足：可卖 ${current.availableToClose}'
-          : '可平仓数量不足：可用 ${current.availableToClose}');
+          ? 'T+1 可卖数量不足：可卖 $available'
+          : '可平仓数量不足：可用 $available');
     }
     if (!tradeRule.supportsShort && current.netQuantity + signedDelta < 0) {
       return fallback.withReason('当前市场规则不支持做空');
@@ -776,7 +798,14 @@ class TxMarketCore {
         transition.openingQuantity > 0) {
       return fallback.withReason('保证金不足，仅允许减仓或强平');
     }
-    if (tradeRule.usesMargin && projectedCash < projectedUsedMargin) {
+    // A risk-breached account must still be able to close against real book
+    // liquidity when the loss plus taker fee leaves a small deficit. This is
+    // a forced-deleveraging path, not permission to open more risk; the
+    // negative cash remains visible and auditable after the fill.
+    final forcedReduction = currentRisk.liquidationRequired &&
+        reduceOnly && transition.openingQuantity == 0;
+    if (tradeRule.usesMargin && projectedCash < projectedUsedMargin &&
+        !forcedReduction) {
       return fallback.withReason('保证金不足，需要至少 $projectedUsedMargin');
     }
     return _CalculatedExecution.accepted(

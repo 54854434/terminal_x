@@ -160,4 +160,37 @@ class TxLiveCandles {
       if (candles.length > maxCandles) candles.removeAt(0);
     }
   }
+
+  /// Remove the empty flat bars that were produced by older UI versions while
+  /// the connected A-share market was closed. A closed minute with no print
+  /// is a time gap, not a traded candle; keeping it makes a long overnight
+  /// interval look like a moving/over-populated K-line.
+  ///
+  /// A non-flat or non-zero-volume bar is retained even if its session label
+  /// is closed. That is deliberate: an impossible historical print must stay
+  /// visible for diagnosis instead of being silently rewritten.
+  bool compactClosedFlatMinutes({bool preserveLatest = true}) {
+    var changed = false;
+    for (final symbol in TxSession.symbols) {
+      final candles = _values[symbol]!;
+      final before = candles.length;
+      final latestStep = candles.isEmpty ? null : candles.last.step;
+      candles.removeWhere((candle) {
+        if (preserveLatest && candle.step == latestStep) return false;
+        final flat = candle.volumeShares == 0 &&
+            candle.openCents == candle.highCents &&
+            candle.openCents == candle.lowCents &&
+            candle.openCents == candle.closeCents;
+        if (!flat) return false;
+        final status = TxSession.marketSessionStatusAt(
+            committedStep: candle.step);
+        return !status.isOpen;
+      });
+      if (candles.length != before) {
+        changed = true;
+        _views[symbol] = UnmodifiableListView<TxCandle>(candles);
+      }
+    }
+    return changed;
+  }
 }

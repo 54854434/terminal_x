@@ -28,4 +28,38 @@ void main() {
     expect(find.byType(Slider), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('repeated preview frames stay paint-safe', (tester) async {
+    final source = List.generate(48, (i) => TxCandle(
+      step: i, openCents: 1000 + i, closeCents: 1001 + i,
+      highCents: 1004 + i, lowCents: 997 + i, volumeShares: i + 1));
+    Widget chart(double price) => MaterialApp(home: Scaffold(
+      body: SingleChildScrollView(child: TxCandleChart(
+        candles: source, activeMinuteStep: 48,
+        indicativeFramePriceCents: price, previewSeconds: 12,
+      )),
+    ));
+
+    await tester.pumpWidget(chart(1040));
+    await tester.pumpWidget(chart(980));
+    await tester.pumpWidget(chart(1055));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('committed bars extend without rebuilding a jumping axis',
+      (tester) async {
+    final source = List.generate(32, (i) => TxCandle(
+      step: i, openCents: 1000 + i, closeCents: 1001 + i,
+      highCents: 1004 + i, lowCents: 997 + i, volumeShares: i + 1));
+    await tester.pumpWidget(MaterialApp(home: Scaffold(
+      body: TxCandleChart(candles: source, activeMinuteStep: 31),
+    )));
+    for (var i = 32; i < 48; i++) {
+      source.add(TxCandle(
+        step: i, openCents: 1000 + i, closeCents: 1001 + i,
+        highCents: 1004 + i, lowCents: 997 + i, volumeShares: i + 1));
+      await tester.pump();
+    }
+    expect(tester.takeException(), isNull);
+  });
 }

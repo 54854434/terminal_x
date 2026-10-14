@@ -3,10 +3,9 @@ import 'package:flutter/material.dart';
 import '../market/tx_market_profiles.dart';
 import 'tx_terminal_theme.dart';
 
-/// Explains an unconnected market mode without re-labeling A-share data.
-///
-/// The current engine has one spot ledger. A preview card is therefore safer
-/// than rendering that ledger with another currency or settlement rule.
+/// Fallback detail card for an independent market mode. The normal terminal
+/// opens the executable independent panel; compact embedders may still use
+/// this profile-only card.
 class TxMarketModePreviewCard extends StatelessWidget {
   const TxMarketModePreviewCard({
     super.key,
@@ -31,13 +30,13 @@ class TxMarketModePreviewCard extends StatelessWidget {
                       size: 20, color: Colors.amberAccent),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text('${profile.label} · 规则预览',
+                    child: Text('${profile.label} · 独立核心',
                         style: const TextStyle(
                             fontSize: 15, fontWeight: FontWeight.w700)),
                   ),
-                  const Text('未接入',
+                  const Text('已连接',
                       style: TextStyle(
-                          fontSize: 11, color: Colors.amberAccent)),
+                          fontSize: 11, color: TxTerminalColors.buy)),
                 ],
               ),
               const SizedBox(height: 8),
@@ -57,28 +56,25 @@ class TxMarketModePreviewCard extends StatelessWidget {
               ClipRRect(
                 borderRadius: BorderRadius.circular(4),
                 child: LinearProgressIndicator(
-                    // This is the independently tested account/risk domain
-                    // model. Runtime matching, native wiring and persistence
-                    // remain separate gates and are not implied here.
                     value: profile.independentCoreProgress,
                     minHeight: 6,
-                    color: Colors.amberAccent,
+                    color: TxTerminalColors.buy,
                     backgroundColor: Color(0xFF2A3445)),
               ),
               const SizedBox(height: 6),
-              Text('独立账户/风控核心 ${(profile.independentCoreProgress * 100).round()}% · '
-                  'P0 SQLite 快照 · P1 真实执行预览/强平 · P2 盘口缓存/参与者反馈',
-                  style: const TextStyle(fontSize: 10, color: Colors.amberAccent)),
+              Text('独立账户/风控/撮合核心 ${(profile.independentCoreProgress * 100).round()}% · '
+                  'SQLite CAS · 真实盘口 · 交易记录',
+                  style: const TextStyle(fontSize: 10, color: TxTerminalColors.buy)),
               const SizedBox(height: 4),
               const Text('已具备独立的仓位方向、加权持仓成本、保证金占用、'
                   '未实现盈亏、强平预警、A 股 T+1 可卖数量模型、Dart 价时撮合、'
                   'Maker/Taker 费率、统一行情标记、跨账户原子日结、严格运行时快照、'
                   'SQLite 独立 CAS 快照、真实盘口滑点预览、盘口不足时的真实强平报告；'
-                  'Flutter/Rust 交易入口接线与设备验收仍在开发。',
+                  '非 A 股模式使用独立 Dart 执行核心，与 Rust A 股账本隔离。',
                   style: TextStyle(fontSize: 11, color: Colors.white70)),
               const SizedBox(height: 4),
-              const Text('为避免伪造跨市场数据，本模式不会复用 A 股现货账本、'
-                  'K 线、盘口或成交记录。',
+              const Text('本模式拥有独立现金、持仓、K 线、盘口和成交记录，'
+                  '不会复用 A 股现货账本。',
                   style: TextStyle(fontSize: 10, color: Colors.white54)),
               const SizedBox(height: 10),
               const Text('已登记模拟标的', style: TextStyle(
@@ -104,7 +100,7 @@ class TxMarketModePreviewCard extends StatelessWidget {
                     const SizedBox(width: 6),
                     Text(instrument.connectionLabel,
                         style: const TextStyle(fontSize: 10,
-                            color: Colors.amberAccent)),
+                            color: TxTerminalColors.buy)),
                   ]),
                 ),
               if (onReturnToConnected != null) ...[

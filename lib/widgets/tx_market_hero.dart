@@ -12,7 +12,8 @@ class TxMarketHero extends StatelessWidget {
     required this.committedPriceCents, required this.step,
     required this.seconds, required this.indicativeCents,
     required this.onBuy, required this.onSell, this.pending = false,
-    this.quoteCurrency = 'CNY', this.coreConnected = false});
+    this.quoteCurrency = 'CNY', this.coreConnected = false,
+    this.connectionLabel, this.committedOnly = false});
 
   final String symbol;
   final int committedPriceCents;
@@ -24,6 +25,8 @@ class TxMarketHero extends StatelessWidget {
   final bool pending;
   final String quoteCurrency;
   final bool coreConnected;
+  final String? connectionLabel;
+  final bool committedOnly;
 
   String _mark() => switch (quoteCurrency) {
     'CNY' => '¥',
@@ -49,9 +52,10 @@ class TxMarketHero extends StatelessWidget {
           decoration: BoxDecoration(
             color: TxTerminalColors.raised,
             borderRadius: BorderRadius.circular(8)),
-          child: Text(coreConnected ? 'RUST · 已连接' : 'OFFLINE · SIM',
+          child: Text(connectionLabel ??
+              (coreConnected ? 'RUST · 已连接' : 'OFFLINE · SIM'),
             style: TextStyle(fontSize: 10,
-              color: coreConnected ? TxTerminalColors.buy
+            color: coreConnected ? TxTerminalColors.buy
                   : TxTerminalColors.secondaryText))),
       ]),
       const SizedBox(height: 11),
@@ -60,7 +64,9 @@ class TxMarketHero extends StatelessWidget {
         builder: (context, value, child) {
           final quote = indicativeCents(value);
           return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Semantics(label: '模拟指示价 ${_price(quote, 4)}，不可用于真实成交',
+            Semantics(label: committedOnly
+                ? '模拟已提交标价 ${_price(quote, 4)}'
+                : '模拟指示价 ${_price(quote, 4)}，不可用于真实成交',
               child: Text(_price(quote, 4),
                 style: const TextStyle(fontSize: 32,
                   color: TxTerminalColors.cyan, fontWeight: FontWeight.w800,
@@ -73,7 +79,9 @@ class TxMarketHero extends StatelessWidget {
           ]);
         }),
       const SizedBox(height: 6),
-      Text(pending
+      Text(committedOnly
+          ? '独立市场已提交标记 · 成交和持仓只来自真实订单簿撮合'
+          : pending
           ? '当前盘口为待保存候选 · SQLite 恢复收盘 ${_price(committedPriceCents.toDouble(), 2)}'
           : '指示走势逐帧演示 · 非真实成交 | 已提交收盘 ${_price(committedPriceCents.toDouble(), 2)}',
         style: const TextStyle(

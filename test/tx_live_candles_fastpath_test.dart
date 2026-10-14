@@ -7,6 +7,30 @@ import '../lib/storage/tx_sqlite_store.dart';
 import '../lib/storage/tx_trading_service.dart';
 
 void main() {
+  test('closed flat minutes compact into a visible time gap', () {
+    final candles = TxLiveCandles.fromIndexJson({
+      'version': 1,
+      'candles': {
+        'SIM-A01': [
+          [0, 1000, 1000, 1000, 1000, 0],
+          [120, 1000, 1000, 1000, 1000, 0],
+          [121, 1000, 1000, 1000, 1000, 0],
+        ],
+        'SIM-A02': [
+          [0, 2500, 2500, 2500, 2500, 0],
+          [120, 2500, 2500, 2500, 2500, 0],
+          [121, 2500, 2500, 2500, 2500, 0],
+        ],
+      },
+    });
+    expect(candles.compactClosedFlatMinutes(), isTrue);
+    expect(candles.forSymbol('SIM-A01').map((c) => c.step).toList(), [0, 121]);
+    expect(candles.forSymbol('SIM-A02').map((c) => c.step).toList(), [0, 121]);
+    // The current latest flat mark stays as the visible baseline; only the
+    // older closed bars become a gap.
+    expect(candles.compactClosedFlatMinutes(), isFalse);
+  });
+
   test('unmatched same-minute order does not regenerate stored candles', () async {
     final db = TxSqliteStore(NativeDatabase.memory());
     try {

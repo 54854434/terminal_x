@@ -91,6 +91,32 @@ void main() {
     }
   });
 
+  test('closed fast-forward commits before the next real opening minute',
+      () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    final trading = TxTradingService(db,
+        initialSessionFactory: () => TxSession.freshWithAgents()..step = 120,
+        persistentMarketWorker: true);
+    try {
+      final initial = await trading.open();
+      final beforeReference = List<int>.of(initial.session.referenceCents);
+      final skipped = await trading.fastForwardClosed();
+
+      expect(skipped.session.step, 209);
+      expect(skipped.revision, initial.revision + 1);
+      expect(skipped.session.referenceCents, beforeReference);
+      expect(skipped.session.currentMinuteFills, isEmpty);
+      expect((await db.readCurrent())!.session.step, 209);
+
+      final opened = await trading.nextTick();
+      expect(opened.session.step, 210);
+      expect(opened.session.marketSessionStatus.isOpen, isTrue);
+      expect(opened.session.currentMinuteFills, isNotEmpty);
+    } finally {
+      await trading.close();
+    }
+  });
+
   test('R45 pulse order IDs cannot collide with a future minute boundary', () {
     final session = TxSession.freshWithAgents();
     session.marketPulse(15);
