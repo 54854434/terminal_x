@@ -1,8 +1,28 @@
 import 'dart:convert';
+import 'dart:math' as math;
 
 import '../engine/tx_engine.dart';
 import 'tx_market_instruments.dart';
 import 'tx_market_profiles.dart';
+
+/// Collateral scope for leveraged independent-market positions.
+///
+/// Cross margin shares the account's equity across every open position.
+/// Isolated margin assigns collateral to each position and does not allow a
+/// losing position to consume another position's reserved collateral.
+enum TxMarginMode { cross, isolated }
+
+extension TxMarginModeLabel on TxMarginMode {
+  String get label => switch (this) {
+    TxMarginMode.cross => '全仓',
+    TxMarginMode.isolated => '逐仓',
+  };
+
+  String get description => switch (this) {
+    TxMarginMode.cross => '所有持仓共享账户权益，资金利用率更高，但单仓亏损会影响全账户。',
+    TxMarginMode.isolated => '每个持仓单独分配保证金，亏损到该仓保证金边界时只处理该仓。',
+  };
+}
 
 /// Numeric risk rules for the five simulated market modes.
 ///
@@ -217,6 +237,7 @@ class TxMarketPosition {
     required this.averageEntryCents,
     required this.unsettledLongQuantity,
     required this.realizedPnlCents,
+    this.isolatedMarginCents = 0,
   });
 
   final String symbol;
@@ -224,6 +245,10 @@ class TxMarketPosition {
   final int averageEntryCents;
   final int unsettledLongQuantity;
   final int realizedPnlCents;
+  /// Collateral currently reserved for this position in isolated mode.
+  /// Cross-margin positions always expose zero here because collateral lives
+  /// at the account level.
+  final int isolatedMarginCents;
 
   int get longQuantity => netQuantity > 0 ? netQuantity : 0;
   int get shortQuantity => netQuantity < 0 ? -netQuantity : 0;
@@ -235,26 +260,34 @@ class TxMarketPosition {
 
 class TxMarketRiskSnapshot {
   const TxMarketRiskSnapshot({
+    required this.marginMode,
     required this.cashCents,
     required this.equityCents,
     required this.unrealizedPnlCents,
     required this.realizedPnlCents,
     required this.usedMarginCents,
+    required this.isolatedMarginCents,
     required this.maintenanceMarginCents,
     required this.freeMarginCents,
     required this.marginRatio,
+    required this.liquidationBufferCents,
     required this.liquidationRequired,
     required this.positions,
   });
 
+  final TxMarginMode marginMode;
   final int cashCents;
   final int equityCents;
   final int unrealizedPnlCents;
   final int realizedPnlCents;
   final int usedMarginCents;
+  final int isolatedMarginCents;
   final int maintenanceMarginCents;
   final int freeMarginCents;
   final double? marginRatio;
+  /// Equity cushion above maintenance. In isolated mode this is the smallest
+  /// per-position cushion; in cross mode it is account-wide.
+  final int? liquidationBufferCents;
   final bool liquidationRequired;
   final Map<String, TxMarketPosition> positions;
 
@@ -338,7 +371,7 @@ class TxMarketExecutionResult {
 }
 
 class TxMarketCore {
-  static const snapshotSchema = 1;
+  static const snapshotSchema = 2;
 
   TxMarketCore({
     required this.profile,
@@ -347,6 +380,7 @@ class TxMarketCore {
     this.gameDay = 1,
     Map<String, int>? initialLongPositions,
     int? leverageMultiple,
+    this.marginMode = TxMarginMode.cross,
   }) : cashCents = openingCashCents,
        rule = TxMarketRiskRules.forMode(profile.mode),
        leverageMultiple = leverageMultiple ??
@@ -356,6 +390,9 @@ class TxMarketCore {
       throw ArgumentError('Invalid opening cash or game day');
     }
     _validateLeverageMultiple(this.leverageMultiple);
+    if (!rule.usesMargin && marginMode != TxMarginMode.cross) {
+      throw ArgumentError('现货账户不支持逐仓保证金');
+    }
     final symbols = profile.instruments.map((item) => item.symbol).toSet();
     if (symbols.length != profile.instruments.length ||
         _marks.keys.length != symbols.length ||
@@ -373,10 +410,20 @@ class TxMarketCore {
       if (quantity < 1 || quantity > TxEngine.maxQuantity) {
         throw ArgumentError.value(quantity, 'initialLongPositions');
       }
-      _positions[entry.key] = _MutablePosition(symbol: entry.key)
+      final position = _MutablePosition(symbol: entry.key)
         ..netQuantity = quantity
         ..averageEntryCents = _marks[entry.key]!
         ..unsettledLongQuantity = positionRule.tPlusOne ? quantity : 0;
+      if (marginMode == TxMarginMode.isolated && positionRule.usesMargin) {
+        final isolated = positionRule.initialMarginCents(
+            priceCents: position.averageEntryCents, quantity: quantity);
+        if (cashCents < isolated) {
+          throw ArgumentError('初始逐仓保证金不足');
+        }
+        cashCents -= isolated;
+        position.isolatedMarginCents = isolated;
+      }
+      _positions[entry.key] = position;
     }
   }
 
@@ -387,6 +434,9 @@ class TxMarketCore {
   /// Account-level leverage. It is persisted with the independent snapshot
   /// and cannot be changed while a position is open.
   int leverageMultiple;
+  /// Account-level collateral scope. It cannot change while a position is
+  /// open; the service also blocks it while player orders are resting.
+  TxMarginMode marginMode;
   final Map<String, int> _marks;
   final Map<String, _MutablePosition> _positions = {};
   int _realizedPnlCents = 0;
@@ -397,12 +447,14 @@ class TxMarketCore {
     int gameDay = 1,
     Map<String, int>? initialLongPositions,
     int? leverageMultiple,
+    TxMarginMode marginMode = TxMarginMode.cross,
   }) => TxMarketCore(
         profile: profile,
         openingCashCents: openingCashCents,
         gameDay: gameDay,
         initialLongPositions: initialLongPositions,
         leverageMultiple: leverageMultiple,
+        marginMode: marginMode,
         initialMarks: {
           for (var i = 0; i < profile.instruments.length; i++)
             profile.instruments[i].symbol: _defaultMark(profile.mode, i),
@@ -437,6 +489,19 @@ class TxMarketCore {
       throw StateError('有持仓时不能调整杠杆，请先平仓');
     }
     leverageMultiple = value;
+  }
+
+  /// Switch collateral scope only while the account is flat. This prevents a
+  /// live position from silently changing its liquidation semantics.
+  void setMarginMode(TxMarginMode value) {
+    if (value == marginMode) return;
+    if (!rule.usesMargin && value != TxMarginMode.cross) {
+      throw StateError('现货账户不支持逐仓保证金');
+    }
+    if (snapshot().hasPositions) {
+      throw StateError('有持仓时不能调整保证金模式，请先平仓');
+    }
+    marginMode = value;
   }
 
   int markPriceCents(String symbol) {
@@ -608,6 +673,7 @@ class TxMarketCore {
         'cashCents': cashCents,
         'gameDay': gameDay,
         'leverageMultiple': leverageMultiple,
+        'marginMode': marginMode.name,
         'marks': _marks,
         'realizedPnlCents': _realizedPnlCents,
         'positions': [
@@ -618,6 +684,7 @@ class TxMarketCore {
               'averageEntryCents': position.averageEntryCents,
               'unsettledLongQuantity': position.unsettledLongQuantity,
               'realizedPnlCents': position.realizedPnlCents,
+              'isolatedMarginCents': position.isolatedMarginCents,
             },
         ],
       };
@@ -631,7 +698,8 @@ class TxMarketCore {
   }
 
   static TxMarketCore fromJsonMap(Map<String, dynamic> data) {
-    if (data['schema'] != snapshotSchema || data['mode'] is! String ||
+    if ((data['schema'] != 1 && data['schema'] != snapshotSchema) ||
+        data['mode'] is! String ||
         data['cashCents'] is! int || data['gameDay'] is! int ||
         data['marks'] is! Map || data['positions'] is! List ||
         data['realizedPnlCents'] is! int) {
@@ -645,6 +713,16 @@ class TxMarketCore {
     if (persistedLeverage != null && persistedLeverage is! int) {
       throw const FormatException('Invalid market leverage');
     }
+    final persistedMargin = data['marginMode'];
+    if (persistedMargin != null && persistedMargin is! String) {
+      throw const FormatException('Invalid market margin mode');
+    }
+    final marginMode = persistedMargin == null
+        ? TxMarginMode.cross
+        : TxMarginMode.values.firstWhere(
+            (value) => value.name == persistedMargin,
+            orElse: () => throw const FormatException(
+                'Unknown market margin mode'));
     final marks = <String, int>{};
     for (final entry in (data['marks'] as Map).entries) {
       if (entry.key is! String || entry.value is! int) {
@@ -658,6 +736,7 @@ class TxMarketCore {
       initialMarks: marks,
       gameDay: data['gameDay'] as int,
       leverageMultiple: persistedLeverage as int?,
+      marginMode: marginMode,
     )
       ..cashCents = data['cashCents'] as int
       .._realizedPnlCents = data['realizedPnlCents'] as int;
@@ -680,19 +759,29 @@ class TxMarketCore {
       final net = position['netQuantity'] as int;
       final average = position['averageEntryCents'] as int;
       final unsettled = position['unsettledLongQuantity'] as int;
+      final isolatedMargin = position['isolatedMarginCents'] ?? 0;
+      if (isolatedMargin is! int) {
+        throw const FormatException('Invalid isolated position margin');
+      }
       if (net.abs() > TxEngine.maxQuantity ||
           (net == 0 && average != 0) ||
           (net != 0 && (average < 1 || average > TxEngine.maxPriceCents)) ||
           unsettled < 0 || unsettled > (net > 0 ? net : 0) ||
           (!positionRule.supportsShort && net < 0) ||
-          (!positionRule.tPlusOne && unsettled != 0)) {
+          (!positionRule.tPlusOne && unsettled != 0) ||
+          isolatedMargin < 0 ||
+          isolatedMargin > TxEngine.maxNotionalCents ||
+          (net == 0 && isolatedMargin != 0) ||
+          marginMode == TxMarginMode.cross && isolatedMargin != 0 ||
+          !positionRule.usesMargin && isolatedMargin != 0) {
         throw const FormatException('Invalid market position invariant');
       }
       core._positions[symbol] = _MutablePosition(symbol: symbol)
         ..netQuantity = net
         ..averageEntryCents = average
         ..unsettledLongQuantity = unsettled
-        ..realizedPnlCents = position['realizedPnlCents'] as int;
+        ..realizedPnlCents = position['realizedPnlCents'] as int
+        ..isolatedMarginCents = isolatedMargin;
     }
     core.snapshot();
     return core;
@@ -707,6 +796,7 @@ class TxMarketCore {
       initialMarks: _marks,
       gameDay: gameDay,
       leverageMultiple: leverageMultiple,
+      marginMode: marginMode,
     )..cashCents = cashCents;
     copy._realizedPnlCents = _realizedPnlCents;
     for (final entry in _positions.entries) {
@@ -728,6 +818,7 @@ class TxMarketCore {
     cashCents = fork.cashCents;
     gameDay = fork.gameDay;
     leverageMultiple = fork.leverageMultiple;
+    marginMode = fork.marginMode;
     _marks
       ..clear()
       ..addAll(fork._marks);
@@ -810,6 +901,8 @@ class TxMarketCore {
     state.netQuantity = calculated.newQuantity;
     state.averageEntryCents = calculated.newAverageEntryCents;
     state.unsettledLongQuantity = calculated.newUnsettledLongQuantity;
+    state.isolatedMarginCents =
+        calculated.publicPlan.projectedPosition.isolatedMarginCents;
     state.realizedPnlCents += calculated.realizedPnlCents;
     _realizedPnlCents += calculated.realizedPnlCents;
     cashCents = calculated.projectedCashCents;
@@ -908,15 +1001,22 @@ class TxMarketCore {
     if (reduceOnly && transition.openingQuantity > 0) {
       return fallback.withReason('只减仓委托不能增加或反向开仓');
     }
+    final collateral = _collateralTransition(
+      current: current,
+      transition: transition,
+      priceCents: priceCents,
+      tradeRule: tradeRule,
+    );
     final projectedPositions = <String, _MutablePosition>{
       for (final entry in _positions.entries)
         entry.key: entry.value.copy(),
     };
-    projectedPositions[symbol] = transition.position;
+    projectedPositions[symbol] = collateral.position;
     final notional = tradeRule.notionalCents(
         priceCents: priceCents, quantity: quantity);
     final projectedCash = tradeRule.usesMargin
-        ? cashCents + transition.realizedPnlCents - feeCents
+        ? cashCents + transition.realizedPnlCents - feeCents +
+            collateral.releasedMarginCents - collateral.allocatedMarginCents
         : cashCents + (side == TxSide.buy ? -notional : notional) - feeCents;
     final projectedUsedMargin = _usedMargin(
         positions: projectedPositions, markOverrides: {symbol: priceCents});
@@ -939,14 +1039,20 @@ class TxMarketCore {
     // negative cash remains visible and auditable after the fill.
     final forcedReduction = currentRisk.liquidationRequired &&
         reduceOnly && transition.openingQuantity == 0;
-    if (tradeRule.usesMargin && projectedCash < projectedUsedMargin &&
-        !forcedReduction) {
-      return fallback.withReason('保证金不足，需要至少 $projectedUsedMargin');
+    if (tradeRule.usesMargin && !forcedReduction) {
+      if (marginMode == TxMarginMode.isolated && projectedCash < 0) {
+        return fallback.withReason('逐仓可用余额不足，需要至少 '
+            '${collateral.allocatedMarginCents - collateral.releasedMarginCents}');
+      }
+      if (marginMode == TxMarginMode.cross &&
+          projectedCash < projectedUsedMargin) {
+        return fallback.withReason('全仓保证金不足，需要至少 $projectedUsedMargin');
+      }
     }
     return _CalculatedExecution.accepted(
       side: side,
       quantity: quantity,
-      position: transition.position,
+      position: collateral.position,
       closingQuantity: transition.closingQuantity,
       openingQuantity: transition.openingQuantity,
       realizedPnlCents: transition.realizedPnlCents,
@@ -1012,6 +1118,41 @@ class TxMarketCore {
     );
   }
 
+  _CollateralTransition _collateralTransition({
+    required _MutablePosition current,
+    required _PositionTransition transition,
+    required int priceCents,
+    required TxMarketRiskRule tradeRule,
+  }) {
+    final position = transition.position;
+    if (!tradeRule.usesMargin || marginMode != TxMarginMode.isolated) {
+      position.isolatedMarginCents = 0;
+      return _CollateralTransition(
+        position: position,
+        releasedMarginCents: 0,
+        allocatedMarginCents: 0,
+      );
+    }
+    final currentQuantity = current.netQuantity.abs();
+    final released = transition.closingQuantity == 0 || currentQuantity == 0
+        ? 0
+        : transition.closingQuantity >= currentQuantity
+            ? current.isolatedMarginCents
+            : current.isolatedMarginCents * transition.closingQuantity ~/
+                currentQuantity;
+    final allocated = transition.openingQuantity == 0
+        ? 0
+        : tradeRule.initialMarginCents(
+            priceCents: priceCents, quantity: transition.openingQuantity);
+    position.isolatedMarginCents = math.max(
+        0, current.isolatedMarginCents - released + allocated);
+    return _CollateralTransition(
+      position: position,
+      releasedMarginCents: released,
+      allocatedMarginCents: allocated,
+    );
+  }
+
   TxMarketRiskSnapshot _snapshot({
     required int cash,
     required Map<String, _MutablePosition> positions,
@@ -1020,9 +1161,13 @@ class TxMarketCore {
     var unrealized = 0;
     var marginUnrealized = 0;
     var used = 0;
+    var isolatedCollateral = 0;
     var maintenance = 0;
     var spotValue = 0;
     var hasMarginPosition = false;
+    var isolatedLiquidation = false;
+    double? minimumIsolatedRatio;
+    int? minimumLiquidationBuffer;
     for (final entry in positions.entries) {
       final position = entry.value;
       if (position.netQuantity == 0) continue;
@@ -1035,28 +1180,66 @@ class TxMarketCore {
       if (positionRule.usesMargin) {
         hasMarginPosition = true;
         marginUnrealized += positionUnrealized;
-        used += positionRule.initialMarginCents(
+        final positionMaintenance = positionRule.maintenanceMarginCents(
             priceCents: mark, quantity: position.netQuantity.abs());
-        maintenance += positionRule.maintenanceMarginCents(
-            priceCents: mark, quantity: position.netQuantity.abs());
+        maintenance += positionMaintenance;
+        if (marginMode == TxMarginMode.isolated) {
+          isolatedCollateral += position.isolatedMarginCents;
+          used += position.isolatedMarginCents;
+          final positionEquity = position.isolatedMarginCents +
+              positionUnrealized;
+          final buffer = positionEquity - positionMaintenance;
+          minimumLiquidationBuffer = minimumLiquidationBuffer == null
+              ? buffer
+              : math.min(minimumLiquidationBuffer!, buffer);
+          final ratio = positionMaintenance == 0
+              ? double.infinity
+              : positionEquity / positionMaintenance;
+          minimumIsolatedRatio = minimumIsolatedRatio == null
+              ? ratio
+              : math.min(minimumIsolatedRatio!, ratio);
+          if (positionEquity < positionMaintenance) {
+            isolatedLiquidation = true;
+          }
+        } else {
+          used += positionRule.initialMarginCents(
+              priceCents: mark, quantity: position.netQuantity.abs());
+        }
       } else {
         spotValue += mark * position.netQuantity *
             positionRule.contractMultiplier;
       }
     }
-    final equity = cash + spotValue + marginUnrealized;
-    final free = hasMarginPosition ? equity - used : cash;
-    final ratio = maintenance == 0 ? null : equity / maintenance;
+    final equity = cash + spotValue + marginUnrealized + isolatedCollateral;
+    final free = hasMarginPosition
+        ? marginMode == TxMarginMode.isolated ? cash : equity - used
+        : cash;
+    final ratio = !hasMarginPosition || maintenance == 0
+        ? null
+        : marginMode == TxMarginMode.isolated
+            ? minimumIsolatedRatio
+            : equity / maintenance;
+    final liquidationBuffer = !hasMarginPosition
+        ? null
+        : marginMode == TxMarginMode.isolated
+            ? minimumLiquidationBuffer
+            : equity - maintenance;
     return TxMarketRiskSnapshot(
+      marginMode: marginMode,
       cashCents: cash,
       equityCents: equity,
       unrealizedPnlCents: unrealized,
       realizedPnlCents: _realizedPnlCents,
       usedMarginCents: used,
+      isolatedMarginCents: isolatedCollateral,
       maintenanceMarginCents: maintenance,
       freeMarginCents: free,
       marginRatio: ratio,
-      liquidationRequired: hasMarginPosition && maintenance > 0 && equity < maintenance,
+      liquidationBufferCents: liquidationBuffer,
+      liquidationRequired: hasMarginPosition && maintenance > 0 &&
+          (marginMode == TxMarginMode.isolated
+              ? isolatedLiquidation
+              : equity < maintenance),
       positions: Map.unmodifiable({
         for (final entry in positions.entries) entry.key: entry.value.freeze(),
       }),
@@ -1073,6 +1256,10 @@ class TxMarketCore {
       if (position.netQuantity == 0) continue;
       final positionRule = _ruleFor(entry.key);
       if (!positionRule.usesMargin) continue;
+      if (marginMode == TxMarginMode.isolated) {
+        total += position.isolatedMarginCents;
+        continue;
+      }
       final mark = markOverrides[entry.key] ?? _marks[entry.key]!;
       total += positionRule.initialMarginCents(
           priceCents: mark, quantity: position.netQuantity.abs());
@@ -1142,13 +1329,15 @@ class _MutablePosition {
     ..netQuantity = netQuantity
     ..averageEntryCents = averageEntryCents
     ..unsettledLongQuantity = unsettledLongQuantity
-    ..realizedPnlCents = realizedPnlCents;
+    ..realizedPnlCents = realizedPnlCents
+    ..isolatedMarginCents = isolatedMarginCents;
 
   final String symbol;
   int netQuantity = 0;
   int averageEntryCents = 0;
   int unsettledLongQuantity = 0;
   int realizedPnlCents = 0;
+  int isolatedMarginCents = 0;
 
   int get availableToClose => netQuantity > 0
       ? netQuantity - unsettledLongQuantity
@@ -1160,7 +1349,20 @@ class _MutablePosition {
     averageEntryCents: averageEntryCents,
     unsettledLongQuantity: unsettledLongQuantity,
     realizedPnlCents: realizedPnlCents,
+    isolatedMarginCents: isolatedMarginCents,
   );
+}
+
+class _CollateralTransition {
+  const _CollateralTransition({
+    required this.position,
+    required this.releasedMarginCents,
+    required this.allocatedMarginCents,
+  });
+
+  final _MutablePosition position;
+  final int releasedMarginCents;
+  final int allocatedMarginCents;
 }
 
 class _PositionTransition {

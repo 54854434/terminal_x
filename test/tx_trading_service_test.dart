@@ -210,6 +210,17 @@ void main() {
     expect(recovered.session.marketTimeStep, 1);
   });
 
+  test('recovery is single-flight when the UI retries while it is settling',
+      () async {
+    await service.open();
+    final first = service.reopenAndVerify();
+    final second = service.reopenAndVerify();
+    expect(identical(first, second), isTrue);
+    final recovered = await first;
+    expect(recovered.revision, service.current.revision);
+    expect(service.recoveryInProgress, isFalse);
+  });
+
   test('ticks persist and new service instance reads same account', () async {
     await service.open();
     await service.nextTick();

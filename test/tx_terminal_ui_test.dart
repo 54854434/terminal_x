@@ -9,6 +9,8 @@ import '../lib/widgets/tx_terminal_theme.dart';
 import '../lib/widgets/tx_settings_page.dart';
 import '../lib/widgets/tx_ticket_submit_bar.dart';
 import '../lib/engine/tx_engine.dart';
+import '../lib/market/tx_market_microstructure.dart';
+import '../lib/market/tx_market_profiles.dart';
 
 void main() {
   test('dark theme uses shared primary and surface colors', () {
@@ -228,6 +230,99 @@ void main() {
     expect(find.text('真实撮合'), findsOneWidget);
     expect(find.text('只读可见挂单'), findsOneWidget);
     expect(find.text('说明文字'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('multi-market desk keeps quote cards uniform and switchable',
+      (tester) async {
+    TxMarketDeskQuote quote({
+      required TxMarketMode mode,
+      required String label,
+      required bool selected,
+    }) => TxMarketDeskQuote(
+      mode: mode,
+      label: label,
+      symbol: 'SIM-01',
+      status: '开市中',
+      mark: '¥10.00',
+      change: '+¥0.10',
+      activity: '4 笔 · 20手',
+      liquidity: '深 1.2k',
+      account: '¥1.0m',
+      isOpen: true,
+      isLoaded: true,
+      isSelected: selected,
+      accent: TxTerminalColors.buy,
+    );
+    TxMarketMode? selected;
+    await tester.pumpWidget(MaterialApp(
+      theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxMarketDeskOverview(
+        quotes: [
+          quote(mode: TxMarketMode.aShare, label: 'A股', selected: true),
+          quote(mode: TxMarketMode.crypto, label: '虚拟货币', selected: false),
+        ],
+        onSelected: (mode) => selected = mode,
+      )),
+    ));
+    expect(find.text('多市场专业工作台'), findsOneWidget);
+    expect(find.text('A股'), findsOneWidget);
+    expect(find.text('虚拟货币'), findsOneWidget);
+    await tester.tap(find.text('虚拟货币'));
+    expect(selected, TxMarketMode.crypto);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('flow panel labels real prints separately from visible depth',
+      (tester) async {
+    final snapshot = TxMarketMicrostructureSnapshot.fromPrints(
+      prints: const [
+        TxMarketPrint(
+          id: 'F1', symbol: 'SIM-X', priceCents: 1000, quantity: 8,
+          aggressor: TxMarketAggressor.buy, timeLabel: '09:31'),
+        TxMarketPrint(
+          id: 'F2', symbol: 'SIM-X', priceCents: 1001, quantity: 3,
+          aggressor: TxMarketAggressor.sell, timeLabel: '09:32'),
+      ],
+      bids: const [TxBookLevel(999, 30, 2)],
+      asks: const [TxBookLevel(1001, 40, 2)],
+    );
+    await tester.pumpWidget(MaterialApp(
+      theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxMarketFlowPanel(
+        snapshot: snapshot,
+        priceLabel: (cents) => '¥${cents / 100}',
+        quantityUnit: '股',
+      )),
+    ));
+    expect(find.text('实时成交与盘口压力'), findsOneWidget);
+    expect(find.text('主动买'), findsWidgets);
+    expect(find.text('十档深度'), findsOneWidget);
+    expect(find.text('8股 · ¥10.0'), findsOneWidget);
+    expect(find.text('3股 · ¥10.01'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('empty flow window uses a stopped neutral pressure bar',
+      (tester) async {
+    final snapshot = TxMarketMicrostructureSnapshot.fromPrints(
+      prints: const <TxMarketPrint>[],
+      bids: const [TxBookLevel(999, 30, 2)],
+      asks: const [TxBookLevel(1001, 40, 2)],
+    );
+    await tester.pumpWidget(MaterialApp(
+      theme: TxTerminalTheme.dark(),
+      home: Scaffold(body: TxMarketFlowPanel(
+        snapshot: snapshot,
+        priceLabel: (cents) => '¥${cents / 100}',
+        quantityUnit: '股',
+      )),
+    ));
+    final progress = tester.widget<LinearProgressIndicator>(
+        find.byType(LinearProgressIndicator));
+    expect(progress.value, 0.0);
+    expect(find.text('暂无主动方向'), findsOneWidget);
+    expect(find.textContaining('没有已发生的真实成交'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

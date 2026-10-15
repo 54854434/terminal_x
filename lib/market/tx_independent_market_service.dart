@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import '../engine/tx_engine.dart';
 import '../storage/tx_sqlite_store.dart';
 import 'tx_candle_history.dart';
+import 'tx_market_conditional_orders.dart';
 import 'tx_market_profiles.dart';
 import 'tx_market_risk_core.dart';
 import 'tx_market_runtime.dart';
@@ -71,18 +72,21 @@ class TxIndependentMarketState {
     for (final instrument in profile.instruments) {
       _candles[instrument.symbol] = <TxCandle>[];
     }
-    final fills = runtime.venue.fills;
-    for (final fill in fills) {
+    final fillCount = runtime.venue.fillCount;
+    for (var index = 0; index < fillCount; index++) {
+      final fill = runtime.venue.fillAt(index);
       // Normal venue history is already in execution order. If an imported
       // legacy snapshot violates that ordering, fall back to the sorted
       // rebuild below rather than presenting a silently misordered chart.
       if (!_appendFill(fill)) {
-        _rebuildCandlesSorted(fills);
-        _candleFillCursor = fills.length;
+        _rebuildCandlesSorted([
+          for (var i = 0; i < fillCount; i++) runtime.venue.fillAt(i),
+        ]);
+        _candleFillCursor = fillCount;
         return;
       }
     }
-    _candleFillCursor = fills.length;
+    _candleFillCursor = fillCount;
   }
 
   void _rebuildCandlesSorted(List<TxMarketVenueFill> fills) {
@@ -161,18 +165,18 @@ class TxIndependentMarketState {
   }
 
   void _updateCandles() {
-    final fills = runtime.venue.fills;
-    if (_candleFillCursor > fills.length) {
+    final fillCount = runtime.venue.fillCount;
+    if (_candleFillCursor > fillCount) {
       _rebuildCandles();
       return;
     }
-    for (var index = _candleFillCursor; index < fills.length; index++) {
-      if (!_appendFill(fills[index])) {
+    for (var index = _candleFillCursor; index < fillCount; index++) {
+      if (!_appendFill(runtime.venue.fillAt(index))) {
         _rebuildCandles();
         return;
       }
     }
-    _candleFillCursor = fills.length;
+    _candleFillCursor = fillCount;
   }
 }
 
@@ -342,6 +346,71 @@ class TxIndependentMarketService {
         return order;
       });
 
+  /// Store a stop-loss or take-profit instruction against the player's
+  /// currently closable net position. The instruction is durable, but it is
+  /// not a resting venue order: the next verified open-market mark decides
+  /// whether it becomes a real reduce-only market order.
+  Future<TxMarketConditionalOrder> placeConditional({
+    required TxMarketMode mode,
+    required String symbol,
+    required TxMarketConditionalOrderKind kind,
+    required int triggerPriceCents,
+    required int quantity,
+    required int gameDay,
+    required int minuteOfDay,
+  }) => _enqueue(() async {
+        final state = _requireState(mode);
+        if (state.runtime.gameDay != gameDay ||
+            state.runtime.minuteOfDay != minuteOfDay) {
+          throw StateError('Independent market clock changed before protection '
+              'order; refresh the board and retry');
+        }
+        final instrument = state.profile.instruments.firstWhere(
+          (item) => item.symbol == symbol,
+          orElse: () => throw ArgumentError.value(symbol, 'symbol'),
+        );
+        final rule = TxMarketRiskRules.forMode(mode);
+        rule.validatePrice(triggerPriceCents);
+        rule.validateQuantity(quantity);
+        final position = state.player.position(symbol);
+        if (position.isFlat || position.availableToClose < quantity) {
+          throw StateError('保护单必须对应当前可平仓位，最多可设置 '
+              '${position.availableToClose} ${instrument.orderUnit}');
+        }
+        final order = TxMarketConditionalOrder(
+          id: _nextOrderId(state, 'COND'),
+          symbol: symbol,
+          side: position.netQuantity > 0 ? TxSide.sell : TxSide.buy,
+          kind: kind,
+          triggerPriceCents: triggerPriceCents,
+          quantity: quantity,
+          createdGameDay: gameDay,
+          createdMinuteOfDay: minuteOfDay,
+        );
+        state.runtime.conditionalOrders.add(order);
+        await _save(state);
+        return order;
+      });
+
+  /// Cancel a still-pending protection instruction. Triggered instructions
+  /// are removed atomically before their reduce-only order is submitted, so
+  /// this endpoint never cancels a fill that has already entered the venue.
+  Future<TxMarketConditionalOrder> cancelConditional({
+    required TxMarketMode mode,
+    required String orderId,
+  }) => _enqueue(() async {
+        final state = _requireState(mode);
+        final index = state.runtime.conditionalOrders.indexWhere(
+          (order) => order.id == orderId,
+        );
+        if (index < 0) {
+          throw StateError('保护单不存在或已触发：$orderId');
+        }
+        final order = state.runtime.conditionalOrders.removeAt(index);
+        await _save(state);
+        return order;
+      });
+
   /// Change only the player's margin regime. The core rejects changes while
   /// exposed; active player orders are also blocked so a pending order cannot
   /// be executed under a different leverage after the UI selection.
@@ -358,6 +427,24 @@ class TxIndependentMarketService {
         state.player.setLeverageMultiple(multiple);
         await _save(state);
         return state.player.leverageMultiple;
+      });
+
+  /// Change only the player's collateral scope. Existing positions and
+  /// resting orders are blocked so a live order cannot be reinterpreted under
+  /// a different liquidation model between preflight and execution.
+  Future<TxMarginMode> setPlayerMarginMode({
+    required TxMarketMode mode,
+    required TxMarginMode marginMode,
+  }) => _enqueue(() async {
+        final state = _requireState(mode);
+        final active = state.runtime.venue.activeOrders.where(
+            (order) => order.ownerId == TxIndependentMarketState.playerId);
+        if (active.isNotEmpty) {
+          throw StateError('请先撤销未成交委托，再调整保证金模式');
+        }
+        state.player.setMarginMode(marginMode);
+        await _save(state);
+        return state.player.marginMode;
       });
 
   Future<TxMarketVenueOrder> cancel({
@@ -546,6 +633,9 @@ class TxIndependentMarketService {
         state._quoteRefreshCount++;
       }
       if (shouldEmitMinute) {
+        _evaluateConditionalOrders(state);
+      }
+      if (shouldEmitMinute) {
         _emitSyntheticFlow(state, gameDay, minuteOfDay);
         _emitSmartTraderFlow(state, gameDay, minuteOfDay);
       }
@@ -557,6 +647,48 @@ class TxIndependentMarketService {
       state._lastQuoteRefreshStep = null;
     }
     if (persist) await _save(state);
+  }
+
+  /// Evaluate protection instructions only after the current minute's mark
+  /// has been accepted by every account. A triggered instruction is consumed
+  /// once, then its reduce-only market order follows the same finite book and
+  /// risk gates as a player ticket; a rejected remainder remains visible in
+  /// venue order history instead of being retried invisibly.
+  void _evaluateConditionalOrders(TxIndependentMarketState state) {
+    if (state.runtime.conditionalOrders.isEmpty) return;
+    final pending = List<TxMarketConditionalOrder>.from(
+        state.runtime.conditionalOrders);
+    for (final condition in pending) {
+      final mark = state.player.markPriceCents(condition.symbol);
+      if (!condition.shouldTrigger(mark)) continue;
+
+      state.runtime.conditionalOrders.removeWhere(
+          (order) => order.id == condition.id);
+      final position = state.player.position(condition.symbol);
+      final available = position.availableToClose;
+      if (available < 1) continue;
+      final quantity = math.min(condition.quantity, available);
+      try {
+        state.runtime.place(
+          id: _nextOrderId(state, 'TRIGGER'),
+          ownerId: TxIndependentMarketState.playerId,
+          symbol: condition.symbol,
+          side: condition.side,
+          kind: TxKind.market,
+          quantity: quantity,
+          limitPriceCents: null,
+          timeInForce: TxTimeInForce.gtc,
+          reduceOnly: true,
+          validateAfter: false,
+        );
+      } on StateError {
+        // The venue keeps deterministic risk/conflict failures explicit. A
+        // single stale protection instruction must not block other markets.
+      } on ArgumentError {
+        // The position may have changed between snapshots; consume the
+        // instruction rather than creating an unbounded retry loop.
+      }
+    }
   }
 
   Future<void> _save(TxIndependentMarketState state) async {
@@ -643,14 +775,23 @@ class TxIndependentMarketService {
   void _emitSyntheticFlow(TxIndependentMarketState state, int gameDay,
       int minuteOfDay) {
     final timeKey = (gameDay - 1) * 1440 + minuteOfDay;
-    final quantity = _flowOrderQuantity(state.mode);
-    // Every open minute gets an auditable print for every instrument. The
-    // prior `timeKey % 3` gate made non-A boards appear frozen after the first
-    // few minutes, and rotating one symbol left the other symbol with no
-    // volume. The two opposite market orders below cross the funded inside
-    // quotes and net the FLOW account back to its starting inventory.
-    for (final instrument in state.profile.instruments) {
-      final buy = () => state.runtime.place(
+    final baseQuantity = _flowOrderQuantity(state.mode);
+    final pressureStep = _flowPressureStep(state.mode);
+    // Every open minute gets an auditable print for every instrument. A
+    // perfectly balanced one-lot buy/sell pair used to remain at the same
+    // inside quote forever, so the independent candles were mostly flat gray
+    // wicks even though the book technically had ten levels. The deterministic
+    // pressure is deliberately modest and alternates over time: it lets a
+    // real participant sweep finite levels, while its opposite leg keeps FLOW
+    // from becoming an unbounded hidden price source.
+    for (var index = 0; index < state.profile.instruments.length; index++) {
+      final instrument = state.profile.instruments[index];
+      final wave = ((timeKey * 5 + index * 17) % 7) - 3;
+      final buyQuantity = baseQuantity +
+          math.max(0, wave).toInt() * pressureStep;
+      final sellQuantity = baseQuantity +
+          math.max(0, -wave).toInt() * pressureStep;
+      final buy = (int quantity) => state.runtime.place(
         id: _nextOrderId(state, 'FLOW-BUY'),
         ownerId: 'FLOW',
         symbol: instrument.symbol,
@@ -661,7 +802,7 @@ class TxIndependentMarketService {
         timeInForce: TxTimeInForce.gtc,
         validateAfter: false,
       );
-      final sell = () => state.runtime.place(
+      final sell = (int quantity) => state.runtime.place(
         id: _nextOrderId(state, 'FLOW-SELL'),
         ownerId: 'FLOW',
         symbol: instrument.symbol,
@@ -673,11 +814,11 @@ class TxIndependentMarketService {
         validateAfter: false,
       );
       if (timeKey.isEven) {
-        buy();
-        sell();
+        buy(buyQuantity);
+        sell(sellQuantity);
       } else {
-        sell();
-        buy();
+        sell(sellQuantity);
+        buy(buyQuantity);
       }
     }
   }
@@ -881,26 +1022,35 @@ class TxIndependentMarketService {
     );
   }
 
-  static const _participantOpeningCashCents = 3000000000;
+  // FX contracts carry a 100,000-unit multiplier. A 120-lot seeded inventory
+  // must remain comfortably inside cross-margin equity so the finite makers
+  // can actually quote and recycle both sides of the book on the first open.
+  // This is collateral, not synthetic liquidity: every fill still passes the
+  // account's margin and inventory checks and the balance is persisted.
+  static const _participantOpeningCashCents = 12000000000;
 
   static int _makerInventory(TxMarketMode mode) => switch (mode) {
-    TxMarketMode.usEquity => 2400,
-    TxMarketMode.futures => 240,
-    TxMarketMode.crypto => 240,
-    // One standard lot is a large notional in this model. Keep the finite
-    // seed inventory below the initial margin budget so the makers start
-    // healthy and can actually provide two-sided FX liquidity.
-    TxMarketMode.forex => 24,
+    // These are finite, but large enough that a few directional minutes do
+    // not make every simulated participant disappear from the book. The
+    // venue still rejects a side when an account truly exhausts its risk
+    // budget; this is not an infinite-liquidity shortcut.
+    TxMarketMode.usEquity => 4800,
+    TxMarketMode.futures => 480,
+    TxMarketMode.crypto => 1200,
+    // One standard lot is large notional in this model. Keep a finite but
+    // usable seed so the FX book can absorb a directional pulse.
+    TxMarketMode.forex => 120,
     TxMarketMode.aShare => 0,
   };
 
   static int _makerQuoteBaseQuantity(TxMarketMode mode) => switch (mode) {
-    TxMarketMode.usEquity => 24,
-    TxMarketMode.futures => 6,
-    // The first ten levels must survive the opening smart-flow pulse; a
-    // single small player order should not jump over the inside BTC quote.
-    TxMarketMode.crypto => 64,
-    TxMarketMode.forex => 4,
+    // Two makers share the inside level. A player-sized order remains inside
+    // the first level, while the deterministic FLOW/AI pulses can legitimately
+    // consume several levels and create real OHLC high/low variation.
+    TxMarketMode.usEquity => 10,
+    TxMarketMode.futures => 3,
+    TxMarketMode.crypto => 8,
+    TxMarketMode.forex => 2,
     TxMarketMode.aShare => 0,
   };
 
@@ -913,10 +1063,18 @@ class TxIndependentMarketService {
   };
 
   static int _smartTraderBaseQuantity(TxMarketMode mode) => switch (mode) {
-    TxMarketMode.usEquity => 10,
+    TxMarketMode.usEquity => 8,
     TxMarketMode.futures => 2,
-    TxMarketMode.crypto => 3,
+    TxMarketMode.crypto => 5,
     TxMarketMode.forex => 2,
+    TxMarketMode.aShare => 0,
+  };
+
+  static int _flowPressureStep(TxMarketMode mode) => switch (mode) {
+    TxMarketMode.usEquity => 6,
+    TxMarketMode.futures => 1,
+    TxMarketMode.crypto => 12,
+    TxMarketMode.forex => 1,
     TxMarketMode.aShare => 0,
   };
 

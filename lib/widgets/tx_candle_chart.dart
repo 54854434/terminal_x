@@ -14,6 +14,7 @@ class TxChartOverlayLine {
     required this.color,
     this.valueLabel,
     this.dashed = true,
+    this.scopeKey,
   });
 
   final int valueCents;
@@ -21,6 +22,14 @@ class TxChartOverlayLine {
   final Color color;
   final String? valueLabel;
   final bool dashed;
+  /// Optional market/symbol scope. A scoped chart only paints lines from the
+  /// same scope, so an asynchronous market switch can never leave the old
+  /// position guide on the new board.
+  final String? scopeKey;
+
+  bool matchesScope(String? requestedScope) => requestedScope == null
+      ? true
+      : scopeKey == requestedScope;
 }
 
 /// Simulated OHLC (real fills plus explicitly marked reference prices for
@@ -31,7 +40,7 @@ class TxCandleChart extends StatefulWidget {
   const TxCandleChart({super.key, required this.candles,
       this.indicativePriceCents, this.indicativeFramePriceCents,
       this.previewSeconds, this.activeMinuteStep, this.pending = false,
-      this.overlays = const <TxChartOverlayLine>[]});
+      this.overlays = const <TxChartOverlayLine>[], this.marketScope});
   final List<TxCandle> candles;
   /// A live intraminute candle is already present in [candles].
   final int? activeMinuteStep;
@@ -40,6 +49,11 @@ class TxCandleChart extends StatefulWidget {
   final double? previewSeconds;
   final bool pending;
   final List<TxChartOverlayLine> overlays;
+  /// Stable identity for the currently painted market and instrument.
+  /// This is deliberately separate from the Flutter key: it also protects
+  /// the painter if a parent keeps the chart state alive during an async
+  /// board switch.
+  final String? marketScope;
   @override
   State<TxCandleChart> createState() => _TxCandleChartState();
 }
@@ -184,13 +198,25 @@ class _TxCandleChartState extends State<TxCandleChart> {
       _axisOffset = _olderOffset;
       _axisLastCommittedStep = visible.last.step;
     } else {
-      // Preview extrema and newly committed candles may expand the envelope,
-      // but they never shrink or rebase the axis on every minute. A high
-      // playback multiplier therefore moves the last candle inside a stable
-      // viewport instead of making the entire chart jump vertically. A new
-      // symbol, period, zoom or history view explicitly rebases it above.
-      _axisHighCents = math.max(_axisHighCents!, high);
-      _axisLowCents = math.min(_axisLowCents!, low);
+      // Keep a genuine fixed viewport while a quote moves inside it. The old
+      // monotonic max/min expansion still changed the y-scale on every small
+      // preview tick, which looked like the entire page was shaking at high
+      // playback speed. Only shift the viewport after the data leaves a wide
+      // guard band; the span is retained so ordinary ticks do not rescale all
+      // existing candles.
+      final stableHigh = _axisHighCents!;
+      final stableLow = _axisLowCents!;
+      final stableSpan = math.max(1.0, stableHigh - stableLow);
+      final guard = math.max(4.0, stableSpan * .18);
+      if (high > stableHigh + guard || low < stableLow - guard) {
+        final envelopeHigh = math.max(high, stableHigh);
+        final envelopeLow = math.min(low, stableLow);
+        final span = math.max(stableSpan,
+            math.max(1.0, envelopeHigh - envelopeLow) * 1.12);
+        final center = (envelopeHigh + envelopeLow) / 2.0;
+        _axisHighCents = center + span / 2.0;
+        _axisLowCents = center - span / 2.0;
+      }
       _axisLastCommittedStep = visible.last.step;
     }
   }
@@ -198,6 +224,20 @@ class _TxCandleChartState extends State<TxCandleChart> {
   @override
   void didUpdateWidget(covariant TxCandleChart oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.marketScope != widget.marketScope) {
+      _maLength = -1;
+      _cachedPeriod = null;
+      _activeBars = const <TxCandle>[];
+      _indicativeWick.reset();
+      _timelineTrace.reset();
+      _axisHighCents = null;
+      _axisLowCents = null;
+      _axisPeriod = null;
+      _axisLastCommittedStep = -1;
+      _olderOffset = 0;
+      _inspectedStep = null;
+      _dragAccumulator = 0;
+    }
     if (!identical(oldWidget.candles, widget.candles)) {
       final historyRebased = oldWidget.candles.isNotEmpty &&
           widget.candles.isNotEmpty &&
@@ -234,6 +274,11 @@ class _TxCandleChartState extends State<TxCandleChart> {
           child: Center(child: Text('暂无已保存的模拟行情记录')));
     }
     _refreshCache();
+    final visibleOverlays = widget.marketScope == null
+        ? widget.overlays
+        : widget.overlays
+            .where((line) => line.matchesScope(widget.marketScope))
+            .toList(growable: false);
     final all = _activeBars;
     final end = (all.length - _olderOffset).clamp(1, all.length).toInt();
     final start = math.max(0, end - _window);
@@ -268,7 +313,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
         ma20: visibleMa20,
         previewHighCents: projection?.highCents,
         previewLowCents: projection?.lowCents,
-        overlays: widget.overlays,
+        overlays: visibleOverlays,
         previousIndicativeStep: _indicativeWick.previousGroupStep,
         previousIndicativeHighCents: _indicativeWick.previousHighCents,
         previousIndicativeLowCents: _indicativeWick.previousLowCents,
@@ -392,7 +437,7 @@ class _TxCandleChartState extends State<TxCandleChart> {
                 previousIndicativeHighCents: _indicativeWick.previousHighCents,
                 previousIndicativeLowCents: _indicativeWick.previousLowCents,
                 showIndicativeWick: true,
-                overlays: widget.overlays)),
+                overlays: visibleOverlays)),
         )),
       )),
       if (inspected != null)
@@ -550,7 +595,7 @@ class _CandlePainter extends CustomPainter {
       final top=y(math.max(c.openCents,c.closeCents).toDouble());
       final bottom=y(math.min(c.openCents,c.closeCents).toDouble());
       if (!hiddenForAggregatePreview) canvas.drawRect(Rect.fromLTWH(x-body/2,top,body,
-          math.max(1.5,bottom-top)),paint);
+          math.max(3.0,bottom-top)),paint);
       if (maxVolume>0 && c.volumeShares>0) {
         final vh=27*c.volumeShares/maxVolume;
         canvas.drawRect(Rect.fromLTWH(x-body/2,size.height-33+(27-vh),

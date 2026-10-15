@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import '../engine/tx_engine.dart';
+import 'tx_market_conditional_orders.dart';
 import 'tx_market_profiles.dart';
 import 'tx_market_risk_core.dart';
 import 'tx_market_venue.dart';
@@ -38,14 +39,17 @@ class TxMarketClockAdvance {
 /// It is also deliberately feed-agnostic: a caller supplies validated marks,
 /// and the venue supplies all actual executions.
 class TxMarketRuntime {
-  static const snapshotSchema = 1;
+  static const snapshotSchema = 2;
 
   TxMarketRuntime({
     required this.venue,
     required this.gameDay,
     required this.minuteOfDay,
     this.markRevision = 0,
-  }) {
+    List<TxMarketConditionalOrder> conditionalOrders = const [],
+  }) : conditionalOrders = List<TxMarketConditionalOrder>.from(
+          conditionalOrders,
+        ) {
     _validateClock(gameDay, minuteOfDay);
     if (markRevision < 0) {
       throw ArgumentError.value(markRevision, 'markRevision');
@@ -61,6 +65,7 @@ class TxMarketRuntime {
   int gameDay;
   int minuteOfDay;
   int markRevision;
+  final List<TxMarketConditionalOrder> conditionalOrders;
 
   TxMarketMode get mode => venue.profile.mode;
 
@@ -153,6 +158,9 @@ class TxMarketRuntime {
         'gameDay': gameDay,
         'minuteOfDay': minuteOfDay,
         'markRevision': markRevision,
+        'conditionalOrders': [
+          for (final order in conditionalOrders) order.toJson(),
+        ],
         'venue': venue.toJson(),
       };
 
@@ -167,7 +175,9 @@ class TxMarketRuntime {
   }
 
   static TxMarketRuntime fromJsonMap(Map<String, dynamic> data) {
-    if (data['schema'] != snapshotSchema || data['mode'] is! String ||
+    final schema = data['schema'];
+    if ((schema != 1 && schema != snapshotSchema) ||
+        data['mode'] is! String ||
         data['gameDay'] is! int || data['minuteOfDay'] is! int ||
         data['markRevision'] is! int || data['venue'] is! Map) {
       throw const FormatException('Invalid market runtime snapshot');
@@ -182,11 +192,41 @@ class TxMarketRuntime {
       if (venue.profile.mode != mode) {
         throw const FormatException('Runtime and venue modes differ');
       }
+      final conditionalOrders = <TxMarketConditionalOrder>[];
+      if (schema == snapshotSchema) {
+        if (data['conditionalOrders'] is! List) {
+          throw const FormatException('Invalid conditional order list');
+        }
+        final ids = <String>{};
+        for (final rawOrder in data['conditionalOrders'] as List) {
+          if (rawOrder is! Map) {
+            throw const FormatException('Invalid conditional order');
+          }
+          final order = TxMarketConditionalOrder.fromJsonMap(
+              Map<String, dynamic>.from(rawOrder));
+          if (!ids.add(order.id)) {
+            throw const FormatException('Duplicate conditional order');
+          }
+          if (!venue.profile.instruments.any(
+              (instrument) => instrument.symbol == order.symbol)) {
+            throw const FormatException('Conditional symbol is not in venue');
+          }
+          try {
+            final rule = TxMarketRiskRules.forMode(mode);
+            rule.validatePrice(order.triggerPriceCents);
+            rule.validateQuantity(order.quantity);
+          } on Object catch (error) {
+            throw FormatException('Invalid conditional order rules: $error');
+          }
+          conditionalOrders.add(order);
+        }
+      }
       return TxMarketRuntime(
         venue: venue,
         gameDay: data['gameDay'] as int,
         minuteOfDay: data['minuteOfDay'] as int,
         markRevision: data['markRevision'] as int,
+        conditionalOrders: conditionalOrders,
       );
     } on FormatException {
       rethrow;

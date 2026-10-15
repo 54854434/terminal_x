@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import '../lib/engine/tx_engine.dart';
 import '../lib/market/tx_independent_market_service.dart';
 import '../lib/market/tx_market_profiles.dart';
+import '../lib/market/tx_market_risk_core.dart';
 import '../lib/storage/tx_sqlite_store.dart';
 
 void main() {
@@ -38,6 +39,10 @@ void main() {
           mode: TxMarketMode.crypto, multiple: 5);
       expect(leverage, 5);
       expect(state.player.leverageMultiple, 5);
+      final marginMode = await service.setPlayerMarginMode(
+          mode: TxMarketMode.crypto, marginMode: TxMarginMode.isolated);
+      expect(marginMode, TxMarginMode.isolated);
+      expect(state.player.marginMode, TxMarginMode.isolated);
 
       await service.sync(mode: TxMarketMode.crypto, gameDay: 1, minuteOfDay: 571);
       expect(state.runtime.venue.fills.length, greaterThan(fillsAtOpen));
@@ -67,6 +72,7 @@ void main() {
       expect(restored.sequence, state.sequence);
       expect(restored.runtime.venue.fills.length,
           state.runtime.venue.fills.length);
+      expect(restored.player.marginMode, TxMarginMode.isolated);
       expect(restored.candlesFor('SIM-BTCUSDT'), isNotEmpty);
       restored.runtime.venue.checkInvariants();
     } finally {
@@ -119,6 +125,39 @@ void main() {
       expect(state.runtime.venue.fills.any((fill) =>
           fill.symbol == symbol && fill.minuteOfDay == 571 &&
           fill.quantity > 1), isTrue);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('independent marks move and finite pressure creates non-flat OHLC',
+      () async {
+    final db = TxSqliteStore(NativeDatabase.memory());
+    try {
+      final fixtures = <TxMarketMode, int>{
+        TxMarketMode.usEquity: 1290,
+        TxMarketMode.futures: 570,
+        TxMarketMode.crypto: 570,
+        TxMarketMode.forex: 570,
+      };
+      for (final entry in fixtures.entries) {
+        final service = TxIndependentMarketService(db);
+        final state = await service.open(
+            mode: entry.key, gameDay: 1, minuteOfDay: entry.value);
+        final symbol = state.profile.instruments.first.symbol;
+        final initialMark = state.markPriceCents(symbol);
+        for (var minute = entry.value + 1;
+            minute <= entry.value + 6;
+            minute++) {
+          await service.sync(
+              mode: entry.key, gameDay: 1, minuteOfDay: minute);
+        }
+        expect(state.markPriceCents(symbol), isNot(initialMark),
+            reason: '${entry.key.name} 标记价应随分钟变化');
+        expect(state.candlesFor(symbol).any(
+            (candle) => candle.highCents > candle.lowCents), isTrue,
+            reason: '${entry.key.name} 背景压力应形成真实高低价');
+      }
     } finally {
       await db.close();
     }

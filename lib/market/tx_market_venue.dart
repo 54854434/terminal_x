@@ -373,6 +373,28 @@ class TxMarketVenue {
 
   Map<String, TxMarketCore> get accounts => Map.unmodifiable(_accounts);
   List<TxMarketVenueFill> get fills => List.unmodifiable(_fills);
+  /// Allocation-free read cursor for committed fill history. The returned
+  /// fill is immutable; callers should use this for bounded recent-window
+  /// reads instead of copying the complete audit list on every frame.
+  int get fillCount => _fills.length;
+  TxMarketVenueFill fillAt(int index) => _fills[index];
+
+  /// Read only the newest committed prints in one game minute. Venue fills
+  /// are append-only and timestamped in execution order, so a normal quote
+  /// card stops after the first older minute instead of scanning all history.
+  /// Legacy out-of-order snapshots still use the full audit/rebuild paths.
+  Iterable<TxMarketVenueFill> fillsForMinute(int gameDay, int minuteOfDay,
+      {String? symbol}) sync* {
+    final target = (gameDay - 1) * 1440 + minuteOfDay;
+    for (var index = _fills.length - 1; index >= 0; index--) {
+      final fill = _fills[index];
+      final step = (fill.gameDay - 1) * 1440 + fill.minuteOfDay;
+      if (step < target) break;
+      if (step == target && (symbol == null || fill.symbol == symbol)) {
+        yield fill;
+      }
+    }
+  }
 
   /// Adds a finite participant to an existing local venue during a compatible
   /// schema migration. Existing accounts, orders and fills are never changed;

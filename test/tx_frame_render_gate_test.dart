@@ -18,6 +18,16 @@ void main() {
     expect(count, greaterThanOrEqualTo(58));
     expect(count, lessThanOrEqualTo(61));
   });
+  test('33ms chart gate remains bounded while high-speed clock keeps moving', () {
+    final gate = TxFrameRenderGate(
+        minimumInterval: const Duration(milliseconds: 33));
+    var count = 0;
+    for (var i = 0; i < 60; i++) {
+      if (gate.shouldPaint(Duration(microseconds: 16667 * i))) count++;
+    }
+    expect(count, greaterThanOrEqualTo(29));
+    expect(count, lessThanOrEqualTo(31));
+  });
   test('committed minute boundary forces preview refresh', () {
     final gate = TxFrameRenderGate();
     expect(gate.shouldPaint(Duration.zero), true);

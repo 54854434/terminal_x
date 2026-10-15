@@ -177,6 +177,64 @@ void main() {
     expect(restored.maxLeverageMultiple, 2);
   });
 
+  test('isolated margin allocates collateral and releases it on close', () {
+    final core = TxMarketCore.seeded(
+      profile: TxMarketProfile.crypto,
+      openingCashCents: 1000000,
+      marginMode: TxMarginMode.isolated,
+    );
+    final opened = core.applyExecution(
+      symbol: 'SIM-BTCUSDT', side: TxSide.buy, quantity: 1,
+      priceCents: 5000000, gameDay: 1, minuteOfDay: 0);
+    expect(opened.risk.marginMode, TxMarginMode.isolated);
+    expect(opened.position.isolatedMarginCents, 250000);
+    expect(opened.risk.cashCents, 750000);
+    expect(opened.risk.freeMarginCents, 750000);
+    expect(opened.risk.equityCents, 1000000);
+
+    core.markToMarket(symbol: 'SIM-BTCUSDT', priceCents: 4900000);
+    final healthy = core.snapshot();
+    expect(healthy.liquidationRequired, isFalse);
+    expect(healthy.liquidationBufferCents, greaterThan(0));
+    expect(core.estimatedLiquidationPriceCents('SIM-BTCUSDT'), isNotNull);
+
+    final closed = core.applyExecution(
+      symbol: 'SIM-BTCUSDT', side: TxSide.sell, quantity: 1,
+      priceCents: 4900000, gameDay: 1, minuteOfDay: 1,
+      reduceOnly: true);
+    expect(closed.position.isFlat, isTrue);
+    expect(closed.position.isolatedMarginCents, 0);
+    expect(core.cashCents, 900000);
+    expect(core.snapshot().isolatedMarginCents, 0);
+  });
+
+  test('margin mode is persisted and cannot change while exposed', () {
+    final core = TxMarketCore.seeded(
+      profile: TxMarketProfile.futures,
+      marginMode: TxMarginMode.isolated,
+    );
+    final restored = TxMarketCore.fromJson(core.exportJson());
+    expect(restored.marginMode, TxMarginMode.isolated);
+    core.applyExecution(
+      symbol: 'SIM-FUT01', side: TxSide.buy, quantity: 1,
+      priceCents: 30000, gameDay: 1, minuteOfDay: 600);
+    expect(() => core.setMarginMode(TxMarginMode.cross), throwsStateError);
+  });
+
+  test('legacy schema without margin mode restores as cross margin', () {
+    final core = TxMarketCore.seeded(profile: TxMarketProfile.crypto);
+    final legacy = Map<String, dynamic>.from(core.toJson())
+      ..['schema'] = 1
+      ..remove('marginMode');
+    final positions = (legacy['positions'] as List)
+        .map((entry) => Map<String, dynamic>.from(entry as Map)
+          ..remove('isolatedMarginCents'))
+        .toList();
+    legacy['positions'] = positions;
+    final restored = TxMarketCore.fromJsonMap(legacy);
+    expect(restored.marginMode, TxMarginMode.cross);
+  });
+
   test('leveraged US long charges financing only on the borrowed portion', () {
     final core = TxMarketCore(
       profile: TxMarketProfile.usEquity,

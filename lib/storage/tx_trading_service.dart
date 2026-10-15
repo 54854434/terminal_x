@@ -112,6 +112,7 @@ class TxTradingService {
   int _pendingGameMinutes = 0;
   String? _lastStorageFailure;
   bool _lastRecoveryPreservedPending = false;
+  Future<TxStoredSession>? _reopenOperation;
 
 
   /// Null until the first complete, durably committed and acknowledged tick.
@@ -124,6 +125,16 @@ class TxTradingService {
   int get pendingGameMinutes => _pendingGameMinutes;
   String? get lastStorageFailure => _lastStorageFailure;
   bool get lastRecoveryPreservedPending => _lastRecoveryPreservedPending;
+  bool get recoveryInProgress => _reopenOperation != null;
+
+  /// Wait for an already-running recovery without starting a second SQLite
+  /// reader. This is used by lifecycle shutdown after a UI timeout; the
+  /// original operation cannot be cancelled safely once Drift has entered its
+  /// transaction, so callers must wait for its single-flight completion.
+  Future<void> waitForRecovery() async {
+    final operation = _reopenOperation;
+    if (operation != null) await operation;
+  }
 
   /// Automatic playback is allowed to wait behind one worker/SQLite command.
   /// A fast target multiplier must create back-pressure, not turn a harmless
@@ -477,7 +488,18 @@ class TxTradingService {
   /// the caller lost its acknowledgement. Reading the database is therefore
   /// the only safe recovery operation: it adopts whichever revision is
   /// actually on disk and discards the uncommitted in-memory candidate.
-  Future<TxStoredSession> reopenAndVerify() async {
+  Future<TxStoredSession> reopenAndVerify() {
+    final active = _reopenOperation;
+    if (active != null) return active;
+    late Future<TxStoredSession> operation;
+    operation = _reopenAndVerify().whenComplete(() {
+      if (identical(_reopenOperation, operation)) _reopenOperation = null;
+    });
+    _reopenOperation = operation;
+    return operation;
+  }
+
+  Future<TxStoredSession> _reopenAndVerify() async {
     // A lifecycle transition can observe the service just before its final
     // acknowledgement clears [_busy]. Give that in-flight operation a bounded
     // chance to finish before restarting the worker. A queued automatic
@@ -596,6 +618,12 @@ class TxTradingService {
 
   Future<void> close() async {
     try {
+      try {
+        await waitForRecovery();
+      } catch (_) {
+        // Recovery remains fail-closed; shutdown still closes the worker and
+        // database after the single-flight operation has settled.
+      }
       final tail = _automaticTail;
       if (_automaticPending > 0 && !_busy && tail != null) await tail;
       if (!_storageFault && hasPendingPersistence && !_busy) {

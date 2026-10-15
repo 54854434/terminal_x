@@ -41,6 +41,10 @@ void main() {
     expect(buy.status, TxStatus.cancelled);
     expect(buy.filled, 2);
     expect(venue.fills.single.priceCents, 100000);
+    expect(venue.fillCount, 1);
+    expect(venue.fillAt(0).priceCents, 100000);
+    expect(venue.fillsForMinute(1, 0, symbol: 'SIM-BTCUSDT').length, 1);
+    expect(venue.fillsForMinute(1, 1), isEmpty);
     expect(venue.fills.single.makerFeeCents, greaterThan(0));
     expect(venue.fills.single.takerFeeCents, greaterThan(0));
     expect(venue.account('TAKER').position('SIM-BTCUSDT').longQuantity, 2);

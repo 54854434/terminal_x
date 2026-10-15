@@ -1,4 +1,4 @@
-/// Terminal X 0.3.9 unified trading interface and market-structure analytics.
+/// Terminal X 0.4.0 unified trading interface and market-structure analytics.
 /// Existing V0.2 + V0.1 apps and backups are never accessed.
 import 'dart:async';
 import 'dart:io';
@@ -28,7 +28,9 @@ import 'market/tx_portfolio_scenarios.dart';
 import 'market/tx_market_phase_timeline.dart';
 import 'market/tx_market_profiles.dart';
 import 'market/tx_market_session_schedule.dart';
+import 'market/tx_market_conditional_orders.dart';
 import 'market/tx_independent_market_service.dart';
+import 'market/tx_market_microstructure.dart';
 import 'market/tx_market_risk_core.dart';
 import 'market/tx_market_venue.dart';
 import 'market/tx_frame_render_gate.dart';
@@ -72,11 +74,29 @@ class TerminalHomeV024 extends StatefulWidget {
   State<TerminalHomeV024> createState() => _TerminalHomeV024State();
 }
 
+class _TxChartOverlayPrefs {
+  bool showCost = true;
+  bool showBreakeven = true;
+  bool showLiquidation = true;
+}
+
+class _TxConditionalDraft {
+  const _TxConditionalDraft({
+    required this.kind,
+    required this.triggerPriceCents,
+    required this.quantity,
+  });
+
+  final TxMarketConditionalOrderKind kind;
+  final int triggerPriceCents;
+  final int quantity;
+}
+
 class _TerminalHomeV024State extends State<TerminalHomeV024>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const green = TxTerminalColors.buy;
   static const red = TxTerminalColors.sell;
-  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.3.9');
+  static const appVersion = String.fromEnvironment('TX_APP_VERSION', defaultValue: '0.4.0');
   final _qty = TextEditingController(text: '1');
   final _price = TextEditingController(text: '10.00');
   TxTradingService? _trader;
@@ -92,6 +112,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   final TxCommitLatencyWindow _marketLatency = TxCommitLatencyWindow();
   final TxCommitLatencyWindow _sqliteLatency = TxCommitLatencyWindow();
   final TxFrameRenderGate _frameRenderGate = TxFrameRenderGate();
+  // Keep chart/hero motion in a repaint island. High multipliers may update
+  // this notifier without rebuilding the status strip or scroll layout.
+  final TxFrameRenderGate _chartFrameRenderGate = TxFrameRenderGate(
+      minimumInterval: Duration(milliseconds: 33));
   TxStorageFootprint? _storageFootprint;
   int _checkpointInterval = TxDeltaCodec.checkpointInterval;
   int _checkpointDraft = TxDeltaCodec.checkpointInterval;
@@ -106,6 +130,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   TxMarketMode _marketMode = TxMarketMode.aShare;
   int _speed = 1;
   final ValueNotifier<double> _seconds = ValueNotifier<double>(0.0);
+  final ValueNotifier<double> _chartSeconds = ValueNotifier<double>(0.0);
   // Authoritative provisional time used for market gates and independent
   // board synchronization. At high multipliers the public display is held at
   // the last safe boundary so the whole scroll view does not repaint for
@@ -137,13 +162,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   Future<void>? _candleWarmup;
   bool _serviceClosed = false;
   bool _recoveringStorage = false;
+  Future<void>? _recoveryOperation;
   bool _independentLoading = false;
   String? _independentFault;
   bool _cancelIndependentPrewarm = false;
   Future<void>? _independentPrewarm;
-  bool _showCostOverlay = true;
-  bool _showBreakevenOverlay = true;
-  bool _showLiquidationOverlay = true;
+  final Map<String, _TxChartOverlayPrefs> _chartOverlayPrefs = {};
+  bool _reduceOnly = false;
 
   bool get _ready => !_loading && !_busy && _fault == null &&
       !_historyWarming &&
@@ -166,10 +191,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final status = TxSession.marketSessionStatusAt(
         committedStep: session.step,
         fractionalSeconds: fractionalSeconds);
-    // Above 60x, keep the committed chart/mark stable. The storage-backed
-    // clock may still run at the requested target, but a 19–58 second visual
-    // jump per frame makes the entire price axis appear to shake.
-    if (!status.isOpen || _speed > 60) return false;
+    // The status strip is deliberately throttled at high speed, but the
+    // chart/hero use their own bounded repaint notifier. Keep the indicative
+    // quote available there so high speed no longer looks frozen.
+    if (!status.isOpen) return false;
     return _auto || seconds > 0;
   }
 
@@ -177,6 +202,38 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _marketPreviewAllowed(session, seconds)
           ? _indication(session, seconds)
           : session.lastPrice(_symbolName).toDouble();
+
+  /// Independent venues have a durable mark only at their game-minute
+  /// boundary.  Use the same explicitly-labelled, non-traded frame quote as
+  /// A-share for the seconds between two boundaries; otherwise an independent
+  /// chart can only change after a real fill and appears frozen even while its
+  /// mark, book and participants are alive.
+  bool _independentPreviewAllowed(TxIndependentMarketState state,
+      TxSession session, double seconds) {
+    if (!seconds.isFinite || seconds < 0 || seconds >= 60) {
+      return false;
+    }
+    final status = state.profile.schedule.status(
+        gameDay: _clockGameDay(session),
+        minuteOfDay: _clockMinuteOfDay(session));
+    return status.isOpen && (_auto || seconds > 0);
+  }
+
+  double _independentIndicativePrice(TxIndependentMarketState state,
+      TxSession session, String symbol, double seconds) {
+    final mark = state.markPriceCents(symbol);
+    if (!_independentPreviewAllowed(state, session, seconds)) {
+      return mark.toDouble();
+    }
+    final symbolIndex = state.profile.instruments.indexWhere(
+        (instrument) => instrument.symbol == symbol);
+    // The mode offset keeps two independent boards from sharing an identical
+    // optical phase. This is a display-only quote and never creates a fill,
+    // volume row or SQLite revision.
+    return TxFrameQuote.cents(
+        mark, _independentTimeStep(state), seconds,
+        math.max(0, symbolIndex) + state.mode.index * 3);
+  }
 
   int _clockGameDay(TxSession session) => TxRealtimeClock.gameDay(
       session.step, _clockSeconds.floor().clamp(0, 59).toInt());
@@ -211,6 +268,237 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   String _quoteAmount(TxMarketProfile profile, int cents) => cents < 0
       ? '-${_quotePrice(profile, cents.abs())}'
       : _quotePrice(profile, cents);
+
+  String _deskCompact(int value) {
+    final absolute = value.abs();
+    if (absolute >= 1000000) {
+      return '${(value / 1000000).toStringAsFixed(1)}m';
+    }
+    if (absolute >= 1000) {
+      return '${(value / 1000).toStringAsFixed(1)}k';
+    }
+    return '$value';
+  }
+
+  String _deskChange(TxMarketProfile profile, int deltaCents) {
+    if (deltaCents == 0) return '—';
+    final sign = deltaCents > 0 ? '+' : '-';
+    return '$sign${_quotePrice(profile, deltaCents.abs())}';
+  }
+
+  Color _deskStatusColor(TxMarketSessionStatus status) => switch (status.state) {
+    TxMarketSessionState.open => TxTerminalColors.buy,
+    TxMarketSessionState.breakTime => TxTerminalColors.gold,
+    TxMarketSessionState.closed => TxTerminalColors.secondaryText,
+  };
+
+  TxMarketDeskQuote _aShareDeskQuote(TxSession session,
+      TxMarketProfile profile, int gameDay, int minuteOfDay) {
+    final symbol = _marketMode == TxMarketMode.aShare
+        ? _symbolName : TxSession.symbols.first;
+    final status = profile.schedule.status(
+        gameDay: gameDay, minuteOfDay: minuteOfDay);
+    final candles = _candles?.forSymbol(symbol) ?? const [];
+    final price = session.lastPrice(symbol);
+    final reference = candles.length >= 2
+        ? candles[candles.length - 2].closeCents
+        : candles.isEmpty ? price : candles.last.openCents;
+    final delta = price - reference;
+    final fills = session.currentMinuteFills
+        .where((fill) => fill.symbol == symbol).toList();
+    final volume = fills.fold<int>(0, (sum, fill) => sum + fill.quantity);
+    final bids = session.engine.depth(symbol, TxSide.buy, levels: 10);
+    final asks = session.engine.depth(symbol, TxSide.sell, levels: 10);
+    final depth = [...bids, ...asks].fold<int>(
+        0, (sum, level) => sum + level.quantity);
+    final account = session.engine.account(TxSession.playerId);
+    return TxMarketDeskQuote(
+      mode: profile.mode,
+      label: profile.label,
+      symbol: symbol,
+      status: status.label,
+      mark: _quotePrice(profile, price),
+      change: _deskChange(profile, delta),
+      activity: '${fills.length} 笔 · ${_deskCompact(volume)}${profile.orderUnit}',
+      liquidity: '深 ${_deskCompact(depth)}',
+      account: _quoteAmount(profile, account.availableCashCents),
+      isOpen: status.isOpen,
+      isLoaded: true,
+      isSelected: _marketMode == profile.mode,
+      accent: _deskStatusColor(status),
+      pressure: TxOrderBookInsight.fromLevels(bids: bids, asks: asks)
+          .bidShareFraction,
+    );
+  }
+
+  TxMarketDeskQuote _independentDeskQuote(TxSession session,
+      TxMarketProfile profile, int gameDay, int minuteOfDay) {
+    final state = _independentMarkets?.state(profile.mode);
+    final scheduleStatus = profile.schedule.status(
+        gameDay: gameDay, minuteOfDay: minuteOfDay);
+    if (state == null) {
+      return TxMarketDeskQuote(
+        mode: profile.mode,
+        label: profile.label,
+        symbol: profile.instruments.first.symbol,
+        status: scheduleStatus.isOpen ? '待打开 · ${scheduleStatus.label}'
+            : scheduleStatus.label,
+        mark: '—',
+        change: '—',
+        activity: '待打开',
+        liquidity: '未载入',
+        account: '未载入',
+        isOpen: scheduleStatus.isOpen,
+        isLoaded: false,
+        isSelected: _marketMode == profile.mode,
+        accent: _deskStatusColor(scheduleStatus),
+      );
+    }
+    final status = state.sessionStatus;
+    final symbol = profile.instruments.first.symbol;
+    final candles = state.candlesFor(symbol);
+    final mark = state.markPriceCents(symbol);
+    final reference = candles.length >= 2
+        ? candles[candles.length - 2].closeCents
+        : candles.isEmpty ? mark : candles.last.openCents;
+    final delta = mark - reference;
+    final fills = state.runtime.venue.fillsForMinute(
+        state.runtime.gameDay, state.runtime.minuteOfDay, symbol: symbol);
+    final volume = fills.fold<int>(0, (sum, fill) => sum + fill.quantity);
+    final fillCount = fills.length;
+    final bids = state.runtime.venue.depth(symbol, TxSide.buy, levels: 10);
+    final asks = state.runtime.venue.depth(symbol, TxSide.sell, levels: 10);
+    final depth = [...bids, ...asks].fold<int>(
+        0, (sum, level) => sum + level.quantity);
+    final stats = state.runtime.venue.stats;
+    final risk = state.playerRisk;
+    return TxMarketDeskQuote(
+      mode: profile.mode,
+      label: profile.label,
+      symbol: symbol,
+      status: status.label,
+      mark: _quotePrice(profile, mark),
+      change: _deskChange(profile, delta),
+      activity: '$fillCount 笔 · ${_deskCompact(volume)}${profile.orderUnit}',
+      liquidity: '深 ${_deskCompact(depth)} · ${stats.activeOrders}单',
+      account: _quoteAmount(profile, risk.equityCents),
+      isOpen: status.isOpen,
+      isLoaded: true,
+      isSelected: _marketMode == profile.mode,
+      accent: _deskStatusColor(status),
+      pressure: TxOrderBookInsight.fromLevels(bids: bids, asks: asks)
+          .bidShareFraction,
+    );
+  }
+
+  List<TxMarketDeskQuote> _marketDeskQuotes(TxSession session) {
+    final gameDay = _clockGameDay(session);
+    final minuteOfDay = _clockMinuteOfDay(session);
+    return [
+      _aShareDeskQuote(session, TxMarketProfile.aShare,
+          gameDay, minuteOfDay),
+      for (final profile in TxMarketProfile.values.skip(1))
+        _independentDeskQuote(session, profile, gameDay, minuteOfDay),
+    ];
+  }
+
+  Widget _marketDeskOverview(TxSession session) => TxMarketDeskOverview(
+    quotes: _marketDeskQuotes(session),
+    onSelected: (mode) => unawaited(_selectMarketMode(mode, session)),
+  );
+
+  TxMarketAggressor _aggressorForOrders({required int buySequence,
+      required int sellSequence}) {
+    if (buySequence == sellSequence) return TxMarketAggressor.unknown;
+    return buySequence > sellSequence
+        ? TxMarketAggressor.buy : TxMarketAggressor.sell;
+  }
+
+  TxMarketMicrostructureSnapshot _aShareMicrostructure(
+      TxSession session, String symbol) {
+    final total = session.engine.fillCount;
+    final start = total > 96 ? total - 96 : 0;
+    final prints = <TxMarketPrint>[];
+    for (var index = start; index < total; index++) {
+      final fill = session.engine.fillAt(index);
+      if (fill.symbol != symbol) continue;
+      final buy = session.engine.order(fill.buyOrderId);
+      final sell = session.engine.order(fill.sellOrderId);
+      final aggressor = _aggressorForOrders(
+          buySequence: buy.sequence, sellSequence: sell.sequence);
+      final incoming = buy.sequence > sell.sequence ? buy : sell;
+      prints.add(TxMarketPrint(
+        id: fill.id,
+        symbol: symbol,
+        priceCents: fill.priceCents,
+        quantity: fill.quantity,
+        aggressor: aggressor,
+        aggressorLabel: buy.sequence == sell.sequence
+            ? null : _participantLabel(incoming.ownerId),
+        timeLabel: fill.id,
+      ));
+    }
+    return TxMarketMicrostructureSnapshot.fromPrints(
+      prints: prints,
+      bids: session.engine.depth(symbol, TxSide.buy, levels: 10),
+      asks: session.engine.depth(symbol, TxSide.sell, levels: 10),
+    );
+  }
+
+  TxMarketMicrostructureSnapshot _independentMicrostructure(
+      TxIndependentMarketState state, String symbol) {
+    final venue = state.runtime.venue;
+    final total = venue.fillCount;
+    final start = total > 96 ? total - 96 : 0;
+    final prints = <TxMarketPrint>[];
+    for (var index = start; index < total; index++) {
+      final fill = venue.fillAt(index);
+      if (fill.symbol != symbol) continue;
+      final buy = venue.order(fill.buyOrderId);
+      final sell = venue.order(fill.sellOrderId);
+      final aggressor = _aggressorForOrders(
+          buySequence: buy.sequence, sellSequence: sell.sequence);
+      final incoming = buy.sequence > sell.sequence ? buy : sell;
+      final minute = '${fill.gameDay}d '
+          '${(fill.minuteOfDay ~/ 60).toString().padLeft(2, '0')}:'
+          '${(fill.minuteOfDay % 60).toString().padLeft(2, '0')}';
+      prints.add(TxMarketPrint(
+        id: fill.id,
+        symbol: symbol,
+        priceCents: fill.priceCents,
+        quantity: fill.quantity,
+        aggressor: aggressor,
+        aggressorLabel: buy.sequence == sell.sequence
+            ? null : incoming.ownerId,
+        timeLabel: minute,
+      ));
+    }
+    return TxMarketMicrostructureSnapshot.fromPrints(
+      prints: prints,
+      bids: venue.depth(symbol, TxSide.buy, levels: 10),
+      asks: venue.depth(symbol, TxSide.sell, levels: 10),
+    );
+  }
+
+  Widget _aShareFlowPanel(TxSession session, String symbol) {
+    final snapshot = _aShareMicrostructure(session, symbol);
+    return TxMarketFlowPanel(
+      snapshot: snapshot,
+      priceLabel: (cents) => '¥${money(cents)}',
+      quantityUnit: '股',
+      subtitle: '最近最多 24 笔已发生成交 · 主动方向由订单序列推导 · 盘口为十档快照',
+    );
+  }
+
+  Widget _independentFlowPanel(TxIndependentMarketState state, String symbol) {
+    final snapshot = _independentMicrostructure(state, symbol);
+    return TxMarketFlowPanel(
+      snapshot: snapshot,
+      priceLabel: (cents) => _quotePrice(state.profile, cents),
+      quantityUnit: state.profile.orderUnit,
+      subtitle: '最近最多 24 笔已发生成交 · 主动方向由订单序列推导 · 盘口为十档快照',
+    );
+  }
 
 
   @override
@@ -279,6 +567,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     if (mounted) _playbackTicker.stop();
     _previousFrame = null;
     _frameRenderGate.reset();
+    _chartFrameRenderGate.reset();
     _flow.pause();
     _speedStopwatch.stop();
     if (_auto && mounted) setState(() => _auto = false);
@@ -319,8 +608,13 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     // the entire page oscillate with the provisional price axis.
     final publishSeconds = _speed <= 60 && _frameRenderGate.shouldPaint(elapsed,
         force: frame.needsMinuteCommit || frame.needsPulseCommit);
+    final publishChartSeconds = _chartFrameRenderGate.shouldPaint(elapsed,
+        force: frame.needsMinuteCommit || frame.needsPulseCommit);
     if (publishSeconds && frameSeconds != _seconds.value) {
       _seconds.value = frameSeconds;
+    }
+    if (publishChartSeconds && frameSeconds != _chartSeconds.value) {
+      _chartSeconds.value = frameSeconds;
     }
     if (frame.needsPulseCommit) {
       _pulse(frame.second);
@@ -349,6 +643,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     });
     _previousFrame = null;
     _frameRenderGate.reset();
+    _chartFrameRenderGate.reset();
     _playbackTicker.start();
   }
 
@@ -381,7 +676,20 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   /// Adopt the audited SQLite head after a failed operation. A deferred,
   /// automatic candidate is preserved by the storage service when the on-disk
   /// head is unchanged; ambiguous player orders are never retried.
-  Future<void> _recoverStorage() async {
+  Future<void> _recoverStorage() {
+    final active = _recoveryOperation;
+    if (active != null) return active;
+    late Future<void> operation;
+    operation = _recoverStorageNow().whenComplete(() {
+      if (identical(_recoveryOperation, operation)) {
+        _recoveryOperation = null;
+      }
+    });
+    _recoveryOperation = operation;
+    return operation;
+  }
+
+  Future<void> _recoverStorageNow() async {
     final service = _trader;
     if (service == null || _recoveringStorage) return;
     _pause();
@@ -447,6 +755,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         _historyWarming = false;
         _clockSeconds = loaded.session.lastPulseSecond.toDouble();
         _seconds.value = _clockSeconds;
+        _chartSeconds.value = _clockSeconds;
         _startupStage = '存档已恢复，K 线缓存后台重建中';
         _startupProgress = .82;
         _notice = service.lastRecoveryPreservedPending
@@ -574,6 +883,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         _startupProgress = .70;
         _loading = false;
       });
+      _clockSeconds = initial.session.lastPulseSecond.toDouble();
+      _seconds.value = _clockSeconds;
+      _chartSeconds.value = _clockSeconds;
       _candleWarmup = _warmCandleHistory(service, initial);
       unawaited(_candleWarmup!);
     } catch (e) {
@@ -670,6 +982,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       setState(() {
         _marketMode = mode;
         _symbol = _symbol.clamp(0, TxSession.symbols.length - 1).toInt();
+        _reduceOnly = false;
         _independentLoading = false;
         _independentFault = null;
         _price.text = money(_trader!.current.session.lastPrice(_symbolName));
@@ -681,6 +994,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     setState(() {
       _marketMode = mode;
       _symbol = 0;
+      _reduceOnly = false;
       _independentLoading = true;
       _independentFault = null;
     });
@@ -792,10 +1106,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           _flow.completePulseCommit();
           _clockSeconds = _flow.minuteProgress * 60.0;
           if (mounted && _speed <= 60) _seconds.value = _clockSeconds;
+          if (mounted) _chartSeconds.value = _clockSeconds;
         } else {
           _flow.completeMinuteCommit();
           _clockSeconds = 0;
           if (mounted) _seconds.value = 0;
+          if (mounted) _chartSeconds.value = 0;
         }
         if (mounted) {
           _settling.value = false;
@@ -866,6 +1182,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _flow.resetProvisional();
       _clockSeconds = 0;
       _seconds.value = 0;
+      _chartSeconds.value = 0;
     }
     _operate((service) async {
     final latency = Stopwatch()..start();
@@ -1056,31 +1373,42 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     ),
   );
 
-  List<TxChartOverlayLine> _aShareChartOverlays(TxSession session) {
+  String _chartScope(TxMarketMode mode, String symbol) =>
+      '${mode.name}:$symbol';
+
+  _TxChartOverlayPrefs _chartPrefs(String scope) =>
+      _chartOverlayPrefs.putIfAbsent(scope, _TxChartOverlayPrefs.new);
+
+  List<TxChartOverlayLine> _aShareChartOverlays(
+      TxSession session, String symbol) {
+    final scope = _chartScope(TxMarketMode.aShare, symbol);
+    final prefs = _chartPrefs(scope);
     final holdings = _positionsForRevision(
         session, _trader!.current.revision);
-    final holding = holdings[_symbolName];
+    final holding = holdings[symbol];
     if (holding == null || !holding.costKnown || holding.quantity <= 0) {
       return const <TxChartOverlayLine>[];
     }
     final average = holding.averagePriceCents.round();
     final pnl = holding.marketValueCents - holding.costBasisCents;
     final lines = <TxChartOverlayLine>[];
-    if (_showCostOverlay) {
+    if (prefs.showCost) {
       lines.add(TxChartOverlayLine(
         valueCents: average,
         label: '成本',
         valueLabel: '¥${money(average)} · ${signedMoney(pnl)}',
         color: TxTerminalColors.primary,
         dashed: false,
+        scopeKey: scope,
       ));
     }
-    if (_showBreakevenOverlay) {
+    if (prefs.showBreakeven) {
       lines.add(TxChartOverlayLine(
         valueCents: average,
         label: '保本',
         valueLabel: '¥${money(average)}',
         color: TxTerminalColors.gold,
+        scopeKey: scope,
       ));
     }
     return lines;
@@ -1098,6 +1426,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
 
   List<TxChartOverlayLine> _independentChartOverlays(
       TxIndependentMarketState state, String symbol) {
+    final scope = _chartScope(state.mode, symbol);
+    final prefs = _chartPrefs(scope);
     final position = state.playerRisk.positions[symbol];
     if (position == null || position.isFlat) {
       return const <TxChartOverlayLine>[];
@@ -1108,7 +1438,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final pnl = (mark - position.averageEntryCents) * position.netQuantity *
         instrument.contractMultiplierUnits;
     final lines = <TxChartOverlayLine>[];
-    if (_showCostOverlay) {
+    if (prefs.showCost) {
       lines.add(TxChartOverlayLine(
         valueCents: position.averageEntryCents,
         label: '成本',
@@ -1116,18 +1446,20 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
             '${_quoteAmount(state.profile, pnl)}',
         color: TxTerminalColors.primary,
         dashed: false,
+        scopeKey: scope,
       ));
     }
-    if (_showBreakevenOverlay) {
+    if (prefs.showBreakeven) {
       final breakeven = _independentBreakevenCents(state, position);
       lines.add(TxChartOverlayLine(
         valueCents: breakeven,
         label: '保本',
         valueLabel: _quotePrice(state.profile, breakeven),
         color: TxTerminalColors.gold,
+        scopeKey: scope,
       ));
     }
-    if (_showLiquidationOverlay) {
+    if (prefs.showLiquidation) {
       final liquidation = state.player.estimatedLiquidationPriceCents(symbol);
       if (liquidation != null) {
         lines.add(TxChartOverlayLine(
@@ -1135,34 +1467,54 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           label: '强平',
           valueLabel: _quotePrice(state.profile, liquidation),
           color: TxTerminalColors.sell,
+          scopeKey: scope,
         ));
       }
+    }
+    for (final condition in state.runtime.conditionalOrders.where(
+        (order) => order.symbol == symbol)) {
+      lines.add(TxChartOverlayLine(
+        valueCents: condition.triggerPriceCents,
+        label: condition.kind.label,
+        valueLabel: '${condition.triggerOperator} '
+            '${_quotePrice(state.profile, condition.triggerPriceCents)}',
+        color: condition.kind == TxMarketConditionalOrderKind.stopLoss
+            ? TxTerminalColors.sell : TxTerminalColors.buy,
+        dashed: true,
+        scopeKey: scope,
+      ));
     }
     return lines;
   }
 
-  Widget _chartOverlayControls({required bool marginMarket}) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      TxChartOverlayToggleBar(
-        showCost: _showCostOverlay,
-        showBreakeven: _showBreakevenOverlay,
-        showLiquidation: _showLiquidationOverlay,
-        onCostChanged: (value) => setState(() => _showCostOverlay = value),
-        onBreakevenChanged: (value) =>
-            setState(() => _showBreakevenOverlay = value),
-        onLiquidationChanged: (value) =>
-            setState(() => _showLiquidationOverlay = value),
-      ),
-      const SizedBox(height: 2),
-      Text(
-        marginMarket
-            ? '成本线带当前浮动收益；保本线含平仓费率估算；强平线来自独立风险核心。'
-            : '成本线带当前收益；A 股现金账户不使用保证金，因此没有强平线。',
-        style: const TextStyle(fontSize: 10, color: Colors.white54),
-      ),
-    ],
-  );
+  Widget _chartOverlayControls({
+    required bool marginMarket,
+    required String scope,
+  }) {
+    final prefs = _chartPrefs(scope);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        TxChartOverlayToggleBar(
+          showCost: prefs.showCost,
+          showBreakeven: prefs.showBreakeven,
+          showLiquidation: prefs.showLiquidation,
+          onCostChanged: (value) => setState(() => prefs.showCost = value),
+          onBreakevenChanged: (value) =>
+              setState(() => prefs.showBreakeven = value),
+          onLiquidationChanged: (value) =>
+              setState(() => prefs.showLiquidation = value),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          marginMarket
+              ? '成本线带当前浮动收益；保本线含平仓费率估算；强平线来自独立风险核心。'
+              : '成本线带当前收益；A 股现金账户不使用保证金，因此没有强平线。',
+          style: const TextStyle(fontSize: 10, color: Colors.white54),
+        ),
+      ],
+    );
+  }
 
   Widget _chooseSymbol(TxSession session) => Padding(
     padding: const EdgeInsets.symmetric(vertical: 8),
@@ -1174,6 +1526,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       selected: {_symbol},
       onSelectionChanged: (values) => setState(() {
         _symbol = values.first;
+        _reduceOnly = false;
         _price.text = money(session.lastPrice(_symbolName));
       }),
     ),
@@ -1186,6 +1539,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     if (_speed == next) return;
     final wasHighMultiplier = _speed > 60;
     _flow.setSpeed(next);
+    _chartFrameRenderGate.reset();
     _committedSpeed.reset();
     _speedStopwatch..reset();
     if (_auto) {
@@ -1204,6 +1558,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         // into smooth intraminute display updates.
         _seconds.value = _clockSeconds;
       }
+      _chartSeconds.value = _clockSeconds;
     });
   }
 
@@ -1296,6 +1651,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
   void _openTradeTicket(TxSide side) => setState(() {
     _ticketSide = side;
     _limit = false;
+    _reduceOnly = false;
     _page = 1;
   });
 
@@ -1400,20 +1756,22 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final minuteVolume = minuteFills.fold<int>(0, (sum, f) => sum + f.quantity);
     final durablePrice = _trader!.durableCurrent.session.lastPrice(_symbolName);
     final candles = _candles!.forSymbol(_symbolName);
-    final chartOverlays = _aShareChartOverlays(session);
+    final chartScope = _chartScope(TxMarketMode.aShare, _symbolName);
+    final chartOverlays = _aShareChartOverlays(session, _symbolName);
     Widget chartCard() => RepaintBoundary(child: Card(child: Padding(
       padding: const EdgeInsets.all(12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _chartOverlayControls(marginMarket: false),
+        _chartOverlayControls(marginMarket: false, scope: chartScope),
         const SizedBox(height: 4),
         ValueListenableBuilder<double>(
-          valueListenable: _seconds,
+          valueListenable: _chartSeconds,
           builder: (context, seconds, child) {
             final showPreview = _marketPreviewAllowed(session, seconds);
             return TxCandleChart(
               key: ValueKey('${_marketMode.name}:$_symbolName'),
               candles: candles,
               overlays: chartOverlays,
+              marketScope: chartScope,
               pending: _trader!.current.pending,
               activeMinuteStep: showPreview
                   ? session.step + 1
@@ -1440,6 +1798,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       // Put the chart before the verbose session/radar cards so the first
       // market frame is immediately useful on a phone-sized viewport.
       chartCard(),
+      _marketDeskOverview(session),
+      _aShareFlowPanel(session, _symbolName),
       sessionCard(),
       TxMarketRadar(quotes: [
         for (var i=0;i<TxSession.symbols.length;i++)
@@ -1451,7 +1811,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           _price.text=money(session.lastPrice(_symbolName));
         })),
       TxMarketHero(symbol: _symbolName, committedPriceCents: durablePrice,
-        step: session.step, seconds: _seconds,
+        step: session.step, seconds: _chartSeconds,
         quoteCurrency: profile.quoteCurrency,
         coreConnected: _tradingReady,
         indicativeCents: (seconds) => _displayIndication(session, seconds),
@@ -1611,6 +1971,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final status = state.sessionStatus;
     final mark = state.markPriceCents(symbol);
     final candles = state.candlesFor(symbol);
+    final chartScope = _chartScope(state.mode, symbol);
     final chartOverlays = _independentChartOverlays(state, symbol);
     final canTrade = _tradingReady && status.isOpen;
     Widget chartCard() => Card(child: Padding(
@@ -1620,22 +1981,40 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           const Text('真实成交 K 线',
               style: TextStyle(fontWeight: FontWeight.w700)),
           const Spacer(),
-          Text('${candles.length} 根 · ${state.runtime.venue.fills.length} 笔市场成交',
+          Text('${candles.length} 根 · ${state.runtime.venue.fillCount} 笔市场成交',
               style: const TextStyle(fontSize: 10,
                   color: TxTerminalColors.secondaryText)),
         ]),
         const SizedBox(height: 4),
-        _chartOverlayControls(marginMarket: instrument.usesMargin),
+        _chartOverlayControls(
+            marginMarket: instrument.usesMargin, scope: chartScope),
         const SizedBox(height: 3),
         const Text('只由已发生的真实成交构造 OHLCV；盘口报价不会伪造 K 线。',
             style: TextStyle(fontSize: 10,
                 color: TxTerminalColors.secondaryText)),
         const SizedBox(height: 7),
-        TxCandleChart(
-          key: ValueKey('${state.mode.name}:$symbol'),
-          candles: candles,
-          overlays: chartOverlays,
-          activeMinuteStep: _independentTimeStep(state),
+        ValueListenableBuilder<double>(
+          valueListenable: _chartSeconds,
+          builder: (context, seconds, child) {
+            final marketOpen = state.profile.schedule.status(
+                gameDay: _clockGameDay(session),
+                minuteOfDay: _clockMinuteOfDay(session)).isOpen;
+            final preview = marketOpen
+                ? _independentIndicativePrice(state, session, symbol, seconds)
+                : null;
+            final previewAllowed = preview != null &&
+                _independentPreviewAllowed(state, session, seconds);
+            return TxCandleChart(
+              key: ValueKey('${state.mode.name}:$symbol'),
+              candles: candles,
+              overlays: chartOverlays,
+              marketScope: chartScope,
+              activeMinuteStep: _independentTimeStep(state),
+              indicativePriceCents: preview?.round(),
+              indicativeFramePriceCents: preview,
+              previewSeconds: previewAllowed ? seconds : null,
+            );
+          },
         ),
       ]),
     ));
@@ -1651,6 +2030,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       selector,
       // The primary quote view comes before the explanatory account cards.
       chartCard(),
+      _marketDeskOverview(session),
+      _independentFlowPanel(state, symbol),
       Card(child: Padding(
         padding: const EdgeInsets.all(12),
         child: Row(children: [
@@ -1706,12 +2087,16 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         symbol: symbol,
         committedPriceCents: mark,
         step: _independentSessionStep(state),
-        seconds: _seconds,
+        seconds: _chartSeconds,
         quoteCurrency: profile.quoteCurrency,
         coreConnected: true,
         connectionLabel: 'DART · 独立已连接',
-        committedOnly: true,
-        indicativeCents: (_) => mark.toDouble(),
+        // The large cyan number follows the same explicitly-labelled
+        // intraminute reference as the chart; only [committedPriceCents] is a
+        // durable mark and can be used by the execution core.
+        committedOnly: false,
+        indicativeCents: (seconds) => _independentIndicativePrice(
+            state, session, symbol, seconds),
         pending: false,
         onBuy: canTrade ? () => _openTradeTicket(TxSide.buy) : null,
         onSell: canTrade ? () => _openTradeTicket(TxSide.sell) : null,
@@ -1768,9 +2153,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     };
     final available = strategies.keys.where(
         state.runtime.venue.accounts.containsKey).toList();
-    final prints = state.runtime.venue.fills.where((fill) {
-      if (fill.symbol != symbol || fill.gameDay != state.runtime.gameDay ||
-          fill.minuteOfDay != state.runtime.minuteOfDay) return false;
+    final prints = state.runtime.venue.fillsForMinute(
+        state.runtime.gameDay, state.runtime.minuteOfDay, symbol: symbol)
+        .where((fill) {
       final buy = state.runtime.venue.order(fill.buyOrderId).ownerId;
       final sell = state.runtime.venue.order(fill.sellOrderId).ownerId;
       return strategies.containsKey(buy) || strategies.containsKey(sell);
@@ -2127,6 +2512,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     if (_auto) _pause();
     FocusManager.instance.primaryFocus?.unfocus();
     final side = _ticketSide;
+    final reduceOnly = _reduceOnly;
     final sequence = state.sequence;
     showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
       title: Text('确认${side == TxSide.buy ? '买入' : '卖出'} · $symbol'),
@@ -2135,6 +2521,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         Text('市场：${profile.label} · 独立账户'),
         Text('类型：${_limit ? '限价 ${_quotePrice(profile, limit!)}' : '市价'}'),
         Text('数量：$quantity · TIF：${_limit ? _timeInForce.label : 'GTC'}'),
+        Text('仓位意图：${reduceOnly ? '只减仓，不反向开仓' : '普通开仓/加减仓'}'),
         Text('订单簿修订：CAS r$sequence'),
         const SizedBox(height: 8),
         const Text('确认后会以当前本地订单簿重新撮合；余额、保证金、手续费和成交记录原子写入独立市场快照。',
@@ -2149,18 +2536,19 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           final current = _independentState;
           if (current == null || current.sequence != sequence ||
               _marketMode != current.mode || _ticketSide != side ||
+              _reduceOnly != reduceOnly ||
               _qty.text.trim() != quantityText ||
               (_limit ? _cents(_price.text.trim()) : null) != limit) {
             setState(() => _notice = '独立市场快照或委托参数已变化，请重新检查');
             return;
           }
-          _independentTrade(side);
+          _independentTrade(side, reduceOnly: reduceOnly);
         }, child: Text('确认${side == TxSide.buy ? '买入' : '卖出'}')),
       ],
     ));
   }
 
-  void _independentTrade(TxSide side) {
+  void _independentTrade(TxSide side, {required bool reduceOnly}) {
     final service = _independentMarkets;
     final state = _independentState;
     if (service == null || state == null || !_tradingReady) return;
@@ -2180,9 +2568,10 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
         timeInForce: _limit ? _timeInForce : TxTimeInForce.gtc,
         gameDay: state.runtime.gameDay,
         minuteOfDay: state.runtime.minuteOfDay,
+        reduceOnly: reduceOnly,
       );
       _marketRepaint.value++;
-      return '${order.id} · 成交${order.filled} · 余量${order.remaining} · '
+      return '${order.id} · ${reduceOnly ? '只减仓 ' : ''}成交${order.filled} · 余量${order.remaining} · '
           '${order.status.name} · CAS r${state.sequence}';
     });
   }
@@ -2198,6 +2587,18 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     });
   }
 
+  void _cancelIndependentConditional(String orderId) {
+    final service = _independentMarkets;
+    final state = _independentState;
+    if (service == null || state == null) return;
+    _independentOperate(() async {
+      final order = await service.cancelConditional(
+          mode: state.mode, orderId: orderId);
+      _marketRepaint.value++;
+      return '${order.kind.label}保护单已取消 · ${order.symbol} · CAS r${state.sequence}';
+    });
+  }
+
   void _changeIndependentLeverage(TxMarketMode mode, int multiple) {
     final service = _independentMarkets;
     final state = _independentState;
@@ -2209,6 +2610,21 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _marketRepaint.value++;
       return '${state.profile.label}账户杠杆已设为 ${selected}× · '
           '已有持仓时不会自动改写保证金规则';
+    });
+  }
+
+  void _changeIndependentMarginMode(
+      TxMarketMode mode, TxMarginMode marginMode) {
+    final service = _independentMarkets;
+    final state = _independentState;
+    if (service == null || state == null || state.mode != mode ||
+        state.player.marginMode == marginMode) return;
+    _independentOperate(() async {
+      final selected = await service.setPlayerMarginMode(
+          mode: mode, marginMode: marginMode);
+      _marketRepaint.value++;
+      return '${state.profile.label}保证金模式已切换为${selected.label} · '
+          '只对下一次开仓生效';
     });
   }
 
@@ -2244,6 +2660,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final profile = state.profile;
     final instrument = profile.instruments.firstWhere(
         (item) => item.symbol == symbol);
+    final usesMargin = instrument.usesMargin;
     final baseRule = TxMarketRiskRules.forMode(state.mode);
     final rule = state.player.riskRule(symbol);
     final mark = state.markPriceCents(symbol);
@@ -2309,6 +2726,33 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           ]),
           if (!canChange)
             const Text('当前有持仓或未成交委托，先平仓/撤单后才能调整杠杆。',
+                style: TextStyle(fontSize: 10, color: Colors.amberAccent)),
+        ],
+        if (baseRule.usesMargin) ...[
+          const SizedBox(height: 8),
+          Row(children: [
+            const Expanded(child: Text('保证金模式',
+                style: TextStyle(fontSize: 10, color: Colors.white70))),
+            Text(state.player.marginMode.label,
+                style: const TextStyle(color: TxTerminalColors.cyan,
+                    fontSize: 11, fontWeight: FontWeight.w700)),
+          ]),
+          const SizedBox(height: 4),
+          Wrap(spacing: 6, runSpacing: 4, children: [
+            for (final mode in TxMarginMode.values)
+              ChoiceChip(
+                label: Text(mode.label),
+                selected: state.player.marginMode == mode,
+                onSelected: canChange
+                    ? (_) => _changeIndependentMarginMode(state.mode, mode)
+                    : null,
+              ),
+          ]),
+          Text(state.player.marginMode.description,
+              style: const TextStyle(fontSize: 10,
+                  color: TxTerminalColors.secondaryText)),
+          if (!canChange)
+            const Text('保证金模式与杠杆一样，必须先平仓并撤销未成交委托。',
                 style: TextStyle(fontSize: 10, color: Colors.amberAccent)),
         ],
         const SizedBox(height: 4),
@@ -2428,6 +2872,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           selected: {selected},
           onSelectionChanged: (values) => setState(() {
             _symbol = values.first;
+            _reduceOnly = false;
             _price.text = (state.markPriceCents(
                     profile.instruments[_symbol].symbol) / 100)
                 .toStringAsFixed(2);
@@ -2502,6 +2947,22 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
                   onSelectionChanged: !canTrade ? null :
                       (values) => setState(() => _ticketSide = values.first),
                 )),
+              if (instrument.usesMargin ||
+                  (risk.positions[symbol]?.availableToClose ?? 0) > 0) ...[
+                const SizedBox(height: 3),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  title: const Text('只减仓 · Reduce-only'),
+                  subtitle: Text(_reduceOnly
+                      ? '只允许减少当前净仓，不会反向开仓；适合分批止盈、止损或降低强平风险。'
+                      : '关闭时按普通委托处理，可能开仓、加仓或反向开仓。'),
+                  value: _reduceOnly,
+                  onChanged: canTrade
+                      ? (value) => setState(() => _reduceOnly = value)
+                      : null,
+                ),
+              ],
               const SizedBox(height: 12),
               Wrap(children: [
                 _metric('现金', _quoteAmount(profile, risk.cashCents)),
@@ -2612,7 +3073,8 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
               dense: true,
               title: Text('${order.symbol} · ${order.side == TxSide.buy ? '买' : '卖'} '
                   '${order.remaining}/${order.quantity}'),
-              subtitle: Text('${order.id} · ${order.timeInForce.label}'),
+              subtitle: Text('${order.id} · ${order.timeInForce.label}'
+                  '${order.reduceOnly ? ' · 只减仓' : ''}'),
               trailing: IconButton(
                 tooltip: '撤单',
                 icon: const Icon(Icons.close),
@@ -3114,6 +3576,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           _metric('现金', _quoteAmount(profile, risk.cashCents)),
           _metric('可用保证金', _quoteAmount(profile, risk.freeMarginCents)),
           _metric('已用保证金', _quoteAmount(profile, risk.usedMarginCents)),
+          _metric('保证金模式', risk.marginMode.label),
           _metric('未实现盈亏', _quoteAmount(profile, risk.unrealizedPnlCents)),
           _metric('已实现盈亏', _quoteAmount(profile, risk.realizedPnlCents)),
         ]),
@@ -3121,15 +3584,32 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       Card(child: Padding(
         padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('保证金风险', style: TextStyle(fontWeight: FontWeight.w700)),
+          Row(children: [
+            const Expanded(child: Text('保证金风险',
+                style: TextStyle(fontWeight: FontWeight.w700))),
+            if (risk.marginMode != TxMarginMode.cross)
+              Text(risk.marginMode.label,
+                  style: const TextStyle(color: TxTerminalColors.cyan,
+                      fontWeight: FontWeight.w700)),
+          ]),
           const SizedBox(height: 6),
           if (risk.marginRatio == null)
             const Text('当前无保证金持仓', style: TextStyle(color: Colors.white70))
           else ...[
-            Text('维持保证金率 ${(risk.marginRatio! * 100).toStringAsFixed(1)}%'),
+            Text('${risk.marginMode == TxMarginMode.isolated ? '最小逐仓' : '账户'}'
+                '维持保证金率 ${(risk.marginRatio! * 100).toStringAsFixed(1)}%'),
             LinearProgressIndicator(
                 value: (risk.marginRatio! / 4).clamp(0.0, 1.0).toDouble(),
                 minHeight: 5),
+            const SizedBox(height: 5),
+            Text('已用保证金 ${_quoteAmount(profile, risk.usedMarginCents)} · '
+                '${risk.marginMode == TxMarginMode.isolated ? '逐仓已分配' : '账户共享'} '
+                '${_quoteAmount(profile, risk.isolatedMarginCents)}'),
+            if (risk.liquidationBufferCents != null)
+              Text('距维持保证金 ${_quoteAmount(profile, risk.liquidationBufferCents!)}',
+                  style: TextStyle(
+                      color: risk.liquidationBufferCents! <= 0
+                          ? red : TxTerminalColors.secondaryText)),
           ],
           if (risk.liquidationRequired)
             const Text('保证金不足：只允许通过真实对手盘减仓或强平',
@@ -3141,41 +3621,477 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       )),
       _independentRiskTerms(state, profile.instruments[
           _symbol.clamp(0, profile.instruments.length - 1).toInt()].symbol),
+      _independentConditionalOrders(state),
       _title('独立市场持仓', sub: '移动加权成本 · 真实成交费用已计入账户核心'),
       for (final instrument in profile.instruments)
         _independentPositionCard(state, instrument.symbol),
     ]);
   }
 
+  void _prepareIndependentReduceOnly(
+      TxIndependentMarketState state, String symbol, int percent) {
+    final position = state.playerRisk.positions[symbol];
+    if (position == null || position.isFlat || position.availableToClose < 1) {
+      return;
+    }
+    final index = state.profile.instruments.indexWhere(
+        (item) => item.symbol == symbol);
+    if (index < 0) return;
+    final available = position.availableToClose;
+    final quantity = math.max(1, (available * percent + 99) ~/ 100);
+    final mark = state.markPriceCents(symbol);
+    setState(() {
+      _marketMode = state.mode;
+      _symbol = index;
+      _page = 1;
+      _ticketSide = position.netQuantity > 0 ? TxSide.sell : TxSide.buy;
+      _limit = false;
+      _timeInForce = TxTimeInForce.gtc;
+      _reduceOnly = true;
+      _qty.text = '$quantity';
+      _price.text = (mark / 100).toStringAsFixed(2);
+      _notice = '${state.profile.label}已填入只减仓 $quantity/$available '
+          '${state.profile.instruments[index].orderUnit}，确认前不会提交';
+    });
+  }
+
+  int _conditionalDefaultTrigger(TxIndependentMarketState state, String symbol,
+      TxSide side, TxMarketConditionalOrderKind kind) {
+    final mark = state.markPriceCents(symbol);
+    final rule = state.player.riskRule(symbol);
+    int alignDown(int value) => math.max(rule.tickSizeCents,
+        (value ~/ rule.tickSizeCents) * rule.tickSizeCents);
+    int alignUp(int value) => math.max(rule.tickSizeCents,
+        ((value + rule.tickSizeCents - 1) ~/ rule.tickSizeCents) *
+            rule.tickSizeCents);
+    final down = alignDown((mark * 98) ~/ 100);
+    final up = alignUp((mark * 102 + 99) ~/ 100);
+    if (kind == TxMarketConditionalOrderKind.stopLoss) {
+      return side == TxSide.sell ? down : up;
+    }
+    return side == TxSide.sell ? up : down;
+  }
+
+  int? _conditionalPriceCents(String raw) {
+    final value = raw.trim();
+    if (!RegExp(r'^\d{1,10}(\.\d{1,4})?$').hasMatch(value)) {
+      return null;
+    }
+    final parts = value.split('.');
+    final fractional = parts.length == 1 ? '' : parts[1];
+    // The engine stores cents. Forex displays four decimals for readability,
+    // but its current tick is still one cent, so extra digits must be zero.
+    if (fractional.length > 2 &&
+        fractional.substring(2).contains(RegExp(r'[1-9]'))) {
+      return null;
+    }
+    final normalizedFraction = fractional.padRight(2, '0').substring(0, 2);
+    final normalized = normalizedFraction.isEmpty
+        ? parts.first
+        : '${parts.first}.$normalizedFraction';
+    return _cents(normalized);
+  }
+
+  String _conditionalPriceText(TxMarketProfile profile, int cents) =>
+      (cents / 100).toStringAsFixed(
+          profile.mode == TxMarketMode.forex ? 4 : 2);
+
+  Future<void> _showIndependentConditionalDialog(
+      TxIndependentMarketState state, String symbol) async {
+    final position = state.playerRisk.positions[symbol];
+    final available = position?.availableToClose ?? 0;
+    if (position == null || position.isFlat || available < 1) {
+      if (mounted) {
+        setState(() => _notice = '$symbol 当前没有可设置保护单的可平仓位');
+      }
+      return;
+    }
+    final profile = state.profile;
+    final side = position.netQuantity > 0 ? TxSide.sell : TxSide.buy;
+    final sequence = state.sequence;
+    var kind = TxMarketConditionalOrderKind.stopLoss;
+    final triggerController = TextEditingController(
+      text: _conditionalPriceText(profile,
+          _conditionalDefaultTrigger(state, symbol, side, kind)));
+    final quantityController = TextEditingController(text: '$available');
+    String? error;
+    final draft = await showDialog<_TxConditionalDraft>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          void submit() {
+            final trigger = _conditionalPriceCents(triggerController.text);
+            final quantity = int.tryParse(quantityController.text.trim());
+            if (trigger == null || quantity == null || quantity < 1) {
+              setDialogState(() => error = '请输入有效的触发价和数量');
+              return;
+            }
+            try {
+              state.player.riskRule(symbol).validatePrice(trigger);
+              state.player.riskRule(symbol).validateQuantity(quantity);
+            } on Object catch (failure) {
+              setDialogState(() => error = '$failure');
+              return;
+            }
+            if (quantity > available) {
+              setDialogState(() => error = '数量不能超过当前可平 $available');
+              return;
+            }
+            Navigator.of(dialogContext).pop(_TxConditionalDraft(
+              kind: kind,
+              triggerPriceCents: trigger,
+              quantity: quantity,
+            ));
+          }
+
+          return AlertDialog(
+            title: Text('$symbol · 设置保护单'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('当前方向：${side == TxSide.sell ? '多头保护 · 触发卖出' : '空头保护 · 触发买入'}'),
+                  Text('当前标记 ${_quotePrice(profile, state.markPriceCents(symbol))} · '
+                      '最多可平 $available ${profile.instruments.firstWhere(
+                          (item) => item.symbol == symbol).orderUnit}'),
+                  const SizedBox(height: 10),
+                  SegmentedButton<TxMarketConditionalOrderKind>(
+                    segments: const [
+                      ButtonSegment(
+                        value: TxMarketConditionalOrderKind.stopLoss,
+                        label: Text('止损'),
+                        icon: Icon(Icons.shield_outlined),
+                      ),
+                      ButtonSegment(
+                        value: TxMarketConditionalOrderKind.takeProfit,
+                        label: Text('止盈'),
+                        icon: Icon(Icons.flag_outlined),
+                      ),
+                    ],
+                    selected: {kind},
+                    onSelectionChanged: (values) {
+                      final next = values.first;
+                      setDialogState(() {
+                        kind = next;
+                        triggerController.text = _conditionalPriceText(
+                            profile,
+                            _conditionalDefaultTrigger(
+                                state, symbol, side, next));
+                        error = null;
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: triggerController,
+                    keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true),
+                    decoration: const InputDecoration(
+                      labelText: '触发价',
+                      helperText: '按已保存标记价判断；触发后以只减仓市价单入场',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: quantityController,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: '减仓数量',
+                      suffixText: profile.instruments
+                          .firstWhere((item) => item.symbol == symbol)
+                          .orderUnit,
+                      border: const OutlineInputBorder(),
+                    ),
+                  ),
+                  if (error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(error!, style: const TextStyle(color: red)),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('取消'),
+              ),
+              FilledButton.icon(
+                onPressed: submit,
+                icon: const Icon(Icons.add_task),
+                label: const Text('保存保护单'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    triggerController.dispose();
+    quantityController.dispose();
+    if (!mounted || draft == null) return;
+    final current = _independentState;
+    if (current == null || current.mode != state.mode ||
+        current.sequence != sequence) {
+      setState(() => _notice = '市场快照已变化，保护单未保存，请重新确认');
+      return;
+    }
+    final service = _independentMarkets;
+    if (service == null) return;
+    _independentOperate(() async {
+      final order = await service.placeConditional(
+        mode: state.mode,
+        symbol: symbol,
+        kind: draft.kind,
+        triggerPriceCents: draft.triggerPriceCents,
+        quantity: draft.quantity,
+        gameDay: state.runtime.gameDay,
+        minuteOfDay: state.runtime.minuteOfDay,
+      );
+      _marketRepaint.value++;
+      return '${order.kind.label}已保存：${order.triggerOperator} '
+          '${_quotePrice(profile, order.triggerPriceCents)} · '
+          '${order.quantity} ${profile.instruments.firstWhere(
+              (item) => item.symbol == symbol).orderUnit} · CAS r${state.sequence}';
+    });
+  }
+
+  Widget _independentConditionalOrders(TxIndependentMarketState state) {
+    final profile = state.profile;
+    final orders = state.runtime.conditionalOrders;
+    return Card(
+      child: ExpansionTile(
+        initiallyExpanded: orders.isNotEmpty,
+        leading: Icon(
+          orders.isEmpty ? Icons.shield_outlined : Icons.shield,
+          color: orders.isEmpty ? TxTerminalColors.secondaryText :
+              TxTerminalColors.cyan,
+        ),
+        title: Text('保护单 · ${orders.length}'),
+        subtitle: Text(orders.isEmpty
+            ? '暂无止盈/止损；触发后会进入真实订单簿并只减仓'
+            : '以已保存标记价触发 · 触发后自动市价减仓'),
+        children: [
+          if (orders.isEmpty)
+            const ListTile(
+              dense: true,
+              title: Text('在持仓卡中选择“设置保护单”'),
+            ),
+          for (final order in orders)
+            ListTile(
+              dense: true,
+              title: Text('${order.kind.label} · ${order.symbol} · '
+                  '${order.side == TxSide.sell ? '卖出' : '买入'}'),
+              subtitle: Text('${order.triggerOperator} '
+                  '${_quotePrice(profile, order.triggerPriceCents)} · '
+                  '数量 ${order.quantity} · 当前标记 '
+                  '${_quotePrice(profile, state.markPriceCents(order.symbol))}'),
+              trailing: IconButton(
+                tooltip: '取消保护单',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: _ready && !_busy
+                    ? () => _cancelIndependentConditional(order.id)
+                    : null,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _independentPositionCard(TxIndependentMarketState state,
       String symbol) {
     final position = state.playerRisk.positions[symbol];
     final profile = state.profile;
+    final risk = state.playerRisk;
     final mark = state.markPriceCents(symbol);
     final instrument = profile.instruments.firstWhere(
         (item) => item.symbol == symbol);
+    final usesMargin = instrument.usesMargin;
     final quantity = position?.netQuantity ?? 0;
     final unrealized = position == null || position.isFlat
         ? 0
         : (mark - position.averageEntryCents) * position.netQuantity *
             instrument.contractMultiplierUnits;
+    final hasPosition = position != null && !position.isFlat;
+    final positionRule = state.player.riskRule(symbol);
+    final notional = hasPosition
+        ? mark * position!.netQuantity.abs() * instrument.contractMultiplierUnits
+        : 0;
+    final entryNotional = hasPosition
+        ? position!.averageEntryCents * position.netQuantity.abs() *
+            instrument.contractMultiplierUnits
+        : 0;
+    final pnlPercent = entryNotional == 0
+        ? 0.0 : unrealized * 100 / entryNotional;
+    final breakeven = hasPosition
+        ? _independentBreakevenCents(state, position!) : null;
+    final liquidation = hasPosition
+        ? state.player.estimatedLiquidationPriceCents(symbol) : null;
+    final maintenance = hasPosition
+        ? positionRule.maintenanceMarginCents(
+            priceCents: mark, quantity: position!.netQuantity.abs())
+        : 0;
+    final marginBalance = hasPosition && usesMargin &&
+            risk.marginMode == TxMarginMode.isolated
+        ? position!.isolatedMarginCents + unrealized : null;
+    final marginBase = hasPosition && usesMargin
+        ? risk.marginMode == TxMarginMode.isolated
+            ? position!.isolatedMarginCents
+            : positionRule.initialMarginCents(
+                priceCents: mark, quantity: position!.netQuantity.abs())
+        : 0;
+    final marginRoi = marginBase == 0 ? 0.0 : unrealized * 100 / marginBase;
+    final positionBuffer = hasPosition && usesMargin
+        ? risk.marginMode == TxMarginMode.isolated
+            ? marginBalance! - maintenance
+            : risk.liquidationBufferCents
+        : null;
+    final conditionalOrders = state.runtime.conditionalOrders
+        .where((order) => order.symbol == symbol)
+        .toList(growable: false);
+    final riskColor = positionBuffer == null
+        ? TxTerminalColors.secondaryText
+        : positionBuffer <= 0
+            ? red
+            : positionBuffer < maintenance ~/ 4 ? TxTerminalColors.gold : green;
+    String signedQuote(int cents) => cents > 0
+        ? '+${_quoteAmount(profile, cents)}'
+        : _quoteAmount(profile, cents);
     return Card(child: Padding(
       padding: const EdgeInsets.all(14),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Expanded(child: Text(symbol,
-              style: const TextStyle(fontWeight: FontWeight.w700))),
-          Text(_quotePrice(profile, mark)),
+          Expanded(child: Row(children: [
+            Text(symbol, style: const TextStyle(fontWeight: FontWeight.w800)),
+            if (hasPosition) ...[
+              const SizedBox(width: 7),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                decoration: BoxDecoration(
+                  color: (quantity > 0 ? green : red).withAlpha(28),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: (quantity > 0 ? green : red)
+                      .withAlpha(100)),
+                ),
+                child: Text(quantity > 0 ? '多头' : '空头',
+                    style: TextStyle(color: quantity > 0 ? green : red,
+                        fontSize: 10, fontWeight: FontWeight.w700)),
+              ),
+            ],
+          ])),
+          Text(_quotePrice(profile, mark),
+              style: const TextStyle(fontWeight: FontWeight.w700)),
         ]),
         const SizedBox(height: 5),
         Text('净仓 $quantity ${instrument.orderUnit} · '
             '可平 ${position?.availableToClose ?? 0} ${instrument.orderUnit}'),
-        if (position != null && !position.isFlat) ...[
-          Text('平均成本 ${_quotePrice(profile, position.averageEntryCents)} · '
-              '浮动 ${_quoteAmount(profile, unrealized)}'),
-          Text('已实现 ${_quoteAmount(profile, position.realizedPnlCents)}'),
+        if (hasPosition && (position?.availableToClose ?? 0) > 0) ...[
+          const SizedBox(height: 7),
+          Wrap(spacing: 5, runSpacing: 4, children: [
+            const Text('快速减仓', style: TextStyle(
+                fontSize: 11, color: Colors.white70)),
+            for (final percent in const [25, 50, 100])
+              ActionChip(
+                label: Text('$percent%'),
+                visualDensity: VisualDensity.compact,
+                onPressed: _ready && !_busy && state.sessionStatus.isOpen
+                    ? () => _prepareIndependentReduceOnly(
+                        state, symbol, percent)
+                    : null,
+              ),
+            ActionChip(
+              avatar: const Icon(Icons.shield_outlined, size: 16),
+              label: const Text('设置保护单'),
+              visualDensity: VisualDensity.compact,
+              onPressed: _ready && !_busy
+                  ? () => _showIndependentConditionalDialog(state, symbol)
+                  : null,
+            ),
+          ]),
+          const Text('快速减仓只填充交易页，不会绕过盘口试算、确认或 CAS 写入。',
+              style: TextStyle(fontSize: 10, color: Colors.white54)),
+        ],
+        if (hasPosition) ...[
+          const SizedBox(height: 9),
+          Wrap(children: [
+            _metric('平均成本', _quotePrice(profile, position!.averageEntryCents)),
+            _metric('持仓名义', _quoteAmount(profile, notional)),
+            _metric('浮动盈亏', signedQuote(unrealized)),
+          ]),
+          Text('收益率 ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toStringAsFixed(2)}%'
+              ' · 已实现 ${signedQuote(position.realizedPnlCents)}',
+              style: TextStyle(color: unrealized >= 0 ? green : red,
+                  fontSize: 12, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          if (usesMargin) ...[
+            Row(children: [
+              const Expanded(child: Text('风险占用',
+                  style: TextStyle(fontSize: 11, color: Colors.white70))),
+              Text(risk.marginMode == TxMarginMode.isolated
+                  ? '逐仓回报 ${marginRoi >= 0 ? '+' : ''}${marginRoi.toStringAsFixed(2)}%'
+                  : '全仓共享权益',
+                  style: TextStyle(color: riskColor, fontSize: 11,
+                      fontWeight: FontWeight.w700)),
+            ]),
+            LinearProgressIndicator(
+              value: risk.marginMode == TxMarginMode.isolated &&
+                      maintenance > 0 && marginBalance != null
+                  ? (marginBalance / maintenance / 4).clamp(0.0, 1.0).toDouble()
+                  : risk.marginRatio == null
+                      ? 0.0
+                      : (risk.marginRatio! / 4).clamp(0.0, 1.0).toDouble(),
+              minHeight: 5,
+              backgroundColor: TxTerminalColors.surfaceElevated,
+              valueColor: AlwaysStoppedAnimation<Color>(riskColor),
+            ),
+            const SizedBox(height: 7),
+            Wrap(spacing: 10, runSpacing: 5, children: [
+              Text('模式 ${risk.marginMode.label}',
+                  style: const TextStyle(fontSize: 11)),
+              Text(risk.marginMode == TxMarginMode.isolated
+                  ? '已分配 ${_quoteAmount(profile, position!.isolatedMarginCents)}'
+                  : '占用 ${_quoteAmount(profile, marginBase)}',
+                  style: const TextStyle(fontSize: 11)),
+              Text('维持 ${_quoteAmount(profile, maintenance)}',
+                  style: const TextStyle(fontSize: 11)),
+            ]),
+            Wrap(spacing: 10, runSpacing: 5, children: [
+              if (breakeven != null)
+                Text('盈亏平衡 ${_quotePrice(profile, breakeven)}',
+                    style: const TextStyle(fontSize: 11,
+                        color: TxTerminalColors.gold)),
+              if (liquidation != null)
+                Text('强平 ${_quotePrice(profile, liquidation)}',
+                    style: TextStyle(fontSize: 11, color: riskColor,
+                        fontWeight: FontWeight.w700)),
+              if (positionBuffer != null)
+                Text('安全边际 ${signedQuote(positionBuffer)}',
+                    style: TextStyle(fontSize: 11, color: riskColor)),
+            ]),
+            if (conditionalOrders.isNotEmpty)
+              Text('保护单 ${conditionalOrders.length} 笔 · '
+                  '${conditionalOrders.map((order) => '${order.kind.label} '
+                      '${order.triggerOperator}${_quotePrice(profile, order.triggerPriceCents)}')
+                      .join(' · ')}',
+                  style: const TextStyle(fontSize: 10,
+                      color: TxTerminalColors.cyan)),
+            if (liquidation != null)
+              Text(risk.marginMode == TxMarginMode.isolated
+                  ? '该强平位只对应本仓逐仓保证金，不会直接占用其他持仓。'
+                  : '该强平位按全仓账户权益估算，其他持仓盈亏会共同影响它。',
+                  style: const TextStyle(fontSize: 10, color: Colors.white54)),
+          ] else ...[
+            const SizedBox(height: 5),
+            const Text('现金现货 · 不使用保证金、融资或强平位。',
+                style: TextStyle(fontSize: 11, color: Colors.white54)),
+          ],
         ] else
-          const Text('当前无持仓', style: TextStyle(color: Colors.white54)),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('当前无持仓 · 选择全仓或逐仓后，下一笔开仓会按该模式分配风险',
+                style: TextStyle(color: Colors.white54, fontSize: 11)),
+          ),
         Align(alignment: Alignment.centerRight,
           child: TextButton(onPressed: () {
             final index = profile.instruments.indexWhere(
@@ -3399,6 +4315,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     final orders = state.runtime.venue.orders.reversed.where(
         (order) => order.ownerId == TxIndependentMarketState.playerId)
         .take(100).toList();
+    final conditionalOrders = state.runtime.conditionalOrders;
     return ListView(padding: const EdgeInsets.all(14), children: [
       _pageHeader(
         icon: Icons.receipt_long_rounded,
@@ -3411,10 +4328,30 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       _marketContextBar(_trader!.current.session),
       _title('记录分类', sub: '未成交委托可撤单；成交记录只来自本板块订单簿'),
       Card(child: ListTile(
-        title: Text('市场成交 ${state.runtime.venue.fills.length} 笔 · '
+        title: Text('市场成交 ${state.runtime.venue.fillCount} 笔 · '
             '我的成交 ${fills.length} 笔'),
         subtitle: Text('个人委托 ${orders.length} 笔 · CAS r${state.sequence}'),
       )),
+      if (conditionalOrders.isNotEmpty) ...[
+        const Text('待触发保护单', style: TextStyle(fontWeight: FontWeight.w700)),
+        for (final condition in conditionalOrders)
+          Card(child: ListTile(
+            dense: true,
+            title: Text('${condition.kind.label} · ${condition.symbol} · '
+                '${condition.side == TxSide.sell ? '卖出' : '买入'}'),
+            subtitle: Text('${condition.triggerOperator} '
+                '${_quotePrice(profile, condition.triggerPriceCents)} · '
+                '数量 ${condition.quantity} · 当前标记 '
+                '${_quotePrice(profile, state.markPriceCents(condition.symbol))}'),
+            trailing: IconButton(
+              tooltip: '取消保护单',
+              icon: const Icon(Icons.delete_outline),
+              onPressed: _ready && !_busy
+                  ? () => _cancelIndependentConditional(condition.id)
+                  : null,
+            ),
+          )),
+      ],
       if (orders.isNotEmpty) ...[
         const Text('最近委托', style: TextStyle(fontWeight: FontWeight.w700)),
         for (final order in orders) Card(child: ListTile(
@@ -3422,7 +4359,9 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
           title: Text('${order.symbol} · ${order.side == TxSide.buy ? '买' : '卖'} '
               '成交${order.filled}/${order.quantity}'),
           subtitle: Text('${order.id} · ${order.timeInForce.label} · '
-              '${order.status.name}${order.rejectReason == null ? '' :
+              '${order.status.name}${order.reduceOnly ? ' · 只减仓' : ''}'
+              '${order.id.startsWith('TRIGGER') ? ' · 保护单触发' : ''}'
+              '${order.rejectReason == null ? '' :
                 ' · ${order.rejectReason}'}'),
           trailing: order.remaining > 0 &&
                   (order.status == TxStatus.open ||
@@ -3516,6 +4455,12 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
       }
     }
     try {
+      await trader.waitForRecovery();
+    } catch (_) {
+      // The service has already completed its fail-closed recovery attempt;
+      // shutdown still proceeds without fabricating a successful save.
+    }
+    try {
       await _closeService(trader);
     } catch (_) {
       // The widget is already being torn down; a failed flush is still
@@ -3530,6 +4475,7 @@ class _TerminalHomeV024State extends State<TerminalHomeV024>
     _startupTimer?.cancel();
     _startupStopwatch.stop();
     _seconds.dispose();
+    _chartSeconds.dispose();
     _marketRepaint.dispose();
     _settling.dispose();
     _pulseSettling.dispose();

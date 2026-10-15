@@ -4,6 +4,17 @@ import '../lib/market/tx_candle_history.dart';
 import '../lib/widgets/tx_candle_chart.dart';
 
 void main() {
+  test('chart overlay scope rejects a line from another market', () {
+    const cryptoLine = TxChartOverlayLine(
+      valueCents: 5000000,
+      label: '成本',
+      color: Colors.blue,
+      scopeKey: 'crypto:SIM-BTCUSDT',
+    );
+    expect(cryptoLine.matchesScope('crypto:SIM-BTCUSDT'), isTrue);
+    expect(cryptoLine.matchesScope('forex:SIM-EURUSD'), isFalse);
+  });
+
   testWidgets('MA overlays and dashed indicative quote toggled safely',
       (tester) async {
     final candles = List.generate(44, (i) => TxCandle(

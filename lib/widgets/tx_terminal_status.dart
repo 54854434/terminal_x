@@ -81,31 +81,54 @@ class TxTerminalStatus extends StatelessWidget {
               maxLines: 1, overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 10,
                 color: TxTerminalColors.secondaryText)),
-            if (pendingSave)
-              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('待保存 $pendingOperations 项 · 每 $saveMinutes 个游戏分钟自动保存',
-                  maxLines: 1, overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 10,
-                    color: TxTerminalColors.primary)),
-                const SizedBox(height: 3),
-                LinearProgressIndicator(
-                  value: (pendingGameMinutes / saveMinutes)
-                      .clamp(0.0, 1.0).toDouble(),
-                  minHeight: 3,
-                  backgroundColor: TxTerminalColors.raised,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                      TxTerminalColors.primary)),
-              ]),
-            if (isSettling)
-              Text(pulse ? '正在同步真实盘口，未确认时间不会前进'
-                  : '正在处理当前结算，未确认时间不会前进',
-                maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 10,
-                  color: TxTerminalColors.primary)),
+            // Reserve both status rows even when they are currently hidden.
+            // Their old conditional insertion changed the height of the
+            // entire scroll view whenever a high-speed SQLite minute began or
+            // finished, which was perceived as vertical screen jitter.
+            Visibility(
+              visible: pendingSave,
+              maintainState: true,
+              maintainAnimation: true,
+              maintainSize: true,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('待保存 $pendingOperations 项 · 每 $saveMinutes 个游戏分钟自动保存',
+                    maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10,
+                      color: TxTerminalColors.primary)),
+                  const SizedBox(height: 3),
+                  LinearProgressIndicator(
+                    value: (pendingGameMinutes / saveMinutes)
+                        .clamp(0.0, 1.0).toDouble(),
+                    minHeight: 3,
+                    backgroundColor: TxTerminalColors.raised,
+                    valueColor: const AlwaysStoppedAnimation<Color>(
+                        TxTerminalColors.primary)),
+                ],
+              ),
+            ),
+            // Keep the row's height stable without leaving hidden text in the
+            // element tree. This prevents both scroll jitter and a11y/test
+            // finders from treating a reserved row as visible status.
+            SizedBox(
+              height: 15,
+              child: isSettling
+                  ? Text(pulse ? '正在同步真实盘口，未确认时间不会前进'
+                      : '正在处理当前结算，未确认时间不会前进',
+                    maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10,
+                      color: TxTerminalColors.primary))
+                  : null,
+            ),
           ]))),
-      if (busy || isSettling) Padding(
+      Padding(
         padding: const EdgeInsets.only(left: 6),
-        child: _syncIcon(isSettling)),
+        child: SizedBox(width: 16, height: 20,
+          child: (busy || isSettling)
+              ? _syncIcon(isSettling)
+              : const SizedBox.shrink()),
+      ),
     ])),
   );
   }
